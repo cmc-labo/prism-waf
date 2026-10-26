@@ -12,34 +12,37 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prismwaf/prismwaf/internal/proxy"
+	"github.com/cmc-labo/prism-waf/internal/proxy"
+	"github.com/cmc-labo/prism-waf/internal/waf"
 )
 
 func main() {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	backend := flag.String("backend", "http://127.0.0.1:8081", "backend server URL")
+	maxBody := flag.Int64("max-body", waf.DefaultMaxBodySize, "maximum request body size in bytes to inspect; larger requests are rejected")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*listen, *backend, logger); err != nil {
+	if err := run(*listen, *backend, *maxBody, logger); err != nil {
 		logger.Error("prismwaf exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(listen, backend string, logger *slog.Logger) error {
+func run(listen, backend string, maxBody int64, logger *slog.Logger) error {
 	u, err := proxy.ParseBackend(backend)
 	if err != nil {
 		return err
 	}
-	handler, err := proxy.New(u, logger)
+	rp, err := proxy.New(u, logger)
 	if err != nil {
 		return err
 	}
+	inspector := waf.NewInspector(waf.DefaultSignatures, maxBody)
 
 	srv := &http.Server{
 		Addr:              listen,
-		Handler:           handler,
+		Handler:           waf.Middleware(rp, inspector, logger),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
