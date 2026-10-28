@@ -36,6 +36,7 @@ func Middleware(next http.Handler, in *Inspector, logger *slog.Logger) http.Hand
 				"category", m.Signature.Category,
 				"location", m.Location,
 				"field", m.Field,
+				"base64", m.Base64,
 				"remote_addr", r.RemoteAddr,
 				"method", r.Method,
 				"path", r.URL.Path,

@@ -40,6 +40,11 @@ func TestNormalize(t *testing.T) {
 		{"duplicate slashes", "/etc//passwd", Options{}, "/etc/passwd"},
 		{"dot segments", "/etc/./passwd", Options{}, "/etc/passwd"},
 		{"dot-dot kept", "/a/../b", Options{}, "/a/../b"},
+		{"log4j lower lookup", "${${lower:j}ndi:ldap://x}", Options{}, "${jndi:ldap:/x}"},
+		{"log4j default lookups", "${${::-j}${::-n}${::-d}${::-i}:", Options{}, "${jndi:"},
+		{"log4j env default", "${${env:NOPE:-j}ndi:", Options{}, "${jndi:"},
+		{"log4j nested", "${${lower:${upper:j}}ndi:", Options{}, "${jndi:"},
+		{"log4j date", "${${date:'j'}ndi:", Options{}, "${jndi:"},
 		{"utf-8 text preserved", "%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF", Options{}, "こんにちは"},
 	}
 	for _, tc := range tests {

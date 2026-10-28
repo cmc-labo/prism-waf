@@ -38,7 +38,10 @@ func run(listen, backend string, maxBody int64, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	inspector := waf.NewInspector(waf.DefaultSignatures, maxBody)
+	inspector, err := waf.NewInspector(waf.DefaultSignatures, maxBody)
+	if err != nil {
+		return err
+	}
 
 	srv := &http.Server{
 		Addr:              listen,

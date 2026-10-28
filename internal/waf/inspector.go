@@ -3,17 +3,22 @@ package waf
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/cmc-labo/prism-waf/internal/normalize"
 )
 
 // DefaultMaxBodySize is the default limit for request bodies that are
-// buffered for inspection.
-const DefaultMaxBodySize = 1 << 20 // 1 MiB
+// buffered for inspection. It matches ModSecurity's default for request
+// bodies without files. Inspection time grows linearly with body size: a
+// body crafted to defeat the signature prefilters costs roughly 100ms of
+// CPU at this size.
+const DefaultMaxBodySize = 128 << 10 // 128 KiB
 
 // ErrBodyTooLarge is returned when a request body exceeds the inspection limit.
 var ErrBodyTooLarge = errors.New("waf: request body too large to inspect")
@@ -34,26 +39,70 @@ type Match struct {
 	Location  Location
 	// Field is the header name for LocationHeader and empty otherwise.
 	Field string
+	// Base64 reports whether the match was found in Base64-decoded data.
+	Base64 bool
 }
 
 // Inspector checks requests against a set of signatures.
 type Inspector struct {
-	signatures  []Signature
+	signatures  []compiledSignature
 	maxBodySize int64
+}
+
+type compiledSignature struct {
+	Signature
+	re *regexp.Regexp
+}
+
+func (s *compiledSignature) matches(text string) bool {
+	if s.re == nil {
+		return strings.Contains(text, s.Pattern)
+	}
+	if len(s.Keywords) > 0 && !containsAny(text, s.Keywords) {
+		return false
+	}
+	return s.re.MatchString(text)
+}
+
+func containsAny(s string, substrs []string) bool {
+	for _, sub := range substrs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewInspector returns an Inspector using the given signatures. Patterns are
 // matched case-insensitively. maxBodySize <= 0 selects DefaultMaxBodySize.
-func NewInspector(signatures []Signature, maxBodySize int64) *Inspector {
+func NewInspector(signatures []Signature, maxBodySize int64) (*Inspector, error) {
 	if maxBodySize <= 0 {
 		maxBodySize = DefaultMaxBodySize
 	}
-	sigs := make([]Signature, len(signatures))
+	sigs := make([]compiledSignature, len(signatures))
 	for i, s := range signatures {
-		s.Pattern = strings.ToLower(s.Pattern)
-		sigs[i] = s
+		cs := compiledSignature{Signature: s}
+		switch {
+		case (s.Pattern == "") == (s.Regex == ""):
+			return nil, fmt.Errorf("waf: signature %s: exactly one of Pattern and Regex must be set", s.ID)
+		case s.Pattern != "" && len(s.Keywords) > 0:
+			return nil, fmt.Errorf("waf: signature %s: Keywords requires Regex", s.ID)
+		case s.Regex != "":
+			re, err := regexp.Compile(s.Regex)
+			if err != nil {
+				return nil, fmt.Errorf("waf: signature %s: %w", s.ID, err)
+			}
+			cs.re = re
+			cs.Keywords = make([]string, len(s.Keywords))
+			for j, k := range s.Keywords {
+				cs.Keywords[j] = strings.ToLower(k)
+			}
+		default:
+			cs.Pattern = strings.ToLower(s.Pattern)
+		}
+		sigs[i] = cs
 	}
-	return &Inspector{signatures: sigs, maxBodySize: maxBodySize}
+	return &Inspector{signatures: sigs, maxBodySize: maxBodySize}, nil
 }
 
 // Inspect checks the path, query string, headers and body of r, in that
@@ -110,36 +159,56 @@ func (in *Inspector) readBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// match checks raw against every signature. Three forms of the value are
-// tried: the raw value (lowercased), its normalized form, and the normalized
-// form with SQL comments removed.
+// candidate is one form of an inspected value.
+type candidate struct {
+	text   string
+	base64 bool
+}
+
+// match checks raw against every signature, trying each form returned by
+// candidates.
 func (in *Inspector) match(loc Location, field, raw string, opts normalize.Options) *Match {
 	if raw == "" {
 		return nil
 	}
-	normalized := normalize.Normalize(raw, opts)
-	candidates := uniq(
-		normalize.CollapseSpaces(strings.ToLower(raw)),
-		normalized,
-		normalize.StripSQLComments(normalized),
-	)
+	cands := candidates(raw, opts)
 	for _, s := range in.signatures {
-		for _, c := range candidates {
-			if strings.Contains(c, s.Pattern) {
-				return &Match{Signature: s, Location: loc, Field: field}
+		for _, c := range cands {
+			if s.matches(c.text) {
+				return &Match{Signature: s.Signature, Location: loc, Field: field, Base64: c.base64}
 			}
 		}
 	}
 	return nil
 }
 
-// uniq returns ss without consecutive duplicates.
-func uniq(ss ...string) []string {
-	out := ss[:1]
-	for _, s := range ss[1:] {
-		if s != out[len(out)-1] {
-			out = append(out, s)
+// candidates returns the forms of raw that signatures are matched against:
+//
+//   - the raw value, lowercased
+//   - the normalized value
+//   - the normalized value with SQL comments replaced by spaces
+//   - the normalized value with split keywords joined back together
+//
+// plus the last three forms of each Base64-encoded token found in raw.
+func candidates(raw string, opts normalize.Options) []candidate {
+	var out []candidate
+	seen := map[string]bool{}
+	add := func(text string, b64 bool) {
+		if !seen[text] {
+			seen[text] = true
+			out = append(out, candidate{text: text, base64: b64})
 		}
+	}
+	addForms := func(normalized string, b64 bool) {
+		add(normalized, b64)
+		add(normalize.StripSQLComments(normalized), b64)
+		add(normalize.JoinSplitKeywords(normalized), b64)
+	}
+
+	add(normalize.CollapseSpaces(strings.ToLower(raw)), false)
+	addForms(normalize.Normalize(raw, opts), false)
+	for _, decoded := range normalize.DecodeBase64(raw) {
+		addForms(normalize.Normalize(decoded, normalize.Options{}), true)
 	}
 	return out
 }

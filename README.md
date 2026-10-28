@@ -11,6 +11,8 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
 - Signature-based detection of common attacks (SQL injection, XSS, path
   traversal, OS command injection, Log4Shell) in the request path, query
   string, headers and body
+- Request normalization that defeats encoding tricks, split keywords and
+  Base64-encoded payloads
 - Blocks matching requests with `403 Forbidden` and logs the matched signature
 
 ## Quick start
@@ -45,9 +47,12 @@ curl -i "http://127.0.0.1:8080/items?id=1%20UNION%20SELECT%20password"
 ## Signature detection
 
 Each request is checked against the built-in signatures in
-[`internal/waf/signature.go`](internal/waf/signature.go). A signature is a
-case-insensitive substring; a request is blocked when any of the following
-contains one:
+[`internal/waf/signature.go`](internal/waf/signature.go). A signature is
+either a case-insensitive substring or an [RE2](https://github.com/google/re2/wiki/Syntax)
+regular expression, so variants such as `UNION(SELECT …)`, `' || 1=1` or
+`<svg/onload=…>` are covered by a single rule. RE2 runs in linear time, so a
+signature cannot be abused for ReDoS. A request is blocked when a signature
+matches any of the following:
 
 - the URL path
 - the query string
@@ -70,23 +75,39 @@ payloads are detected (see [`internal/normalize`](internal/normalize)):
 | Backslashes, `//`, `/./`       | `..\..\windows`              | `../../windows` |
 | Whitespace variations          | `union%09%0aselect`          | `union select`|
 | SQL comments                   | `union/**/select`            | `union select`|
+| Log4j nested lookups           | `${${lower:j}ndi:`           | `${jndi:`     |
 
 Decoders are applied repeatedly (up to five rounds) until the value stops
 changing, so combinations such as URL-encoded HTML entities are unwrapped too.
 Malformed escapes such as `%zz` are left as-is instead of aborting decoding.
 
-Each value is matched in three forms: raw (lowercased), normalized, and
-normalized with SQL comments removed. Signature patterns should therefore be
-written in normalized form.
+Each value is matched in several forms:
+
+| Form              | Purpose                                                        |
+|-------------------|----------------------------------------------------------------|
+| Raw (lowercased)  | Baseline                                                       |
+| Normalized        | Decoded and canonicalized as above                             |
+| Comments → spaces | `union/**/select` → `union select`                             |
+| Keywords joined   | Undoes keyword splitting: `un/**/ion` → `union`, `'al'+'ert'` → `alert`, `c'a't` → `cat`, `c$@at` → `cat`, `cat${IFS}x` → `cat x`, `w^hoami` → `whoami` |
+| Base64-decoded    | Tokens of 12+ Base64 / Base64url characters that decode to printable text are decoded and run through all of the above. Matches are logged with `base64=true`. |
+
+Signature patterns should therefore be written in normalized form.
+
+Large inputs are expensive to scan with regular expressions, so a signature
+can declare `Keywords`: substrings that every match must contain. The regex
+only runs when one of them is present, which makes typical inspection about
+10× faster.
 
 Request bodies are buffered in memory for inspection. Bodies larger than
-`-max-body` are rejected with `413 Request Entity Too Large` rather than
-partially inspected.
+`-max-body` (default 128 KiB, the same as ModSecurity's default for bodies
+without files) are rejected with `413 Request Entity Too Large` rather than
+partially inspected. Inspection cost grows with body size; a body crafted
+to defeat the keyword prefilters takes about 100 ms of CPU at 128 KiB, so
+raise the limit with care.
 
-The signatures are deliberately simple substrings. Normalization defeats
-common encoding tricks, but payloads rewritten at the syntax level (for
-example `UNION(SELECT…)` or alternative JavaScript event handlers) can still
-get through. Treat them as a baseline, not complete protection.
+The built-in signatures cover common payloads and their usual variations,
+but no signature set is complete. Treat them as a baseline, not complete
+protection.
 
 ## Options
 
@@ -94,12 +115,13 @@ get through. Treat them as a baseline, not complete protection.
 |------------|-------------------------|--------------------------|
 | `-listen`  | `:8080`                 | Address to listen on     |
 | `-backend` | `http://127.0.0.1:8081` | Backend server URL       |
-| `-max-body` | `1048576` (1 MiB)      | Maximum request body size to inspect, in bytes |
+| `-max-body` | `131072` (128 KiB)     | Maximum request body size to inspect, in bytes |
 
 ## Development
 
 ```sh
 go test ./...
+go test ./internal/waf -run '^$' -bench .   # inspection benchmarks
 go build -o bin/prismwaf ./cmd/prismwaf
 ```
 

@@ -42,8 +42,10 @@ type Options struct {
 //  3. Lowercase.
 //  4. Remove NUL, control and invisible formatting characters
 //     (e.g. zero-width spaces).
-//  5. Convert backslashes to slashes and simplify "//" and "/./".
-//  6. Collapse each run of whitespace into a single space.
+//  5. Expand Log4j-style lookups that only rewrite text, such as
+//     "${lower:j}" or "${::-j}", so "${${lower:j}ndi:" becomes "${jndi:".
+//  6. Convert backslashes to slashes and simplify "//" and "/./".
+//  7. Collapse each run of whitespace into a single space.
 func Normalize(s string, o Options) string {
 	for range maxDecodeRounds {
 		d := s
@@ -59,6 +61,7 @@ func Normalize(s string, o Options) string {
 	s = norm.NFKC.String(s)
 	s = strings.ToLower(s)
 	s = removeInvisible(s)
+	s = expandLookups(s)
 	s = normalizeSlashes(s)
 	return CollapseSpaces(s)
 }
@@ -85,6 +88,38 @@ func StripSQLComments(s string) string {
 	s = reSQLVersionedComment.ReplaceAllString(s, " $1 ")
 	s = reSQLBlockComment.ReplaceAllString(s, " ")
 	return CollapseSpaces(s)
+}
+
+// maxLookupRounds bounds how many levels of nested lookups are expanded.
+const maxLookupRounds = 10
+
+var (
+	// ${lower:x} and ${upper:x}
+	reLookupCase = regexp.MustCompile(`\$\{(?:lower|upper):([^${}]*)\}`)
+	// ${anything:-x}, e.g. ${::-x} or ${env:UNDEFINED:-x}
+	reLookupDefault = regexp.MustCompile(`\$\{[^${}]*?:-([^${}]*)\}`)
+	// ${date:'x'}
+	reLookupDate = regexp.MustCompile(`\$\{date:'([^${}']*)'\}`)
+)
+
+// expandLookups replaces Log4j lookups whose result is a literal string with
+// that string. Attackers nest them to spell out "jndi" without writing it,
+// e.g. "${${::-j}${lower:N}di:ldap://...}". The same syntax covers shell
+// default-value expansion (${VAR:-x}).
+func expandLookups(s string) string {
+	if !strings.Contains(s, "${") {
+		return s
+	}
+	for range maxLookupRounds {
+		d := reLookupCase.ReplaceAllString(s, "$1")
+		d = reLookupDefault.ReplaceAllString(d, "$1")
+		d = reLookupDate.ReplaceAllString(d, "$1")
+		if d == s {
+			break
+		}
+		s = d
+	}
+	return s
 }
 
 // percentDecode decodes %XX and %uXXXX sequences. Unlike url.QueryUnescape it
