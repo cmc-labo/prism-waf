@@ -3,6 +3,10 @@ package waf
 
 // Signature is a simple attack pattern. A request matches a signature when
 // any inspected part of it contains Pattern (case-insensitive).
+//
+// Patterns are matched against normalized request data (see package
+// normalize), so they should be written in normalized form: decoded,
+// lowercase, single spaces, and forward slashes instead of backslashes.
 type Signature struct {
 	ID       string
 	Category string
@@ -35,9 +39,8 @@ var DefaultSignatures = []Signature{
 
 	// Path traversal
 	{ID: "PT-001", Category: "path-traversal", Pattern: "../"},
-	{ID: "PT-002", Category: "path-traversal", Pattern: `..\`},
-	{ID: "PT-003", Category: "path-traversal", Pattern: "/etc/passwd"},
-	{ID: "PT-004", Category: "path-traversal", Pattern: `c:\windows\`},
+	{ID: "PT-002", Category: "path-traversal", Pattern: "/etc/passwd"},
+	{ID: "PT-003", Category: "path-traversal", Pattern: "c:/windows/"},
 
 	// OS command injection
 	{ID: "CMDI-001", Category: "command-injection", Pattern: "/bin/sh"},

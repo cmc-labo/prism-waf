@@ -54,16 +54,39 @@ contains one:
 - any header value
 - the request body
 
-Before matching, values are percent-decoded (up to three times, to catch
-double encoding), lowercased, and runs of whitespace are collapsed to a single
-space. Form bodies (`application/x-www-form-urlencoded`) are decoded as well.
+Before matching, every value is normalized so that encoded or obfuscated
+payloads are detected (see [`internal/normalize`](internal/normalize)):
+
+| Evasion technique              | Example                      | Normalized    |
+|--------------------------------|------------------------------|---------------|
+| URL encoding (nested)          | `%253Cscript`                | `<script`     |
+| IIS `%u` encoding              | `%u003Cscript`               | `<script`     |
+| HTML entities                  | `&lt;` `&#60;` `&#x3c;`      | `<`           |
+| JavaScript / JSON escapes      | `\x3c` `\u003c`              | `<`           |
+| Overlong UTF-8                 | `%c0%ae%c0%ae/`              | `../`         |
+| Fullwidth / compatibility (NFKC) | `＜ｓｃｒｉｐｔ＞`             | `<script>`    |
+| Mixed case                     | `UnIoN SeLeCt`               | `union select`|
+| NUL and zero-width characters  | `<scr%00ipt>`                | `<script>`    |
+| Backslashes, `//`, `/./`       | `..\..\windows`              | `../../windows` |
+| Whitespace variations          | `union%09%0aselect`          | `union select`|
+| SQL comments                   | `union/**/select`            | `union select`|
+
+Decoders are applied repeatedly (up to five rounds) until the value stops
+changing, so combinations such as URL-encoded HTML entities are unwrapped too.
+Malformed escapes such as `%zz` are left as-is instead of aborting decoding.
+
+Each value is matched in three forms: raw (lowercased), normalized, and
+normalized with SQL comments removed. Signature patterns should therefore be
+written in normalized form.
 
 Request bodies are buffered in memory for inspection. Bodies larger than
 `-max-body` are rejected with `413 Request Entity Too Large` rather than
 partially inspected.
 
-The signatures are deliberately simple and will not stop obfuscated payloads.
-Treat them as a baseline, not complete protection.
+The signatures are deliberately simple substrings. Normalization defeats
+common encoding tricks, but payloads rewritten at the syntax level (for
+example `UNION(SELECT…)` or alternative JavaScript event handlers) can still
+get through. Treat them as a baseline, not complete protection.
 
 ## Options
 
@@ -83,10 +106,11 @@ go build -o bin/prismwaf ./cmd/prismwaf
 ## Project layout
 
 ```
-cmd/prismwaf/      entry point
-internal/proxy/    reverse proxy
-internal/waf/      signatures and request inspection
-examples/backend/  echo server for local testing
+cmd/prismwaf/        entry point
+internal/proxy/      reverse proxy
+internal/normalize/  decoding and canonicalization of request data
+internal/waf/        signatures and request inspection
+examples/backend/    echo server for local testing
 ```
 
 ## License

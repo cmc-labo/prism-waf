@@ -6,17 +6,14 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"strings"
+
+	"github.com/cmc-labo/prism-waf/internal/normalize"
 )
 
 // DefaultMaxBodySize is the default limit for request bodies that are
 // buffered for inspection.
 const DefaultMaxBodySize = 1 << 20 // 1 MiB
-
-// maxDecodeRounds bounds how many times a value is percent-decoded, so that
-// double-encoded payloads such as "%253Cscript" are still detected.
-const maxDecodeRounds = 3
 
 // ErrBodyTooLarge is returned when a request body exceeds the inspection limit.
 var ErrBodyTooLarge = errors.New("waf: request body too large to inspect")
@@ -66,15 +63,15 @@ func NewInspector(signatures []Signature, maxBodySize int64) *Inspector {
 // still be forwarded. Bodies larger than the configured limit are rejected
 // with ErrBodyTooLarge rather than partially inspected.
 func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
-	if m := in.match(LocationPath, "", r.URL.EscapedPath(), url.PathUnescape); m != nil {
+	if m := in.match(LocationPath, "", r.URL.EscapedPath(), normalize.Options{}); m != nil {
 		return m, nil
 	}
-	if m := in.match(LocationQuery, "", r.URL.RawQuery, url.QueryUnescape); m != nil {
+	if m := in.match(LocationQuery, "", r.URL.RawQuery, normalize.Options{PlusAsSpace: true}); m != nil {
 		return m, nil
 	}
 	for name, values := range r.Header {
 		for _, v := range values {
-			if m := in.match(LocationHeader, name, v, url.QueryUnescape); m != nil {
+			if m := in.match(LocationHeader, name, v, normalize.Options{PlusAsSpace: true}); m != nil {
 				return m, nil
 			}
 		}
@@ -85,11 +82,8 @@ func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
 		return nil, err
 	}
 	if len(body) > 0 {
-		var decode func(string) (string, error)
-		if isFormEncoded(r.Header.Get("Content-Type")) {
-			decode = url.QueryUnescape
-		}
-		if m := in.match(LocationBody, "", string(body), decode); m != nil {
+		opts := normalize.Options{PlusAsSpace: isFormEncoded(r.Header.Get("Content-Type"))}
+		if m := in.match(LocationBody, "", string(body), opts); m != nil {
 			return m, nil
 		}
 	}
@@ -116,17 +110,19 @@ func (in *Inspector) readBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// match checks both the raw value and its decoded form against every signature.
-func (in *Inspector) match(loc Location, field, raw string, decode func(string) (string, error)) *Match {
+// match checks raw against every signature. Three forms of the value are
+// tried: the raw value (lowercased), its normalized form, and the normalized
+// form with SQL comments removed.
+func (in *Inspector) match(loc Location, field, raw string, opts normalize.Options) *Match {
 	if raw == "" {
 		return nil
 	}
-	candidates := []string{normalize(raw)}
-	if decode != nil {
-		if d := decodeAll(raw, decode); d != raw {
-			candidates = append(candidates, normalize(d))
-		}
-	}
+	normalized := normalize.Normalize(raw, opts)
+	candidates := uniq(
+		normalize.CollapseSpaces(strings.ToLower(raw)),
+		normalized,
+		normalize.StripSQLComments(normalized),
+	)
 	for _, s := range in.signatures {
 		for _, c := range candidates {
 			if strings.Contains(c, s.Pattern) {
@@ -137,23 +133,15 @@ func (in *Inspector) match(loc Location, field, raw string, decode func(string) 
 	return nil
 }
 
-// decodeAll percent-decodes s repeatedly until it stops changing, decoding
-// fails, or maxDecodeRounds is reached.
-func decodeAll(s string, decode func(string) (string, error)) string {
-	for range maxDecodeRounds {
-		d, err := decode(s)
-		if err != nil || d == s {
-			break
+// uniq returns ss without consecutive duplicates.
+func uniq(ss ...string) []string {
+	out := ss[:1]
+	for _, s := range ss[1:] {
+		if s != out[len(out)-1] {
+			out = append(out, s)
 		}
-		s = d
 	}
-	return s
-}
-
-// normalize lowercases s and collapses each run of whitespace into a single
-// space, so that "UNION\t  SELECT" matches the pattern "union select".
-func normalize(s string) string {
-	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+	return out
 }
 
 func isFormEncoded(contentType string) bool {

