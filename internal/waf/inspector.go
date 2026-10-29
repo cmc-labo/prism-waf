@@ -41,6 +41,12 @@ type Match struct {
 	Field string
 	// Base64 reports whether the match was found in Base64-decoded data.
 	Base64 bool
+	// Value is the raw value of the inspected part: the escaped path, the
+	// raw query string, the header value or the body.
+	Value string
+	// Data is the text the signature matched, taken from the normalized
+	// form of Value that matched.
+	Data string
 }
 
 // Inspector checks requests against a set of signatures.
@@ -54,14 +60,23 @@ type compiledSignature struct {
 	re *regexp.Regexp
 }
 
-func (s *compiledSignature) matches(text string) bool {
+// find reports whether the signature matches text and returns the matched
+// substring. The cheaper MatchString runs first, so the cost of extracting
+// the match is only paid for requests that are blocked.
+func (s *compiledSignature) find(text string) (string, bool) {
 	if s.re == nil {
-		return strings.Contains(text, s.Pattern)
+		if strings.Contains(text, s.Pattern) {
+			return s.Pattern, true
+		}
+		return "", false
 	}
 	if len(s.Keywords) > 0 && !containsAny(text, s.Keywords) {
-		return false
+		return "", false
 	}
-	return s.re.MatchString(text)
+	if !s.re.MatchString(text) {
+		return "", false
+	}
+	return s.re.FindString(text), true
 }
 
 func containsAny(s string, substrs []string) bool {
@@ -174,8 +189,15 @@ func (in *Inspector) match(loc Location, field, raw string, opts normalize.Optio
 	cands := candidates(raw, opts)
 	for _, s := range in.signatures {
 		for _, c := range cands {
-			if s.matches(c.text) {
-				return &Match{Signature: s.Signature, Location: loc, Field: field, Base64: c.base64}
+			if data, ok := s.find(c.text); ok {
+				return &Match{
+					Signature: s.Signature,
+					Location:  loc,
+					Field:     field,
+					Base64:    c.base64,
+					Value:     raw,
+					Data:      data,
+				}
 			}
 		}
 	}

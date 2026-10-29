@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
 	"github.com/cmc-labo/prism-waf/internal/waf"
 )
@@ -20,17 +21,34 @@ func main() {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	backend := flag.String("backend", "http://127.0.0.1:8081", "backend server URL")
 	maxBody := flag.Int64("max-body", waf.DefaultMaxBodySize, "maximum request body size in bytes to inspect; larger requests are rejected")
+	auditLog := flag.String("audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
+	trustedProxies := flag.String("trusted-proxies", "", "comma-separated IPs or CIDRs of proxies whose X-Forwarded-For is trusted")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*listen, *backend, *maxBody, logger); err != nil {
+	cfg := config{
+		listen:         *listen,
+		backend:        *backend,
+		maxBody:        *maxBody,
+		auditLog:       *auditLog,
+		trustedProxies: *trustedProxies,
+	}
+	if err := run(cfg, logger); err != nil {
 		logger.Error("prismwaf exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(listen, backend string, maxBody int64, logger *slog.Logger) error {
-	u, err := proxy.ParseBackend(backend)
+type config struct {
+	listen         string
+	backend        string
+	maxBody        int64
+	auditLog       string
+	trustedProxies string
+}
+
+func run(cfg config, logger *slog.Logger) error {
+	u, err := proxy.ParseBackend(cfg.backend)
 	if err != nil {
 		return err
 	}
@@ -38,14 +56,28 @@ func run(listen, backend string, maxBody int64, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	inspector, err := waf.NewInspector(waf.DefaultSignatures, maxBody)
+	inspector, err := waf.NewInspector(waf.DefaultSignatures, cfg.maxBody)
 	if err != nil {
 		return err
 	}
+	tp, err := waf.ParseTrustedProxies(cfg.trustedProxies)
+	if err != nil {
+		return err
+	}
+	auditLogger, closeAudit, err := audit.Open(cfg.auditLog)
+	if err != nil {
+		return err
+	}
+	defer closeAudit.Close()
 
 	srv := &http.Server{
-		Addr:              listen,
-		Handler:           waf.Middleware(rp, inspector, logger),
+		Addr: cfg.listen,
+		Handler: waf.Middleware(rp, waf.Config{
+			Inspector:      inspector,
+			Audit:          auditLogger,
+			TrustedProxies: tp,
+			Logger:         logger,
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -55,7 +87,7 @@ func run(listen, backend string, maxBody int64, logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("prismwaf started", "listen", listen, "backend", u.String())
+		logger.Info("prismwaf started", "listen", cfg.listen, "backend", u.String(), "audit_log", cfg.auditLog)
 		errCh <- srv.ListenAndServe()
 	}()
 

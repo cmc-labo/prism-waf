@@ -143,7 +143,7 @@ func TestMiddleware(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		io.WriteString(w, string(b))
 	})
-	h := Middleware(next, mustInspector(t, 16), nil)
+	h := Middleware(next, Config{Inspector: mustInspector(t, 16)})
 
 	tests := []struct {
 		name        string
