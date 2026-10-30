@@ -3,6 +3,7 @@ package waf
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -142,5 +143,99 @@ func TestNoAuditEventForCleanRequest(t *testing.T) {
 	rec, events := serveWithAudit(t, Config{}, httptest.NewRequest("GET", "/products?id=42", nil))
 	if rec.Code != http.StatusOK || len(events) != 0 {
 		t.Errorf("status = %d, events = %d", rec.Code, len(events))
+	}
+}
+
+func TestDetectModeForwardsAndLogs(t *testing.T) {
+	big := strings.Repeat("a", 100) + " <script>"
+	tests := []struct {
+		name       string
+		req        func() *http.Request
+		wantReason string
+		wantBody   string
+	}{
+		{
+			name:       "attack in query",
+			req:        func() *http.Request { return httptest.NewRequest("GET", "/?q=<script>", nil) },
+			wantReason: "signature",
+		},
+		{
+			name: "attack in body",
+			req: func() *http.Request {
+				return httptest.NewRequest("POST", "/", strings.NewReader("id=1' OR '1'='1"))
+			},
+			wantReason: "signature",
+			wantBody:   "id=1' OR '1'='1",
+		},
+		{
+			name:       "body too large with Content-Length",
+			req:        func() *http.Request { return httptest.NewRequest("POST", "/", strings.NewReader(big)) },
+			wantReason: "body_too_large",
+			wantBody:   big,
+		},
+		{
+			name: "body too large without Content-Length",
+			req: func() *http.Request {
+				r := httptest.NewRequest("POST", "/", strings.NewReader(big))
+				r.ContentLength = -1 // chunked: the limit is only noticed while reading
+				return r
+			},
+			wantReason: "body_too_large",
+			wantBody:   big,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			var reached bool
+			var gotBody string
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached = true
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				w.WriteHeader(http.StatusTeapot)
+			})
+			h := Middleware(next, Config{
+				Inspector: mustInspector(t, 64),
+				Mode:      ModeDetect,
+				Audit:     audit.New(&buf),
+			})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, tc.req())
+
+			if !reached || rec.Code != http.StatusTeapot {
+				t.Fatalf("request not forwarded: reached = %v, status = %d", reached, rec.Code)
+			}
+			if gotBody != tc.wantBody {
+				t.Errorf("backend body = %q, want %q", gotBody, tc.wantBody)
+			}
+			var e audit.Event
+			if err := json.Unmarshal(buf.Bytes(), &e); err != nil {
+				t.Fatalf("audit event: %v (%q)", err, buf.String())
+			}
+			if e.Action != "detect" || e.Reason != tc.wantReason {
+				t.Errorf("action = %q, reason = %q; want detect, %s", e.Action, e.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestBlockModeIsDefault(t *testing.T) {
+	rec, events := serveWithAudit(t, Config{}, httptest.NewRequest("GET", "/?q=<script>", nil))
+	if rec.Code != http.StatusForbidden || len(events) != 1 || events[0].Action != "block" {
+		t.Errorf("status = %d, events = %+v", rec.Code, events)
+	}
+}
+
+func TestParseMode(t *testing.T) {
+	for _, s := range []string{"block", "detect"} {
+		if m, err := ParseMode(s); err != nil || string(m) != s {
+			t.Errorf("ParseMode(%q) = %q, %v", s, m, err)
+		}
+	}
+	for _, s := range []string{"", "Block", "off", "monitor"} {
+		if _, err := ParseMode(s); err == nil {
+			t.Errorf("ParseMode(%q) succeeded, want error", s)
+		}
 	}
 }

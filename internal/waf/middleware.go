@@ -2,6 +2,7 @@ package waf
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -30,9 +31,32 @@ var sensitiveHeaders = map[string]bool{
 	"X-Csrf-Token":        true,
 }
 
+// Mode controls what happens to requests that are detected as attacks.
+type Mode string
+
+const (
+	// ModeBlock rejects detected requests. It is the default.
+	ModeBlock Mode = "block"
+	// ModeDetect only records detected requests in the audit log and
+	// forwards them to the backend. Use it to check a new deployment or new
+	// signatures for false positives before enabling blocking.
+	ModeDetect Mode = "detect"
+)
+
+// ParseMode parses "block" or "detect".
+func ParseMode(s string) (Mode, error) {
+	switch m := Mode(s); m {
+	case ModeBlock, ModeDetect:
+		return m, nil
+	}
+	return "", fmt.Errorf("waf: invalid mode %q: must be %q or %q", s, ModeBlock, ModeDetect)
+}
+
 // Config configures Middleware.
 type Config struct {
 	Inspector *Inspector
+	// Mode is ModeBlock or ModeDetect. The zero value means ModeBlock.
+	Mode Mode
 	// Audit receives an event for every blocked request. Nil disables audit
 	// logging.
 	Audit *audit.Logger
@@ -44,29 +68,37 @@ type Config struct {
 }
 
 // Middleware inspects each request before passing it to next. Requests that
-// match a signature are rejected with 403 Forbidden, and requests whose body
-// exceeds the inspection limit with 413 Request Entity Too Large. Both are
-// recorded in the audit log.
+// match a signature, and requests whose body exceeds the inspection limit,
+// are recorded in the audit log. In ModeBlock they are then rejected with
+// 403 Forbidden and 413 Request Entity Too Large respectively; in ModeDetect
+// they are forwarded to next unchanged.
 func Middleware(next http.Handler, cfg Config) http.Handler {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	detect := cfg.Mode == ModeDetect
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m, err := cfg.Inspector.Inspect(r)
 		switch {
 		case errors.Is(err, ErrBodyTooLarge):
 			id := logEvent(cfg, logger, r, "body_too_large", nil)
-			blockResponse(w, http.StatusRequestEntityTooLarge, id)
+			if !detect {
+				blockResponse(w, http.StatusRequestEntityTooLarge, id)
+				return
+			}
 		case err != nil:
 			logger.Error("failed to inspect request", "remote_addr", r.RemoteAddr, "error", err)
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
 		case m != nil:
 			id := logEvent(cfg, logger, r, "signature", m)
-			blockResponse(w, http.StatusForbidden, id)
-		default:
-			next.ServeHTTP(w, r)
+			if !detect {
+				blockResponse(w, http.StatusForbidden, id)
+				return
+			}
 		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -77,14 +109,19 @@ func blockResponse(w http.ResponseWriter, code int, eventID string) {
 	http.Error(w, http.StatusText(code)+"\nEvent ID: "+eventID, code)
 }
 
-// logEvent writes an audit event for a blocked request and returns its ID.
+// logEvent writes an audit event for a detected request and returns its ID.
+// The event's action is "block" or, in ModeDetect, "detect".
 func logEvent(cfg Config, logger *slog.Logger, r *http.Request, reason string, m *Match) string {
+	action := "block"
+	if cfg.Mode == ModeDetect {
+		action = "detect"
+	}
 	e := &audit.Event{
 		Time:       time.Now().UTC(),
 		ID:         audit.NewID(),
 		ClientIP:   cfg.TrustedProxies.ClientIP(r),
 		RemoteAddr: r.RemoteAddr,
-		Action:     "block",
+		Action:     action,
 		Reason:     reason,
 		Request:    requestSummary(r, m),
 	}

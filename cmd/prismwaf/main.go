@@ -21,6 +21,7 @@ func main() {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	backend := flag.String("backend", "http://127.0.0.1:8081", "backend server URL")
 	maxBody := flag.Int64("max-body", waf.DefaultMaxBodySize, "maximum request body size in bytes to inspect; larger requests are rejected")
+	mode := flag.String("mode", string(waf.ModeBlock), `"block" to reject detected requests, "detect" to only log them`)
 	auditLog := flag.String("audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
 	trustedProxies := flag.String("trusted-proxies", "", "comma-separated IPs or CIDRs of proxies whose X-Forwarded-For is trusted")
 	flag.Parse()
@@ -30,6 +31,7 @@ func main() {
 		listen:         *listen,
 		backend:        *backend,
 		maxBody:        *maxBody,
+		mode:           *mode,
 		auditLog:       *auditLog,
 		trustedProxies: *trustedProxies,
 	}
@@ -43,6 +45,7 @@ type config struct {
 	listen         string
 	backend        string
 	maxBody        int64
+	mode           string
 	auditLog       string
 	trustedProxies string
 }
@@ -60,6 +63,10 @@ func run(cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	mode, err := waf.ParseMode(cfg.mode)
+	if err != nil {
+		return err
+	}
 	tp, err := waf.ParseTrustedProxies(cfg.trustedProxies)
 	if err != nil {
 		return err
@@ -74,6 +81,7 @@ func run(cfg config, logger *slog.Logger) error {
 		Addr: cfg.listen,
 		Handler: waf.Middleware(rp, waf.Config{
 			Inspector:      inspector,
+			Mode:           mode,
 			Audit:          auditLogger,
 			TrustedProxies: tp,
 			Logger:         logger,
@@ -87,7 +95,10 @@ func run(cfg config, logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("prismwaf started", "listen", cfg.listen, "backend", u.String(), "audit_log", cfg.auditLog)
+		logger.Info("prismwaf started", "listen", cfg.listen, "backend", u.String(), "mode", mode, "audit_log", cfg.auditLog)
+		if mode == waf.ModeDetect {
+			logger.Warn("detection mode: attacks are logged but NOT blocked")
+		}
 		errCh <- srv.ListenAndServe()
 	}()
 

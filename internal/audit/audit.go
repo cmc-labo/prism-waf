@@ -26,7 +26,8 @@ type Event struct {
 	ClientIP string `json:"client_ip"`
 	// RemoteAddr is the address of the TCP peer.
 	RemoteAddr string `json:"remote_addr"`
-	// Action is what PrismWAF did, e.g. "block".
+	// Action is what PrismWAF did: "block" (rejected) or "detect" (only
+	// logged and forwarded, in detection mode).
 	Action string `json:"action"`
 	// Reason is why, e.g. "signature" or "body_too_large".
 	Reason  string  `json:"reason"`

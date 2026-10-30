@@ -13,9 +13,10 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   string, headers and body
 - Request normalization that defeats encoding tricks, split keywords and
   Base64-encoded payloads
-- Blocks matching requests with `403 Forbidden`
+- Blocks matching requests with `403 Forbidden`, or only logs them in
+  detection mode
 - Audit log (JSON Lines) recording the client IP, the matched rule and the
-  payload of every blocked request
+  payload of every detected request
 
 ## Quick start
 
@@ -111,9 +112,35 @@ The built-in signatures cover common payloads and their usual variations,
 but no signature set is complete. Treat them as a baseline, not complete
 protection.
 
+## Modes
+
+| Mode | `-mode` | Detected requests |
+|------|---------|-------------------|
+| Block (default) | `block` | Rejected with `403 Forbidden` (or `413` if the body is too large) and logged with `"action": "block"` |
+| Detect | `detect` | Forwarded to the backend unchanged and logged with `"action": "detect"` |
+
+Detection mode lets you find false positives on real traffic before
+anything is blocked. A typical rollout:
+
+```sh
+# 1. Run in detection mode for a while
+go run ./cmd/prismwaf -mode detect -audit-log audit.log
+
+# 2. Review what would have been blocked, by rule and by path
+jq -r 'select(.action == "detect") | [.rule.id // .reason, .request.uri] | @tsv' audit.log | sort | uniq -c | sort -rn
+
+# 3. Once the remaining detections are real attacks, switch to blocking
+go run ./cmd/prismwaf -mode block -audit-log audit.log
+```
+
+In detection mode, requests with bodies over `-max-body` are forwarded
+without their body being inspected, and logged with
+`"reason": "body_too_large"`. Only the first matching rule is logged for each
+request.
+
 ## Audit log
 
-Every blocked request is written to the audit log as one JSON object per
+Every detected request is written to the audit log as one JSON object per
 line. By default it goes to standard output; use `-audit-log` to append to a
 file instead (created with mode `0600`, since payloads may contain secrets).
 
@@ -145,8 +172,9 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 
 | Field | Description |
 |-------|-------------|
-| `id` | Event ID. Also returned in the `403`/`413` response body, so users can report false positives. |
+| `id` | Event ID. In block mode it is also returned in the `403`/`413` response body, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
+| `action` | `block`, or `detect` in detection mode. |
 | `reason` | `signature` or `body_too_large`. |
 | `rule` | The signature that matched. |
 | `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body`. |
@@ -190,6 +218,7 @@ cannot spoof their address by sending the header themselves.
 | `-listen`  | `:8080`                 | Address to listen on     |
 | `-backend` | `http://127.0.0.1:8081` | Backend server URL       |
 | `-max-body` | `131072` (128 KiB)     | Maximum request body size to inspect, in bytes |
+| `-mode` | `block`                 | `block` to reject detected requests, `detect` to only log them |
 | `-audit-log` | `-` (standard output) | File to append audit events to |
 | `-trusted-proxies` | (none)          | Comma-separated IPs/CIDRs of proxies whose `X-Forwarded-For` is trusted |
 

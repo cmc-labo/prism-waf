@@ -125,7 +125,8 @@ func NewInspector(signatures []Signature, maxBodySize int64) (*Inspector, error)
 //
 // The body is read into memory and r.Body is replaced so the request can
 // still be forwarded. Bodies larger than the configured limit are rejected
-// with ErrBodyTooLarge rather than partially inspected.
+// with ErrBodyTooLarge rather than partially inspected; r.Body is then left
+// intact, so the request can still be forwarded in detection mode.
 func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
 	if m := in.match(LocationPath, "", r.URL.EscapedPath(), normalize.Options{}); m != nil {
 		return m, nil
@@ -162,16 +163,26 @@ func (in *Inspector) readBody(r *http.Request) ([]byte, error) {
 	if r.ContentLength > in.maxBodySize {
 		return nil, ErrBodyTooLarge
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, in.maxBodySize+1))
-	r.Body.Close()
+	orig := r.Body
+	body, err := io.ReadAll(io.LimitReader(orig, in.maxBodySize+1))
 	if err != nil {
+		orig.Close()
 		return nil, err
 	}
 	if int64(len(body)) > in.maxBodySize {
+		// A body of unknown length turned out to be too large. Put back
+		// what was read, followed by the unread rest of the stream.
+		r.Body = readCloser{io.MultiReader(bytes.NewReader(body), orig), orig}
 		return nil, ErrBodyTooLarge
 	}
+	orig.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	return body, nil
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
 }
 
 // candidate is one form of an inspected value.
