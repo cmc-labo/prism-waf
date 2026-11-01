@@ -9,7 +9,9 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
 
 - Reverse proxy to a single backend server
 - HTTPS (TLS termination, HTTP/2, certificate reload without restart,
-  HTTP→HTTPS redirect) and HTTPS backends
+  several domains via SNI, automatic certificates via ACME/Let's Encrypt,
+  HSTS, client certificates/mutual TLS, HTTP→HTTPS redirect) and HTTPS
+  backends
 - Signature-based detection of common attacks (SQL injection, XSS, path
   traversal, OS command injection, Log4Shell) in the request path, query
   string, headers and body
@@ -149,6 +151,88 @@ go run ./cmd/prismwaf -listen :8443 -tls-cert cert.pem -tls-key key.pem
 curl --cacert cert.pem https://localhost:8443/
 ```
 
+### Several domains (SNI)
+
+Repeat `-tls-cert` and `-tls-key` in pairs. Each connection gets the first
+certificate that is valid for the server name the client requests; clients
+that request no name or an unknown one get the first certificate. All
+certificates are reloaded on `SIGHUP`, and if any of them fails to load,
+all current ones stay in use.
+
+```sh
+go run ./cmd/prismwaf -listen :443 \
+  -tls-cert example.com.pem -tls-key example.com.key \
+  -tls-cert example.org.pem -tls-key example.org.key
+```
+
+An RSA and an ECDSA certificate for the same name can be combined in the
+same way; each client gets one it supports.
+
+### Automatic certificates (ACME / Let's Encrypt)
+
+PrismWAF can obtain and renew certificates itself instead of using
+certificate files:
+
+```sh
+go run ./cmd/prismwaf -listen :443 -http-redirect :80 \
+  -acme-domains example.com,www.example.com \
+  -acme-cache /var/lib/prismwaf/acme \
+  -acme-email admin@example.com
+```
+
+- Certificates are requested only for `-acme-domains`, so clients cannot
+  make PrismWAF request certificates for arbitrary names and exhaust the
+  CA's rate limits. Wildcards and IP addresses are not supported, and
+  clients must send a server name (SNI).
+- `-acme-cache` holds the account key and the certificates (mode 0700).
+  Keep it across restarts; requesting new certificates on every start hits
+  the rate limits quickly.
+- The CA verifies the domains with the TLS-ALPN-01 challenge on port 443
+  and, when `-http-redirect` is set, the HTTP-01 challenge on port 80. So
+  `-listen` must be reachable as port 443, or `-http-redirect` as port 80,
+  from the internet.
+- Certificates are renewed automatically, 30 days (or a third of their
+  lifetime, if shorter) before they expire.
+- Using `-acme-domains` means accepting the CA's terms of service.
+- Try a new setup with `-acme-directory staging` (Let's Encrypt's staging
+  environment, untrusted certificates but higher rate limits) first. Any
+  other ACME CA can be used by passing its directory URL.
+
+`-acme-domains` and `-tls-cert` are mutually exclusive.
+
+### HSTS
+
+`-hsts-max-age` adds a `Strict-Transport-Security` header to every HTTPS
+response, including blocked ones, so that browsers use only HTTPS for the
+site from then on. A header sent by the backend is replaced.
+
+```sh
+go run ./cmd/prismwaf ... -hsts-max-age 8760h -hsts-include-subdomains
+```
+
+Browsers remember the policy for the whole max-age, so start with a short
+value such as `5m` and increase it once HTTPS works everywhere.
+`-hsts-include-subdomains` applies it to all subdomains as well.
+`-hsts-preload` signals consent to be included in the browsers' preload
+lists (<https://hstspreload.org>); it requires a max-age of at least one
+year and `-hsts-include-subdomains`.
+
+### Client certificates (mutual TLS)
+
+`-tls-client-ca` requires clients to present a certificate signed by one
+of the CAs in the given PEM file; others are rejected during the TLS
+handshake, before any request reaches the WAF or the backend:
+
+```sh
+go run ./cmd/prismwaf ... -tls-client-ca clients-ca.pem
+curl --cert alice.pem --key alice.key https://example.com/
+```
+
+With `-tls-client-auth optional`, clients without a certificate are
+accepted too, but a certificate that is sent must be valid. Mutual TLS can
+be combined with ACME; the CA's validation connections are exempted from
+client authentication but cannot be used to send requests.
+
 ### HTTPS backends
 
 Use an `https://` backend URL. Its certificate is verified against the
@@ -271,8 +355,17 @@ cannot spoof their address by sending the header themselves.
 | `-mode` | `block`                 | `block` to reject detected requests, `detect` to only log them |
 | `-audit-log` | `-` (standard output) | File to append audit events to |
 | `-trusted-proxies` | (none)          | Comma-separated IPs/CIDRs of proxies whose `X-Forwarded-For` is trusted |
-| `-tls-cert`, `-tls-key` | (none)     | PEM certificate chain and private key; enables HTTPS on `-listen` |
-| `-http-redirect` | (none)            | Address of an HTTP listener that redirects to HTTPS, e.g. `:80` |
+| `-tls-cert`, `-tls-key` | (none)     | PEM certificate chain and private key; enables HTTPS on `-listen`. Repeat for several domains |
+| `-acme-domains` | (none)             | Comma-separated domains to obtain certificates for via ACME; enables HTTPS on `-listen` |
+| `-acme-cache` | (none)               | Directory for ACME account keys and certificates (required with `-acme-domains`) |
+| `-acme-email` | (none)               | Contact email for the ACME CA |
+| `-acme-directory` | Let's Encrypt    | ACME directory URL, or `staging` for Let's Encrypt's staging environment |
+| `-http-redirect` | (none)            | Address of an HTTP listener that redirects to HTTPS and answers ACME HTTP-01 challenges, e.g. `:80` |
+| `-hsts-max-age` | `0` (off)          | Send `Strict-Transport-Security` with this max-age, e.g. `8760h` |
+| `-hsts-include-subdomains` | `false` | Add `includeSubDomains` to the HSTS header |
+| `-hsts-preload` | `false`            | Add `preload` to the HSTS header |
+| `-tls-client-ca` | (none)            | PEM CA file; require client certificates signed by it (mutual TLS) |
+| `-tls-client-auth` | `require`       | `require` or `optional` client certificates with `-tls-client-ca` |
 | `-backend-ca` | (none)               | PEM CA file for verifying an `https://` backend |
 | `-backend-insecure-skip-verify` | `false` | Do not verify the backend certificate (testing only) |
 
@@ -289,7 +382,7 @@ go build -o bin/prismwaf ./cmd/prismwaf
 ```
 cmd/prismwaf/        entry point
 internal/proxy/      reverse proxy
-internal/tlsutil/    TLS configuration, certificate reload, HTTPS redirect
+internal/tlsutil/    TLS configuration, certificates (files, SNI, ACME), mTLS, HSTS, HTTPS redirect
 internal/audit/      audit log (JSON Lines)
 internal/normalize/  decoding and canonicalization of request data
 internal/waf/        signatures and request inspection

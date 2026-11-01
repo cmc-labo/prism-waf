@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,9 +30,18 @@ func main() {
 	flag.StringVar(&cfg.mode, "mode", string(waf.ModeBlock), `"block" to reject detected requests, "detect" to only log them`)
 	flag.StringVar(&cfg.auditLog, "audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
 	flag.StringVar(&cfg.trustedProxies, "trusted-proxies", "", "comma-separated IPs or CIDRs of proxies whose X-Forwarded-For is trusted")
-	flag.StringVar(&cfg.tlsCert, "tls-cert", "", "PEM certificate chain file; enables HTTPS on -listen (requires -tls-key)")
-	flag.StringVar(&cfg.tlsKey, "tls-key", "", "PEM private key file for -tls-cert")
-	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80" (requires -tls-cert)`)
+	flag.Var(&cfg.tlsCerts, "tls-cert", "PEM certificate chain file; enables HTTPS on -listen. Repeat with -tls-key for several domains (SNI); the first is the default")
+	flag.Var(&cfg.tlsKeys, "tls-key", "PEM private key file for the -tls-cert at the same position")
+	flag.StringVar(&cfg.acmeDomains, "acme-domains", "", "comma-separated domains to obtain certificates for from an ACME CA (Let's Encrypt); enables HTTPS on -listen")
+	flag.StringVar(&cfg.acmeCache, "acme-cache", "", "directory to store ACME account keys and certificates in (required with -acme-domains)")
+	flag.StringVar(&cfg.acmeEmail, "acme-email", "", "contact email for the ACME CA's expiry notices")
+	flag.StringVar(&cfg.acmeDirectory, "acme-directory", "", "ACME directory URL; default Let's Encrypt, \"staging\" for its staging environment")
+	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80"; also answers ACME HTTP-01 challenges (requires HTTPS)`)
+	flag.DurationVar(&cfg.hsts.MaxAge, "hsts-max-age", 0, `send Strict-Transport-Security with this max-age on HTTPS responses, e.g. "8760h"; 0 disables`)
+	flag.BoolVar(&cfg.hsts.IncludeSubdomains, "hsts-include-subdomains", false, "add includeSubDomains to the HSTS header")
+	flag.BoolVar(&cfg.hsts.Preload, "hsts-preload", false, "add preload to the HSTS header (requires -hsts-max-age of at least 8760h and -hsts-include-subdomains)")
+	flag.StringVar(&cfg.clientCA, "tls-client-ca", "", "PEM CA file to verify client certificates with (mutual TLS)")
+	flag.StringVar(&cfg.clientAuth, "tls-client-auth", "", `client certificate mode with -tls-client-ca: "require" (default) or "optional"`)
 	flag.StringVar(&cfg.backendCA, "backend-ca", "", "PEM CA file to verify an https:// backend with, instead of the system CAs")
 	flag.BoolVar(&cfg.backendInsecure, "backend-insecure-skip-verify", false, "do not verify the https:// backend certificate (testing only)")
 	flag.Parse()
@@ -49,21 +60,68 @@ type config struct {
 	mode            string
 	auditLog        string
 	trustedProxies  string
-	tlsCert         string
-	tlsKey          string
+	tlsCerts        stringList
+	tlsKeys         stringList
+	acmeDomains     string
+	acmeCache       string
+	acmeEmail       string
+	acmeDirectory   string
 	httpRedirect    string
+	hsts            tlsutil.HSTSPolicy
+	clientCA        string
+	clientAuth      string
 	backendCA       string
 	backendInsecure bool
 }
 
-func (c config) tlsEnabled() bool { return c.tlsCert != "" }
+// stringList is a flag that can be repeated.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
+func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
+
+func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
 
 func (c config) validate() error {
-	if (c.tlsCert == "") != (c.tlsKey == "") {
-		return errors.New("-tls-cert and -tls-key must be set together")
+	if len(c.tlsCerts) != len(c.tlsKeys) {
+		return errors.New("each -tls-cert needs a matching -tls-key")
 	}
-	if c.httpRedirect != "" && !c.tlsEnabled() {
-		return errors.New("-http-redirect requires -tls-cert and -tls-key")
+	if len(c.tlsCerts) > 0 && c.acmeEnabled() {
+		return errors.New("-tls-cert and -acme-domains are mutually exclusive")
+	}
+	if !c.acmeEnabled() && (c.acmeCache != "" || c.acmeEmail != "" || c.acmeDirectory != "") {
+		return errors.New("-acme-cache, -acme-email and -acme-directory require -acme-domains")
+	}
+	if c.acmeEnabled() && c.acmeCache == "" {
+		return errors.New("-acme-domains requires -acme-cache")
+	}
+	if !c.tlsEnabled() {
+		switch {
+		case c.httpRedirect != "":
+			return errors.New("-http-redirect requires HTTPS (-tls-cert or -acme-domains)")
+		case c.hsts != (tlsutil.HSTSPolicy{}):
+			return errors.New("-hsts-* options require HTTPS (-tls-cert or -acme-domains)")
+		case c.clientCA != "":
+			return errors.New("-tls-client-ca requires HTTPS (-tls-cert or -acme-domains)")
+		}
+	}
+	if c.hsts.MaxAge == 0 && (c.hsts.IncludeSubdomains || c.hsts.Preload) {
+		return errors.New("-hsts-include-subdomains and -hsts-preload require -hsts-max-age")
+	}
+	if err := c.hsts.Validate(); err != nil {
+		return err
+	}
+	if c.clientAuth != "" && c.clientCA == "" {
+		return errors.New("-tls-client-auth requires -tls-client-ca")
+	}
+	if _, err := tlsutil.ParseClientAuth(c.clientAuth); err != nil {
+		return err
 	}
 	return nil
 }
@@ -102,37 +160,86 @@ func run(cfg config, logger *slog.Logger) error {
 	}
 	defer closeAudit.Close()
 
+	// Send net/http's own errors, such as failed TLS handshakes of clients
+	// without a valid certificate, to the operational log.
+	httpErrorLog := slog.NewLogLogger(logger.Handler(), slog.LevelWarn)
+	var handler http.Handler = waf.Middleware(rp, waf.Config{
+		Inspector:      inspector,
+		Mode:           mode,
+		Audit:          auditLogger,
+		TrustedProxies: tp,
+		Logger:         logger,
+	})
+	if cfg.hsts.MaxAge > 0 {
+		// Outermost, so that blocked responses carry the header too.
+		handler = tlsutil.HSTS(handler, cfg.hsts)
+	}
 	srv := &http.Server{
-		Addr: cfg.listen,
-		Handler: waf.Middleware(rp, waf.Config{
-			Inspector:      inspector,
-			Mode:           mode,
-			Audit:          auditLogger,
-			TrustedProxies: tp,
-			Logger:         logger,
-		}),
+		Addr:              cfg.listen,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		ErrorLog:          httpErrorLog,
 	}
 	servers := []*http.Server{srv}
 
 	var certs *tlsutil.CertReloader
 	if cfg.tlsEnabled() {
-		certs, err = tlsutil.NewCertReloader(cfg.tlsCert, cfg.tlsKey)
-		if err != nil {
-			return err
-		}
-		srv.TLSConfig = tlsutil.ServerConfig(certs)
+		opts := tlsutil.ServerOptions{}
+		var redirect http.Handler
 		if cfg.httpRedirect != "" {
 			_, httpsPort, err := net.SplitHostPort(cfg.listen)
 			if err != nil {
 				return fmt.Errorf("invalid -listen address %q: %w", cfg.listen, err)
 			}
+			redirect = tlsutil.RedirectHandler(httpsPort)
+		}
+		if cfg.acmeEnabled() {
+			m, err := tlsutil.NewACMEManager(tlsutil.ACMEConfig{
+				Domains:      splitList(cfg.acmeDomains),
+				CacheDir:     cfg.acmeCache,
+				Email:        cfg.acmeEmail,
+				DirectoryURL: acmeDirectoryURL(cfg.acmeDirectory),
+			})
+			if err != nil {
+				return err
+			}
+			opts.GetCertificate = m.GetCertificate
+			opts.ACME = true
+			if redirect != nil {
+				redirect = m.HTTPHandler(redirect)
+			}
+		} else {
+			pairs := make([]tlsutil.CertPair, len(cfg.tlsCerts))
+			for i := range cfg.tlsCerts {
+				pairs[i] = tlsutil.CertPair{CertFile: cfg.tlsCerts[i], KeyFile: cfg.tlsKeys[i]}
+			}
+			certs, err = tlsutil.NewCertReloader(pairs)
+			if err != nil {
+				return err
+			}
+			opts.GetCertificate = certs.GetCertificate
+		}
+		if cfg.clientCA != "" {
+			if opts.ClientCAs, err = tlsutil.LoadCAs(cfg.clientCA); err != nil {
+				return err
+			}
+			clientAuth := cfg.clientAuth
+			if clientAuth == "" {
+				clientAuth = "require"
+			}
+			if opts.ClientAuth, err = tlsutil.ParseClientAuth(clientAuth); err != nil {
+				return err
+			}
+		}
+		srv.TLSConfig = tlsutil.ServerConfig(opts)
+		if redirect != nil {
 			servers = append(servers, &http.Server{
 				Addr:              cfg.httpRedirect,
-				Handler:           tlsutil.RedirectHandler(httpsPort),
+				Handler:           redirect,
 				ReadHeaderTimeout: 10 * time.Second,
 				IdleTimeout:       120 * time.Second,
+				ErrorLog:          httpErrorLog,
 			})
 		}
 	}
@@ -150,6 +257,18 @@ func run(cfg config, logger *slog.Logger) error {
 	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backend", u.String(), "mode", mode, "audit_log", cfg.auditLog)
 	if cfg.httpRedirect != "" {
 		logger.Info("redirecting HTTP to HTTPS", "listen", cfg.httpRedirect)
+	}
+	if cfg.acmeEnabled() {
+		logger.Info("obtaining certificates via ACME", "domains", cfg.acmeDomains, "directory", acmeDirectoryURL(cfg.acmeDirectory), "cache", cfg.acmeCache)
+		if cfg.httpRedirect == "" {
+			logger.Info("ACME HTTP-01 challenge disabled; TLS-ALPN-01 requires -listen to be reachable on port 443")
+		}
+	}
+	if cfg.hsts.MaxAge > 0 {
+		logger.Info("HSTS enabled", "header", cfg.hsts.Header())
+	}
+	if srv.TLSConfig != nil && srv.TLSConfig.ClientAuth != tls.NoClientCert {
+		logger.Info("client certificate authentication enabled", "mode", srv.TLSConfig.ClientAuth.String(), "ca", cfg.clientCA)
 	}
 	if mode == waf.ModeDetect {
 		logger.Warn("detection mode: attacks are logged but NOT blocked")
@@ -188,6 +307,26 @@ func run(cfg config, logger *slog.Logger) error {
 		}
 	}
 	return runErr
+}
+
+// splitList splits a comma-separated flag value, ignoring blanks.
+func splitList(s string) []string {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// acmeDirectoryURL resolves the -acme-directory flag; "" means the
+// default, Let's Encrypt.
+func acmeDirectoryURL(s string) string {
+	if s == "staging" {
+		return tlsutil.LetsEncryptStaging
+	}
+	return s
 }
 
 // backendTransport returns the transport for requests to the backend, or
