@@ -31,7 +31,7 @@ func TestProxyForwardsRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(u, nil)
+	h, err := New(u, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestProxyBackendDown(t *testing.T) {
 	u, _ := ParseBackend(backend.URL)
 	backend.Close() // make the backend unreachable
 
-	h, err := New(u, nil)
+	h, err := New(u, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,5 +105,53 @@ func TestParseBackend(t *testing.T) {
 		if (err != nil) != tc.wantErr {
 			t.Errorf("ParseBackend(%q) err = %v, wantErr %v", tc.in, err, tc.wantErr)
 		}
+	}
+}
+
+func TestProxyHTTPSBackend(t *testing.T) {
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "secure "+r.URL.Path)
+	}))
+	defer backend.Close()
+	u, _ := ParseBackend(backend.URL)
+
+	// backend.Client() trusts the test server's self-signed certificate.
+	h, err := New(u, backend.Client().Transport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "secure /x" {
+		t.Errorf("got %d %q", rec.Code, rec.Body.String())
+	}
+
+	// With the default transport, the untrusted certificate is rejected.
+	h, _ = New(u, nil, nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("untrusted backend: status = %d, want 502", rec.Code)
+	}
+}
+
+func TestProxyTLSFrontendSetsForwardedProto(t *testing.T) {
+	var proto string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proto = r.Header.Get("X-Forwarded-Proto")
+	}))
+	defer backend.Close()
+	u, _ := ParseBackend(backend.URL)
+	h, _ := New(u, nil, nil)
+
+	front := httptest.NewTLSServer(h)
+	defer front.Close()
+	resp, err := front.Client().Get(front.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if proto != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want https", proto)
 	}
 }

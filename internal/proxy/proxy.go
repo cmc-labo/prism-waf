@@ -12,8 +12,9 @@ import (
 )
 
 // New returns an http.Handler that forwards every request to backend
-// unchanged, except for the standard X-Forwarded-* headers.
-func New(backend *url.URL, logger *slog.Logger) (http.Handler, error) {
+// unchanged, except for the standard X-Forwarded-* headers. transport sends
+// the requests to the backend; nil uses http.DefaultTransport.
+func New(backend *url.URL, transport http.RoundTripper, logger *slog.Logger) (http.Handler, error) {
 	if backend == nil || backend.Scheme == "" || backend.Host == "" {
 		return nil, errors.New("proxy: backend URL must include scheme and host")
 	}
@@ -22,6 +23,7 @@ func New(backend *url.URL, logger *slog.Logger) (http.Handler, error) {
 	}
 
 	rp := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(backend)
 			r.SetXForwarded()

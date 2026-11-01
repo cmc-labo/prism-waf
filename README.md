@@ -8,6 +8,8 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
 ## Features
 
 - Reverse proxy to a single backend server
+- HTTPS (TLS termination, HTTP/2, certificate reload without restart,
+  HTTP→HTTPS redirect) and HTTPS backends
 - Signature-based detection of common attacks (SQL injection, XSS, path
   traversal, OS command injection, Log4Shell) in the request path, query
   string, headers and body
@@ -111,6 +113,54 @@ raise the limit with care.
 The built-in signatures cover common payloads and their usual variations,
 but no signature set is complete. Treat them as a baseline, not complete
 protection.
+
+## HTTPS
+
+### Serving HTTPS to clients
+
+Pass a certificate and key to serve HTTPS on `-listen`:
+
+```sh
+go run ./cmd/prismwaf -listen :443 \
+  -tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  -tls-key  /etc/letsencrypt/live/example.com/privkey.pem \
+  -http-redirect :80
+```
+
+- TLS 1.2 or later is required; Go's default cipher suites are used.
+- HTTP/2 is negotiated automatically.
+- `-http-redirect` starts a plain HTTP listener that answers every request
+  with `308 Permanent Redirect` to the same URL over HTTPS. It does not
+  proxy anything.
+- Send `SIGHUP` to reload the certificate without dropping connections,
+  e.g. from a certbot deploy hook:
+  `certbot renew --deploy-hook "pkill -HUP prismwaf"`.
+  If the new files cannot be loaded, the current certificate stays in use
+  and an error is logged.
+- The backend receives `X-Forwarded-Proto: https`.
+
+For local testing, create a self-signed certificate:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+  -keyout key.pem -out cert.pem
+go run ./cmd/prismwaf -listen :8443 -tls-cert cert.pem -tls-key key.pem
+curl --cacert cert.pem https://localhost:8443/
+```
+
+### HTTPS backends
+
+Use an `https://` backend URL. Its certificate is verified against the
+system CAs; for an internal CA or a self-signed certificate, pass it with
+`-backend-ca`:
+
+```sh
+go run ./cmd/prismwaf -backend https://app.internal:8443 -backend-ca internal-ca.pem
+```
+
+`-backend-insecure-skip-verify` disables verification entirely. It makes the
+connection vulnerable to interception and is meant for testing only.
 
 ## Modes
 
@@ -221,6 +271,10 @@ cannot spoof their address by sending the header themselves.
 | `-mode` | `block`                 | `block` to reject detected requests, `detect` to only log them |
 | `-audit-log` | `-` (standard output) | File to append audit events to |
 | `-trusted-proxies` | (none)          | Comma-separated IPs/CIDRs of proxies whose `X-Forwarded-For` is trusted |
+| `-tls-cert`, `-tls-key` | (none)     | PEM certificate chain and private key; enables HTTPS on `-listen` |
+| `-http-redirect` | (none)            | Address of an HTTP listener that redirects to HTTPS, e.g. `:80` |
+| `-backend-ca` | (none)               | PEM CA file for verifying an `https://` backend |
+| `-backend-insecure-skip-verify` | `false` | Do not verify the backend certificate (testing only) |
 
 ## Development
 
@@ -235,6 +289,7 @@ go build -o bin/prismwaf ./cmd/prismwaf
 ```
 cmd/prismwaf/        entry point
 internal/proxy/      reverse proxy
+internal/tlsutil/    TLS configuration, certificate reload, HTTPS redirect
 internal/audit/      audit log (JSON Lines)
 internal/normalize/  decoding and canonicalization of request data
 internal/waf/        signatures and request inspection
