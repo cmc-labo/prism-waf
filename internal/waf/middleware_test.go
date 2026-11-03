@@ -107,6 +107,20 @@ func TestAuditEventKeepsSensitiveHeaderWhenItIsThePayload(t *testing.T) {
 	}
 }
 
+func TestAuditEventForJSONField(t *testing.T) {
+	r := httptest.NewRequest("POST", "/login", strings.NewReader(`{"user":{"name":"admin' OR '1'='1","pw":"x"}}`))
+	r.Header.Set("Content-Type", "application/json")
+
+	rec, events := serveWithAudit(t, Config{}, r)
+
+	if rec.Code != http.StatusForbidden || len(events) != 1 {
+		t.Fatalf("status %d, %d events", rec.Code, len(events))
+	}
+	if m := events[0].Match; m.Location != "body" || m.Field != "$.user.name" || m.Value != "admin' OR '1'='1" {
+		t.Errorf("match = %+v", m)
+	}
+}
+
 func TestAuditEventBase64AndTruncation(t *testing.T) {
 	payload := strings.Repeat("a", 10000) + ` PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==`
 	r := httptest.NewRequest("POST", "/api", strings.NewReader(payload))

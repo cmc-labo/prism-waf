@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cmc-labo/prism-waf/internal/normalize"
 )
@@ -37,12 +38,15 @@ const (
 type Match struct {
 	Signature Signature
 	Location  Location
-	// Field is the header name for LocationHeader and empty otherwise.
+	// Field is the header name for LocationHeader, the path of the value
+	// for a parsed JSON or XML body (e.g. "$.user.name" or
+	// "/order/item/@id"), and empty otherwise.
 	Field string
 	// Base64 reports whether the match was found in Base64-decoded data.
 	Base64 bool
 	// Value is the raw value of the inspected part: the escaped path, the
-	// raw query string, the header value or the body.
+	// raw query string, the header value, the body, or the decoded value of
+	// a JSON or XML field.
 	Value string
 	// Data is the text the signature matched, taken from the normalized
 	// form of Value that matched.
@@ -147,12 +151,41 @@ func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
 		return nil, err
 	}
 	if len(body) > 0 {
-		opts := normalize.Options{PlusAsSpace: isFormEncoded(r.Header.Get("Content-Type"))}
-		if m := in.match(LocationBody, "", string(body), opts); m != nil {
-			return m, nil
-		}
+		return in.inspectBody(r.Header.Get("Content-Type"), body), nil
 	}
 	return nil, nil
+}
+
+// inspectBody checks a request body. JSON and XML bodies are parsed and
+// each value is checked on its own, with Match.Field set to its path.
+// Bodies that are not valid UTF-8 or fail to parse are checked as a whole,
+// as are bodies of other types, so a malformed document cannot hide a
+// payload from inspection.
+func (in *Inspector) inspectBody(contentType string, body []byte) *Match {
+	var walk func([]byte, visitFunc) error
+	switch bodyFormatOf(contentType) {
+	case formatJSON:
+		walk = walkJSON
+	case formatXML:
+		walk = walkXML
+	}
+	// Parsers replace invalid UTF-8, which would hide overlong encodings
+	// that normalization decodes in the raw body.
+	if walk != nil && utf8.Valid(body) {
+		var m *Match
+		err := walk(body, func(value string, path func() string) error {
+			if m = in.match(LocationBody, "", value, normalize.Options{}); m != nil {
+				m.Field = path()
+				return errStopWalk
+			}
+			return nil
+		})
+		if m != nil || err == nil {
+			return m
+		}
+	}
+	opts := normalize.Options{PlusAsSpace: isFormEncoded(contentType)}
+	return in.match(LocationBody, "", string(body), opts)
 }
 
 // readBody buffers the request body and restores it on r.

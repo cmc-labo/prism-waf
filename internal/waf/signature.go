@@ -141,6 +141,28 @@ var DefaultSignatures = []Signature{
 		Keywords: []string{"/bin/", "cmd", "powershell"},
 	},
 
+	// XML external entities (XXE). Requests rarely need a DTD, so external
+	// entities and DTDs, entities built from other entities, and XInclude
+	// are all treated as attacks.
+	{
+		// <!ENTITY xxe SYSTEM "file:///...">, <!ENTITY % p PUBLIC "x" "http://...">,
+		// <!DOCTYPE x SYSTEM "http://.../evil.dtd">
+		ID: "XXE-001", Category: "xxe",
+		Regex:    `<!(?:entity\s+(?:%\s*)?|doctype\s+)[^\s>\[]+\s+(?:system|public)\b`,
+		Keywords: []string{"<!entity", "<!doctype"},
+	},
+	{
+		// Entity expansion ("billion laughs"): <!ENTITY b "&a;&a;&a;">
+		ID: "XXE-002", Category: "xxe",
+		Regex:    `<!entity\s+(?:%\s*)?[^\s>]+\s+["'][^"']*[&%][^;\s"']+;`,
+		Keywords: []string{"<!entity"},
+	},
+	{
+		// <xi:include href="file:///etc/passwd" xmlns:xi="http://www.w3.org/2001/XInclude"/>
+		ID: "XXE-003", Category: "xxe",
+		Pattern: "w3.org/2001/xinclude",
+	},
+
 	// Log4Shell (CVE-2021-44228). Nested lookups such as ${${lower:j}ndi:
 	// are expanded during normalization.
 	{

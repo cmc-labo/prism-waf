@@ -1,7 +1,10 @@
 package waf
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -71,8 +74,9 @@ func TestInspectDetectsAttacks(t *testing.T) {
 				r.Header.Set("Content-Type", "application/json")
 				return r
 			},
-			wantID:  "SQLI-001",
-			wantLoc: LocationBody,
+			wantID:    "SQLI-001",
+			wantLoc:   LocationBody,
+			wantField: "$.user",
 		},
 	}
 
@@ -391,6 +395,7 @@ func BenchmarkInspect(b *testing.B) {
 		b.Fatal(err)
 	}
 	largeBody := `{"items":[` + strings.Repeat(`{"id":12345,"name":"O'Brien's item","desc":"plain text description"},`, 1700) + `{}]}`
+	largeXML := `<items>` + strings.Repeat(`<item id="12345"><name>O'Brien's item</name><desc>plain text description</desc></item>`, 1450) + `</items>`
 	benches := []struct {
 		name string
 		req  func() *http.Request
@@ -401,8 +406,18 @@ func BenchmarkInspect(b *testing.B) {
 			r.Header.Set("Cookie", "theme=dark; session=Zm9vYmFyYmF6cXV4")
 			return r
 		}},
-		{"128KiB JSON body", func() *http.Request {
+		{"128KiB raw body", func() *http.Request {
 			return httptest.NewRequest("POST", "/api", strings.NewReader(largeBody))
+		}},
+		{"128KiB JSON body", func() *http.Request {
+			r := httptest.NewRequest("POST", "/api", strings.NewReader(largeBody))
+			r.Header.Set("Content-Type", "application/json")
+			return r
+		}},
+		{"128KiB XML body", func() *http.Request {
+			r := httptest.NewRequest("POST", "/api", strings.NewReader(largeXML))
+			r.Header.Set("Content-Type", "application/xml")
+			return r
 		}},
 	}
 	for _, bc := range benches {
@@ -435,13 +450,77 @@ func BenchmarkInspectWorstCase(b *testing.B) {
 		}
 	}
 	filler := `{"id":12345,"name":"O'Brien's item","desc":"plain text description"},`
-	body := prefix.String() + strings.Repeat(filler, (DefaultMaxBodySize-prefix.Len())/len(filler))
-
-	if m, err := in.Inspect(httptest.NewRequest("POST", "/", strings.NewReader(body))); m != nil || err != nil {
-		b.Fatalf("worst-case body must pass inspection, got %+v, %v", m, err)
+	// fill returns the largest body that is still within the limit once
+	// encoded, e.g. as one JSON string or one XML attribute value.
+	fill := func(encode func(string) string) string {
+		for n := (DefaultMaxBodySize - prefix.Len()) / len(filler); ; n-- {
+			if body := encode(prefix.String() + strings.Repeat(filler, n)); len(body) <= DefaultMaxBodySize {
+				return body
+			}
+		}
 	}
-	b.SetBytes(int64(len(body)))
-	for b.Loop() {
-		in.Inspect(httptest.NewRequest("POST", "/", strings.NewReader(body)))
+
+	for _, bc := range []struct{ name, ct, body string }{
+		{"raw", "", fill(func(s string) string { return s })},
+		{"JSON", "application/json", fill(func(s string) string {
+			b, _ := json.Marshal(s)
+			return string(b)
+		})},
+		{"XML", "application/xml", fill(func(s string) string { return `<a b="` + html.EscapeString(s) + `"/>` })},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			req := func() *http.Request {
+				r := httptest.NewRequest("POST", "/", strings.NewReader(bc.body))
+				r.Header.Set("Content-Type", bc.ct)
+				return r
+			}
+			if m, err := in.Inspect(req()); m != nil || err != nil {
+				b.Fatalf("worst-case body must pass inspection, got %+v, %v", m, err)
+			}
+			b.SetBytes(int64(len(bc.body)))
+			for b.Loop() {
+				in.Inspect(req())
+			}
+		})
+	}
+}
+
+// BenchmarkInspectManyFields measures structured bodies made of as many
+// short values as fit into the body limit. Each value is inspected on its
+// own, so this is the worst case for the per-value overhead.
+func BenchmarkInspectManyFields(b *testing.B) {
+	in, err := NewInspector(DefaultSignatures, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var jsonBody, xmlBody strings.Builder
+	jsonBody.WriteString("[")
+	xmlBody.WriteString("<a>")
+	for i := 0; jsonBody.Len() < DefaultMaxBodySize-16; i++ {
+		fmt.Fprintf(&jsonBody, `"%x",`, i)
+	}
+	for i := 0; xmlBody.Len() < DefaultMaxBodySize-16; i++ {
+		fmt.Fprintf(&xmlBody, `<b c="%x"/>`, i)
+	}
+	jsonBody.WriteString(`""]`)
+	xmlBody.WriteString("</a>")
+	for _, bc := range []struct{ name, ct, body string }{
+		{"JSON", "application/json", jsonBody.String()},
+		{"XML", "application/xml", xmlBody.String()},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			req := func() *http.Request {
+				r := httptest.NewRequest("POST", "/", strings.NewReader(bc.body))
+				r.Header.Set("Content-Type", bc.ct)
+				return r
+			}
+			if m, err := in.Inspect(req()); m != nil || err != nil {
+				b.Fatalf("body must pass inspection, got %+v, %v", m, err)
+			}
+			b.SetBytes(int64(len(bc.body)))
+			for b.Loop() {
+				in.Inspect(req())
+			}
+		})
 	}
 }

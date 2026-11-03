@@ -13,8 +13,9 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   HSTS, client certificates/mutual TLS, HTTP→HTTPS redirect) and HTTPS
   backends
 - Signature-based detection of common attacks (SQL injection, XSS, path
-  traversal, OS command injection, Log4Shell) in the request path, query
-  string, headers and body
+  traversal, OS command injection, Log4Shell, XXE) in the request path,
+  query string, headers and body
+- JSON and XML bodies are parsed and every value is inspected on its own
 - Request normalization that defeats encoding tricks, split keywords and
   Base64-encoded payloads
 - Blocks matching requests with `403 Forbidden`, or only logs them in
@@ -64,7 +65,7 @@ matches any of the following:
 - the URL path
 - the query string
 - any header value
-- the request body
+- the request body; JSON and XML bodies value by value (see below)
 
 Before matching, every value is normalized so that encoded or obfuscated
 payloads are detected (see [`internal/normalize`](internal/normalize)):
@@ -105,12 +106,51 @@ can declare `Keywords`: substrings that every match must contain. The regex
 only runs when one of them is present, which makes typical inspection about
 10× faster.
 
+### JSON and XML bodies
+
+Bodies with a JSON content type (`application/json`, `application/*+json`)
+or an XML content type (`application/xml`, `text/xml`, `application/*+xml`
+such as SOAP) are parsed, and every value is inspected on its own instead
+of the body as a whole:
+
+| Format | Inspected values | Example `match.field` |
+|--------|------------------|-----------------------|
+| JSON | Every string value and object key, including duplicate keys | `$.user.name`, `$.items[2]`, `$["a.b"]` |
+| XML | Element text, attribute values, start tags (names only, to catch event handler attributes), comments, processing instructions, the DOCTYPE | `/order/item`, `/order/item/@id`, `/order/comment()`, `<!DOCTYPE>` |
+
+This has three benefits:
+
+- **Fewer false positives.** JSON and XML syntax around values can complete
+  a pattern that no value contains: `{"filter":"and price>100"}` looks like
+  `" and price>100` (SQL injection) to a raw scan, but the value alone is
+  harmless.
+- **Better detection.** Patterns that require the end of a value, such as
+  `admin'--` or `; id`, now match inside a document. Escapes are decoded by
+  the parser, and XML text is joined across CDATA sections, entity
+  references and comments, so `<![CDATA[<scr]]><![CDATA[ipt>]]>` is
+  inspected as `<script>`.
+- **Precise audit events.** `match.field` names the value that matched and
+  `match.value` holds its decoded content.
+
+A body that is not valid UTF-8 or does not parse, for example truncated
+JSON, a payload after the document, or an XML entity that only a DTD can
+define, is inspected as a whole as before, so a malformed document cannot
+hide a payload. Bodies with other content types are always inspected as a
+whole.
+
+XML bodies are also checked for XML external entity (XXE) attacks: external
+entities and DTDs (`<!ENTITY x SYSTEM "…">`), entity expansion ("billion
+laughs") and XInclude. These signatures apply to all other locations too.
+
+### Body size
+
 Request bodies are buffered in memory for inspection. Bodies larger than
 `-max-body` (default 128 KiB, the same as ModSecurity's default for bodies
 without files) are rejected with `413 Request Entity Too Large` rather than
 partially inspected. Inspection cost grows with body size; a body crafted
-to defeat the keyword prefilters takes about 100 ms of CPU at 128 KiB, so
-raise the limit with care.
+to defeat the keyword prefilters takes about 100 ms of CPU at 128 KiB,
+whether it is inspected raw or as JSON or XML, so raise the limit with
+care.
 
 The built-in signatures cover common payloads and their usual variations,
 but no signature set is complete. Treat them as a baseline, not complete
@@ -311,7 +351,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `action` | `block`, or `detect` in detection mode. |
 | `reason` | `signature` or `body_too_large`. |
 | `rule` | The signature that matched. |
-| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body`. |
+| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). |
 | `match.data` | The text the signature matched, after normalization. |
 | `match.value` | The raw value that was inspected, i.e. the payload as sent. Truncated to 4 KiB (`value_truncated`, `value_length`). |
 | `match.base64` | `true` if the match was in Base64-decoded data. |
@@ -385,7 +425,7 @@ internal/proxy/      reverse proxy
 internal/tlsutil/    TLS configuration, certificates (files, SNI, ACME), mTLS, HSTS, HTTPS redirect
 internal/audit/      audit log (JSON Lines)
 internal/normalize/  decoding and canonicalization of request data
-internal/waf/        signatures and request inspection
+internal/waf/        signatures, request inspection, JSON/XML body parsing
 examples/backend/    echo server for local testing
 ```
 
