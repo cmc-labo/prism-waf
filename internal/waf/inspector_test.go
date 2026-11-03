@@ -129,6 +129,16 @@ func TestInspectRestoresBody(t *testing.T) {
 	if string(b) != "hello" {
 		t.Errorf("body after inspection = %q, want %q", b, "hello")
 	}
+	// GetBody lets the proxy send the body again on retry.
+	for range 2 {
+		rc, err := r.GetBody()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := io.ReadAll(rc); string(b) != "hello" {
+			t.Errorf("GetBody = %q, want %q", b, "hello")
+		}
+	}
 }
 
 func TestInspectBodyTooLarge(t *testing.T) {

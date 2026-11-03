@@ -13,12 +13,16 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":8081", "address to listen on")
+	name := flag.String("name", "", "name reported in the X-Backend response header, to tell several backends apart")
 	flag.Parse()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if *name != "" {
+			w.Header().Set("X-Backend", *name)
+		}
 		fmt.Fprintf(w, "%s %s %s\n", r.Method, r.URL.RequestURI(), r.Proto)
 		fmt.Fprintf(w, "Host: %s\n", r.Host)
 

@@ -127,8 +127,8 @@ func NewInspector(signatures []Signature, maxBodySize int64) (*Inspector, error)
 // Inspect checks the path, query string, headers and body of r, in that
 // order, and returns the first match, or nil if the request is clean.
 //
-// The body is read into memory and r.Body is replaced so the request can
-// still be forwarded. Bodies larger than the configured limit are rejected
+// The body is read into memory and r.Body and r.GetBody are replaced so the
+// request can still be forwarded, and retried. Bodies larger than the configured limit are rejected
 // with ErrBodyTooLarge rather than partially inspected; r.Body is then left
 // intact, so the request can still be forwarded in detection mode.
 func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
@@ -210,6 +210,10 @@ func (in *Inspector) readBody(r *http.Request) ([]byte, error) {
 	}
 	orig.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
+	// Let the proxy send the body again when it retries on another backend.
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 	return body, nil
 }
 

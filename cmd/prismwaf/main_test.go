@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -44,6 +45,13 @@ func TestConfigValidate(t *testing.T) {
 		{"client CA without TLS", config{clientCA: "ca.pem"}, true},
 		{"client auth without CA", https(config{clientAuth: "require"}), true},
 		{"invalid client auth", https(config{clientCA: "ca.pem", clientAuth: "maybe"}), true},
+
+		{"least-conn", config{lbPolicy: "least-conn"}, false},
+		{"invalid lb policy", config{lbPolicy: "random"}, true},
+		{"negative fail timeout", config{failTimeout: -time.Second}, true},
+		{"health check", config{healthPath: "/healthz", healthInterval: time.Second, healthTimeout: time.Second}, false},
+		{"relative health check path", config{healthPath: "healthz", healthInterval: time.Second, healthTimeout: time.Second}, true},
+		{"zero health check interval", config{healthPath: "/healthz", healthTimeout: time.Second}, true},
 	}
 	for _, tc := range tests {
 		if err := tc.cfg.validate(); (err != nil) != tc.wantErr {
@@ -65,5 +73,15 @@ func TestSplitList(t *testing.T) {
 	got := splitList(" example.com, ,www.example.com,")
 	if len(got) != 2 || got[0] != "example.com" || got[1] != "www.example.com" {
 		t.Errorf("splitList = %q", got)
+	}
+}
+
+func TestBackendURLs(t *testing.T) {
+	if got := (config{}).backendURLs(); len(got) != 1 || got[0] != defaultBackend {
+		t.Errorf("default = %q", got)
+	}
+	c := config{backends: stringList{"http://a:1, http://b:2", "http://c:3"}}
+	if got := c.backendURLs(); !slices.Equal(got, []string{"http://a:1", "http://b:2", "http://c:3"}) {
+		t.Errorf("backendURLs = %q", got)
 	}
 }

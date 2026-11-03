@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -25,7 +26,12 @@ import (
 func main() {
 	var cfg config
 	flag.StringVar(&cfg.listen, "listen", ":8080", "address to listen on")
-	flag.StringVar(&cfg.backend, "backend", "http://127.0.0.1:8081", "backend server URL (http:// or https://)")
+	flag.Var(&cfg.backends, "backend", `backend server URL (http:// or https://); repeat or separate with commas for several backends (default "`+defaultBackend+`")`)
+	flag.StringVar(&cfg.lbPolicy, "lb-policy", string(proxy.RoundRobin), `how to choose the backend for a request: "round-robin" or "least-conn"`)
+	flag.DurationVar(&cfg.failTimeout, "backend-fail-timeout", proxy.DefaultFailTimeout, "how long to skip a backend that cannot be connected to")
+	flag.StringVar(&cfg.healthPath, "health-check-path", "", `path to GET on every backend periodically, e.g. "/healthz"; backends that fail are skipped`)
+	flag.DurationVar(&cfg.healthInterval, "health-check-interval", 10*time.Second, "interval between health checks")
+	flag.DurationVar(&cfg.healthTimeout, "health-check-timeout", 5*time.Second, "timeout of a health check request")
 	flag.Int64Var(&cfg.maxBody, "max-body", waf.DefaultMaxBodySize, "maximum request body size in bytes to inspect; larger requests are rejected")
 	flag.StringVar(&cfg.mode, "mode", string(waf.ModeBlock), `"block" to reject detected requests, "detect" to only log them`)
 	flag.StringVar(&cfg.auditLog, "audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
@@ -55,7 +61,12 @@ func main() {
 
 type config struct {
 	listen          string
-	backend         string
+	backends        stringList
+	lbPolicy        string
+	failTimeout     time.Duration
+	healthPath      string
+	healthInterval  time.Duration
+	healthTimeout   time.Duration
 	maxBody         int64
 	mode            string
 	auditLog        string
@@ -84,11 +95,43 @@ func (l *stringList) Set(v string) error {
 	return nil
 }
 
+// defaultBackend is used when no -backend is given.
+const defaultBackend = "http://127.0.0.1:8081"
+
+// backendURLs returns the -backend values, split at commas.
+func (c config) backendURLs() []string {
+	var urls []string
+	for _, v := range c.backends {
+		urls = append(urls, splitList(v)...)
+	}
+	if len(urls) == 0 {
+		urls = []string{defaultBackend}
+	}
+	return urls
+}
+
 func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
 
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
 
 func (c config) validate() error {
+	// Empty and zero values select the proxy package's defaults.
+	if c.lbPolicy != "" {
+		if _, err := proxy.ParsePolicy(c.lbPolicy); err != nil {
+			return err
+		}
+	}
+	if c.failTimeout < 0 {
+		return errors.New("-backend-fail-timeout must not be negative")
+	}
+	if c.healthPath != "" {
+		if !strings.HasPrefix(c.healthPath, "/") {
+			return errors.New(`-health-check-path must start with "/"`)
+		}
+		if c.healthInterval <= 0 || c.healthTimeout <= 0 {
+			return errors.New("-health-check-interval and -health-check-timeout must be positive")
+		}
+	}
 	if len(c.tlsCerts) != len(c.tlsKeys) {
 		return errors.New("each -tls-cert needs a matching -tls-key")
 	}
@@ -130,15 +173,25 @@ func run(cfg config, logger *slog.Logger) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
-	u, err := proxy.ParseBackend(cfg.backend)
-	if err != nil {
-		return err
+	var backends []*url.URL
+	for _, raw := range cfg.backendURLs() {
+		u, err := proxy.ParseBackend(raw)
+		if err != nil {
+			return err
+		}
+		backends = append(backends, u)
 	}
 	transport, err := backendTransport(cfg)
 	if err != nil {
 		return err
 	}
-	rp, err := proxy.New(u, transport, logger)
+	rp, err := proxy.New(proxy.Config{
+		Backends:    backends,
+		Transport:   transport,
+		Policy:      proxy.Policy(cfg.lbPolicy),
+		FailTimeout: cfg.failTimeout,
+		Logger:      logger,
+	})
 	if err != nil {
 		return err
 	}
@@ -249,12 +302,18 @@ func run(cfg config, logger *slog.Logger) error {
 	if certs != nil {
 		go reloadOnSIGHUP(ctx, certs, logger)
 	}
+	if cfg.healthPath != "" {
+		go rp.HealthCheck(ctx, cfg.healthPath, cfg.healthInterval, cfg.healthTimeout)
+	}
 
 	scheme := "http"
 	if cfg.tlsEnabled() {
 		scheme = "https"
 	}
-	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backend", u.String(), "mode", mode, "audit_log", cfg.auditLog)
+	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backends", cfg.backendURLs(), "lb_policy", cfg.lbPolicy, "mode", mode, "audit_log", cfg.auditLog)
+	if cfg.healthPath != "" {
+		logger.Info("health checks enabled", "path", cfg.healthPath, "interval", cfg.healthInterval)
+	}
 	if cfg.httpRedirect != "" {
 		logger.Info("redirecting HTTP to HTTPS", "listen", cfg.httpRedirect)
 	}

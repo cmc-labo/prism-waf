@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -31,7 +32,7 @@ func TestProxyForwardsRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(u, nil, nil)
+	h, err := New(Config{Backends: []*url.URL{u}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestProxyBackendDown(t *testing.T) {
 	u, _ := ParseBackend(backend.URL)
 	backend.Close() // make the backend unreachable
 
-	h, err := New(u, nil, nil)
+	h, err := New(Config{Backends: []*url.URL{u}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func TestProxyHTTPSBackend(t *testing.T) {
 	u, _ := ParseBackend(backend.URL)
 
 	// backend.Client() trusts the test server's self-signed certificate.
-	h, err := New(u, backend.Client().Transport, nil)
+	h, err := New(Config{Backends: []*url.URL{u}, Transport: backend.Client().Transport})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +128,7 @@ func TestProxyHTTPSBackend(t *testing.T) {
 	}
 
 	// With the default transport, the untrusted certificate is rejected.
-	h, _ = New(u, nil, nil)
+	h, _ = New(Config{Backends: []*url.URL{u}})
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
 	if rec.Code != http.StatusBadGateway {
@@ -142,7 +143,7 @@ func TestProxyTLSFrontendSetsForwardedProto(t *testing.T) {
 	}))
 	defer backend.Close()
 	u, _ := ParseBackend(backend.URL)
-	h, _ := New(u, nil, nil)
+	h, _ := New(Config{Backends: []*url.URL{u}})
 
 	front := httptest.NewTLSServer(h)
 	defer front.Close()
