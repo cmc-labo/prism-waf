@@ -132,6 +132,11 @@ func NewInspector(signatures []Signature, maxBodySize int64) (*Inspector, error)
 // with ErrBodyTooLarge rather than partially inspected; r.Body is then left
 // intact, so the request can still be forwarded in detection mode.
 func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
+	if len(in.signatures) == 0 {
+		// Only buffer the body and enforce its size limit, e.g. for the CRS.
+		_, err := in.readBody(r)
+		return nil, err
+	}
 	if m := in.match(LocationPath, "", r.URL.EscapedPath(), normalize.Options{}); m != nil {
 		return m, nil
 	}

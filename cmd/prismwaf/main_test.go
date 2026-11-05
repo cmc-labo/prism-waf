@@ -46,6 +46,11 @@ func TestConfigValidate(t *testing.T) {
 		{"client auth without CA", https(config{clientAuth: "require"}), true},
 		{"invalid client auth", https(config{clientCA: "ca.pem", clientAuth: "maybe"}), true},
 
+		{"crs", config{engine: "crs"}, false},
+		{"both engines with exclusions", config{engine: "both", crsAfter: stringList{"x.conf"}}, false},
+		{"invalid engine", config{engine: "modsecurity"}, true},
+		{"crs rules without crs", config{crsBefore: stringList{"x.conf"}}, true},
+
 		{"least-conn", config{lbPolicy: "least-conn"}, false},
 		{"invalid lb policy", config{lbPolicy: "random"}, true},
 		{"negative fail timeout", config{failTimeout: -time.Second}, true},

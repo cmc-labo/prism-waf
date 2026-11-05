@@ -17,6 +17,8 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   traversal, OS command injection, Log4Shell, XXE) in the request path,
   query string, headers and body
 - JSON and XML bodies are parsed and every value is inspected on its own
+- Optional [OWASP Core Rule Set (CRS) v4](https://coreruleset.org/) through
+  the [Coraza](https://coraza.io/) engine, embedded in the binary
 - Request normalization that defeats encoding tricks, split keywords and
   Base64-encoded payloads
 - Blocks matching requests with `403 Forbidden`, or only logs them in
@@ -26,7 +28,7 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
 
 ## Quick start
 
-Requirements: Go 1.24 or later.
+Requirements: Go 1.25 or later.
 
 Start the example backend (an echo server on `:8081`):
 
@@ -156,6 +158,96 @@ care.
 The built-in signatures cover common payloads and their usual variations,
 but no signature set is complete. Treat them as a baseline, not complete
 protection.
+
+## OWASP Core Rule Set
+
+PrismWAF can also inspect requests with the
+[OWASP Core Rule Set (CRS)](https://coreruleset.org/) v4, run by the
+[OWASP Coraza](https://coraza.io/) WAF engine. The rules (CRS 4.25.0) are
+embedded in the binary; no files need to be installed.
+
+```sh
+go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
+```
+
+| `-engine` | Inspection |
+|-----------|------------|
+| `builtin` (default) | PrismWAF's own signatures |
+| `crs` | Only the CRS |
+| `both` | The built-in signatures first, then the CRS for requests they let through |
+
+The CRS works in anomaly scoring mode: every matching rule adds to the
+request's score (critical 5, error 4, warning 3, notice 2), and the request
+is an attack when the score reaches `-crs-anomaly-threshold` (default 5,
+so one critical rule is enough). `-crs-paranoia-level` (1-4, default 1)
+enables more rules; higher levels catch more evasions but cause more false
+positives and need tuning. Only request rules are used; responses are not
+inspected.
+
+All of PrismWAF's other features apply to the CRS too: detection mode,
+the audit log, the body size limit, and the event ID in the error response.
+Requests the CRS rejects get `403 Forbidden`, or the status a rule asks for:
+`400 Bad Request` for a JSON, XML or multipart body that cannot be parsed
+(rule 200002), and for too many arguments (see below).
+
+### Tuning and rule exclusions
+
+False positives are handled with standard
+[CRS rule exclusions](https://coreruleset.org/docs/concepts/false_positives_tuning/)
+in ModSecurity's SecLang, loaded with `-crs-rules-before` (before the CRS
+rules, for runtime exclusions with `ctl:` and setting `tx` variables) and
+`-crs-rules-after` (after them, for `SecRuleRemoveById` and similar). Both
+can be repeated and accept glob patterns. Files cannot use `Include`.
+
+```apache
+# before.conf: turn off rule 942100 for the search endpoint only
+SecRule REQUEST_FILENAME "@beginsWith /search" \
+    "id:1000,phase:1,pass,nolog,ctl:ruleRemoveById=942100"
+
+# CRS rejects content types that are not explicitly allowed (rule 920420);
+# add text/plain to its default list
+SecAction "id:1001,phase:1,pass,nolog,setvar:'tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |multipart/related| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/cloudevents+json| |application/cloudevents-batch+json| |text/plain|'"
+```
+
+```apache
+# after.conf: do not inspect the "password" argument with any SQLi rule
+SecRuleUpdateTargetByTag "attack-sqli" "!ARGS:password"
+```
+
+```sh
+go run ./cmd/prismwaf -engine crs -crs-rules-before before.conf -crs-rules-after after.conf
+```
+
+Use rule IDs below 100000 for your own rules; the CRS uses 900000-999999
+and PrismWAF uses 9500001 (see below). Start a new deployment in detection
+mode (`-mode detect`) and tune the exclusions with the audit log before
+blocking.
+
+### Limits and performance
+
+Coraza stops collecting arguments (query and body parameters, JSON and XML
+values) at a fixed limit and never inspects the rest, so a payload placed
+after enough dummy parameters would pass. PrismWAF therefore rejects
+requests with more than `-crs-max-args` arguments (default 1000) with
+`400 Bad Request` (rule 9500001), regardless of the anomaly score.
+
+The CRS is much more thorough than the built-in signatures, and much more
+expensive. Coraza runs every rule with Go's linear-time regular expression
+engine, which is safe from ReDoS but slow on large inputs:
+
+| Request | Built-in | CRS |
+|---------|---------:|----:|
+| Typical `GET` | 0.02 ms | 0.6 ms |
+| 128 KiB JSON body | 14 ms | 260 ms |
+| 128 KiB body of other types (worst case) | 110 ms | 750 ms |
+| 1000 arguments | — | about 110 ms |
+
+Inspection time grows with the body size, so with the CRS consider a lower
+`-max-body` if your application allows it (32 KiB costs a quarter of the
+above), and limit request rates in front of PrismWAF. Request lines and
+headers are limited to 64 KiB (`431 Request Header Fields Too Large`), since
+the query string is inspected like the body but is not covered by
+`-max-body`.
 
 ## Load balancing
 
@@ -406,12 +498,13 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `id` | Event ID. In block mode it is also returned in the `403`/`413` response body, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
 | `action` | `block`, or `detect` in detection mode. |
-| `reason` | `signature` or `body_too_large`. |
-| `rule` | The signature that matched. |
-| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). |
+| `reason` | `signature`, `crs` or `body_too_large`. |
+| `rule` | The signature that matched. For the CRS, the most severe matched rule, e.g. `{"id": "942100", "category": "sqli"}`, or the rule that rejected the request on its own (e.g. 200002). |
+| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
 | `match.data` | The text the signature matched, after normalization. |
 | `match.value` | The raw value that was inspected, i.e. the payload as sent. Truncated to 4 KiB (`value_truncated`, `value_length`). |
 | `match.base64` | `true` if the match was in Base64-decoded data. |
+| `crs` | CRS details: `anomaly_score`, `deciding_rule` (usually 949110, "anomaly score exceeded") and `rules`, every matched rule with its `id`, `message`, `severity`, `variable` and matched `value`. |
 | `request.headers` | Request headers. `Authorization`, `Cookie` and other credential headers are `[REDACTED]`, unless the attack was found in that header. |
 
 The response to the client only contains the event ID; rule details are not
@@ -454,6 +547,12 @@ cannot spoof their address by sending the header themselves.
 | `-health-check-interval` | `10s`     | Interval between health checks |
 | `-health-check-timeout` | `5s`       | Timeout of a health check request |
 | `-max-body` | `131072` (128 KiB)     | Maximum request body size to inspect, in bytes |
+| `-engine` | `builtin`               | `builtin`, `crs` (OWASP CRS v4) or `both` |
+| `-crs-paranoia-level` | `1`         | CRS paranoia level, 1-4 |
+| `-crs-anomaly-threshold` | `5`      | CRS inbound anomaly score at which a request is blocked |
+| `-crs-max-args` | `1000`            | Maximum number of arguments per request with the CRS |
+| `-crs-rules-before` | (none)        | SecLang file loaded before the CRS rules; repeatable, globs allowed |
+| `-crs-rules-after` | (none)         | SecLang file loaded after the CRS rules; repeatable, globs allowed |
 | `-mode` | `block`                 | `block` to reject detected requests, `detect` to only log them |
 | `-audit-log` | `-` (standard output) | File to append audit events to |
 | `-trusted-proxies` | (none)          | Comma-separated IPs/CIDRs of proxies whose `X-Forwarded-For` is trusted |
@@ -488,9 +587,15 @@ internal/tlsutil/    TLS configuration, certificates (files, SNI, ACME), mTLS, H
 internal/audit/      audit log (JSON Lines)
 internal/normalize/  decoding and canonicalization of request data
 internal/waf/        signatures, request inspection, JSON/XML body parsing
+internal/crs/        OWASP CRS v4 with the Coraza engine
 examples/backend/    echo server for local testing
 ```
 
 ## License
 
 PrismWAF is released under the [MIT License](LICENSE).
+
+Binaries also contain third-party code under their own licenses, notably
+[OWASP Coraza](https://github.com/corazawaf/coraza) and the
+[OWASP Core Rule Set](https://github.com/coreruleset/coreruleset)
+(both Apache License 2.0).

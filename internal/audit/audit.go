@@ -29,14 +29,40 @@ type Event struct {
 	// Action is what PrismWAF did: "block" (rejected) or "detect" (only
 	// logged and forwarded, in detection mode).
 	Action string `json:"action"`
-	// Reason is why, e.g. "signature" or "body_too_large".
-	Reason  string  `json:"reason"`
-	Rule    *Rule   `json:"rule,omitempty"`
-	Match   *Match  `json:"match,omitempty"`
+	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS)
+	// or "body_too_large".
+	Reason string `json:"reason"`
+	Rule   *Rule  `json:"rule,omitempty"`
+	Match  *Match `json:"match,omitempty"`
+	// CRS holds the details of an OWASP CRS detection.
+	CRS     *CRS    `json:"crs,omitempty"`
 	Request Request `json:"request"`
 }
 
-// Rule identifies the signature that matched.
+// CRS describes an OWASP CRS detection.
+type CRS struct {
+	// AnomalyScore is the inbound anomaly score, if it decided.
+	AnomalyScore int `json:"anomaly_score,omitempty"`
+	// DecidingRule is the rule that rejected the request, usually 949110
+	// (anomaly score exceeded).
+	DecidingRule int `json:"deciding_rule"`
+	// Rules are the matched rules that add to the anomaly score.
+	Rules []CRSRule `json:"rules"`
+}
+
+// CRSRule is a matched CRS rule.
+type CRSRule struct {
+	ID       int    `json:"id"`
+	Message  string `json:"message"`
+	Severity string `json:"severity,omitempty"`
+	// Variable is where it matched, e.g. "ARGS:q".
+	Variable string `json:"variable,omitempty"`
+	// Value is the matched value, possibly truncated.
+	Value string `json:"value,omitempty"`
+}
+
+// Rule identifies the signature that matched. For CRS detections, it is
+// the most severe matched CRS rule.
 type Rule struct {
 	ID       string `json:"id"`
 	Category string `json:"category"`
@@ -45,8 +71,12 @@ type Rule struct {
 // Match describes where and how the rule matched.
 type Match struct {
 	// Location is the part of the request: path, query, header or body.
+	// For CRS detections, it is the ModSecurity variable, e.g. ARGS or
+	// REQUEST_HEADERS.
 	Location string `json:"location"`
-	// Field is the header name for header matches.
+	// Field is the header name for header matches, the path of the value
+	// in a JSON or XML body, or the key of a CRS variable (e.g. the
+	// argument name).
 	Field string `json:"field,omitempty"`
 	// Base64 reports whether the match was in Base64-decoded data.
 	Base64 bool `json:"base64,omitempty"`

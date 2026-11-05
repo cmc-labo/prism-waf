@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
+	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
 	"github.com/cmc-labo/prism-waf/internal/waf"
@@ -32,6 +33,12 @@ func main() {
 	flag.StringVar(&cfg.healthPath, "health-check-path", "", `path to GET on every backend periodically, e.g. "/healthz"; backends that fail are skipped`)
 	flag.DurationVar(&cfg.healthInterval, "health-check-interval", 10*time.Second, "interval between health checks")
 	flag.DurationVar(&cfg.healthTimeout, "health-check-timeout", 5*time.Second, "timeout of a health check request")
+	flag.StringVar(&cfg.engine, "engine", engineBuiltin, `rules to inspect requests with: "builtin" (PrismWAF signatures), "crs" (OWASP CRS v4) or "both"`)
+	flag.IntVar(&cfg.crsParanoia, "crs-paranoia-level", crs.DefaultParanoiaLevel, "CRS paranoia level (1-4); higher detects more but causes more false positives")
+	flag.IntVar(&cfg.crsThreshold, "crs-anomaly-threshold", crs.DefaultInboundThreshold, "CRS inbound anomaly score at which a request is blocked (a critical rule scores 5)")
+	flag.IntVar(&cfg.crsMaxArgs, "crs-max-args", crs.DefaultMaxArgs, "maximum number of arguments (parameters, JSON/XML values) per request with the CRS; requests with more are rejected")
+	flag.Var(&cfg.crsBefore, "crs-rules-before", "SecLang file loaded before the CRS rules, e.g. ctl:ruleRemoveById exclusions; repeatable, globs allowed")
+	flag.Var(&cfg.crsAfter, "crs-rules-after", "SecLang file loaded after the CRS rules, e.g. SecRuleRemoveById exclusions; repeatable, globs allowed")
 	flag.Int64Var(&cfg.maxBody, "max-body", waf.DefaultMaxBodySize, "maximum request body size in bytes to inspect; larger requests are rejected")
 	flag.StringVar(&cfg.mode, "mode", string(waf.ModeBlock), `"block" to reject detected requests, "detect" to only log them`)
 	flag.StringVar(&cfg.auditLog, "audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
@@ -68,6 +75,12 @@ type config struct {
 	healthInterval  time.Duration
 	healthTimeout   time.Duration
 	maxBody         int64
+	engine          string
+	crsParanoia     int
+	crsThreshold    int
+	crsMaxArgs      int
+	crsBefore       stringList
+	crsAfter        stringList
 	mode            string
 	auditLog        string
 	trustedProxies  string
@@ -95,6 +108,24 @@ func (l *stringList) Set(v string) error {
 	return nil
 }
 
+// Values of -engine.
+const (
+	engineBuiltin = "builtin"
+	engineCRS     = "crs"
+	engineBoth    = "both"
+)
+
+func (c config) builtinEnabled() bool {
+	return c.engine == "" || c.engine == engineBuiltin || c.engine == engineBoth
+}
+func (c config) crsEnabled() bool { return c.engine == engineCRS || c.engine == engineBoth }
+
+// maxHeaderBytes limits the request line and headers. The query string is
+// inspected like the body but is not covered by -max-body, so Go's default
+// of 1 MiB would allow far more expensive requests. Larger requests get
+// 431 Request Header Fields Too Large.
+const maxHeaderBytes = 64 << 10
+
 // defaultBackend is used when no -backend is given.
 const defaultBackend = "http://127.0.0.1:8081"
 
@@ -115,6 +146,14 @@ func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
 
 func (c config) validate() error {
+	switch c.engine {
+	case "", engineBuiltin, engineCRS, engineBoth:
+	default:
+		return fmt.Errorf("invalid -engine %q: must be %q, %q or %q", c.engine, engineBuiltin, engineCRS, engineBoth)
+	}
+	if !c.crsEnabled() && (len(c.crsBefore) > 0 || len(c.crsAfter) > 0) {
+		return errors.New("-crs-rules-before and -crs-rules-after require -engine crs or both")
+	}
 	// Empty and zero values select the proxy package's defaults.
 	if c.lbPolicy != "" {
 		if _, err := proxy.ParsePolicy(c.lbPolicy); err != nil {
@@ -195,9 +234,30 @@ func run(cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	inspector, err := waf.NewInspector(waf.DefaultSignatures, cfg.maxBody)
+	var signatures []waf.Signature
+	if cfg.builtinEnabled() {
+		signatures = waf.DefaultSignatures
+	}
+	inspector, err := waf.NewInspector(signatures, cfg.maxBody)
 	if err != nil {
 		return err
+	}
+	var crsEngine *crs.Engine
+	if cfg.crsEnabled() {
+		start := time.Now()
+		crsEngine, err = crs.New(crs.Config{
+			ParanoiaLevel:    cfg.crsParanoia,
+			InboundThreshold: cfg.crsThreshold,
+			MaxArgs:          cfg.crsMaxArgs,
+			RulesBefore:      cfg.crsBefore,
+			RulesAfter:       cfg.crsAfter,
+			MaxBodySize:      cfg.maxBody,
+		})
+		if err != nil {
+			return err
+		}
+		logger.Info("OWASP CRS loaded", "version", crs.Version, "paranoia_level", cfg.crsParanoia,
+			"anomaly_threshold", cfg.crsThreshold, "max_args", cfg.crsMaxArgs, "took", time.Since(start).Round(time.Millisecond))
 	}
 	mode, err := waf.ParseMode(cfg.mode)
 	if err != nil {
@@ -218,6 +278,7 @@ func run(cfg config, logger *slog.Logger) error {
 	httpErrorLog := slog.NewLogLogger(logger.Handler(), slog.LevelWarn)
 	var handler http.Handler = waf.Middleware(rp, waf.Config{
 		Inspector:      inspector,
+		CRS:            crsEngine,
 		Mode:           mode,
 		Audit:          auditLogger,
 		TrustedProxies: tp,
@@ -232,6 +293,7 @@ func run(cfg config, logger *slog.Logger) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          httpErrorLog,
 	}
 	servers := []*http.Server{srv}
@@ -292,6 +354,7 @@ func run(cfg config, logger *slog.Logger) error {
 				Handler:           redirect,
 				ReadHeaderTimeout: 10 * time.Second,
 				IdleTimeout:       120 * time.Second,
+				MaxHeaderBytes:    maxHeaderBytes,
 				ErrorLog:          httpErrorLog,
 			})
 		}
@@ -310,7 +373,7 @@ func run(cfg config, logger *slog.Logger) error {
 	if cfg.tlsEnabled() {
 		scheme = "https"
 	}
-	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backends", cfg.backendURLs(), "lb_policy", cfg.lbPolicy, "mode", mode, "audit_log", cfg.auditLog)
+	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backends", cfg.backendURLs(), "lb_policy", cfg.lbPolicy, "engine", cfg.engine, "mode", mode, "audit_log", cfg.auditLog)
 	if cfg.healthPath != "" {
 		logger.Info("health checks enabled", "path", cfg.healthPath, "interval", cfg.healthInterval)
 	}
