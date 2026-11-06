@@ -20,8 +20,9 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   ([details](docs/audit-log.md))
 - **Load balancing**: several backends, round-robin or least-connections,
   failover and health checks ([details](docs/load-balancing.md))
-- **HTTPS**: TLS termination, HTTP/2, SNI, ACME/Let's Encrypt, HSTS,
-  mutual TLS, HTTPS backends ([details](docs/https.md))
+- **HTTPS**: TLS termination, HTTP/2, SNI, HSTS, mutual TLS, HTTPS
+  backends ([details](docs/https.md)), and automatic certificates from
+  Let's Encrypt or any ACME CA ([details](docs/acme.md))
 
 ## Quick start
 
@@ -67,6 +68,7 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 - [Modes and audit log](docs/audit-log.md)
 - [Load balancing](docs/load-balancing.md)
 - [HTTPS](docs/https.md)
+- [Automatic certificates (ACME / Let's Encrypt)](docs/acme.md)
 - [Development](docs/development.md)
 
 ## License

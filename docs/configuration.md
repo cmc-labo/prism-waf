@@ -72,7 +72,7 @@ See [Audit log](audit-log.md#audit-log) and
 | `-tls-client-ca` | (none) | PEM CA file; require client certificates signed by it (mutual TLS) |
 | `-tls-client-auth` | `require` | `require` or `optional` client certificates with `-tls-client-ca` |
 
-See [HTTPS](https.md).
+See [HTTPS](https.md) and [Automatic certificates](acme.md).
 
 ## Fixed limits
 

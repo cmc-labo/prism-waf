@@ -58,29 +58,13 @@ certificate files:
 ```sh
 go run ./cmd/prismwaf -listen :443 -http-redirect :80 \
   -acme-domains example.com,www.example.com \
-  -acme-cache /var/lib/prismwaf/acme \
-  -acme-email admin@example.com
+  -acme-cache /var/lib/prismwaf/acme
 ```
 
-- Certificates are requested only for `-acme-domains`, so clients cannot
-  make PrismWAF request certificates for arbitrary names and exhaust the
-  CA's rate limits. Wildcards and IP addresses are not supported, and
-  clients must send a server name (SNI).
-- `-acme-cache` holds the account key and the certificates (mode 0700).
-  Keep it across restarts; requesting new certificates on every start hits
-  the rate limits quickly.
-- The CA verifies the domains with the TLS-ALPN-01 challenge on port 443
-  and, when `-http-redirect` is set, the HTTP-01 challenge on port 80. So
-  `-listen` must be reachable as port 443, or `-http-redirect` as port 80,
-  from the internet.
-- Certificates are renewed automatically, 30 days (or a third of their
-  lifetime, if shorter) before they expire.
-- Using `-acme-domains` means accepting the CA's terms of service.
-- Try a new setup with `-acme-directory staging` (Let's Encrypt's staging
-  environment, untrusted certificates but higher rate limits) first. Any
-  other ACME CA can be used by passing its directory URL.
-
-`-acme-domains` and `-tls-cert` are mutually exclusive.
+`-acme-domains` and `-tls-cert` are mutually exclusive. See
+[Automatic certificates](acme.md) for the requirements, caveats such as
+rate limits and switching from staging to production, use cases and
+troubleshooting.
 
 ## HSTS
 
@@ -112,7 +96,7 @@ curl --cert alice.pem --key alice.key https://example.com/
 
 With `-tls-client-auth optional`, clients without a certificate are
 accepted too, but a certificate that is sent must be valid. Mutual TLS can
-be combined with ACME; the CA's validation connections are exempted from
+be combined with [ACME](acme.md#an-admin-portal-with-client-certificates); the CA's validation connections are exempted from
 client authentication but cannot be used to send requests.
 
 ## HTTPS backends

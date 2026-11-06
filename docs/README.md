@@ -7,5 +7,6 @@
 | [OWASP Core Rule Set](crs.md) | `-engine`, paranoia level, anomaly threshold, rule exclusions, tested use cases, performance |
 | [Modes and audit log](audit-log.md) | Block and detection mode, the audit event format, client IP behind proxies |
 | [Load balancing](load-balancing.md) | Several backends, balancing policies, failover, health checks |
-| [HTTPS](https.md) | TLS termination, SNI, ACME/Let's Encrypt, HSTS, mutual TLS, HTTPS backends |
+| [HTTPS](https.md) | TLS termination, SNI, HSTS, mutual TLS, HTTPS backends |
+| [Automatic certificates](acme.md) | ACME/Let's Encrypt: requirements, rate limits, staging, systemd, troubleshooting |
 | [Development](development.md) | Tests, benchmarks, building, project layout |
