@@ -20,6 +20,7 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
+	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
 	"github.com/cmc-labo/prism-waf/internal/waf"
 )
@@ -43,6 +44,10 @@ func main() {
 	flag.StringVar(&cfg.mode, "mode", string(waf.ModeBlock), `"block" to reject detected requests, "detect" to only log them`)
 	flag.StringVar(&cfg.auditLog, "audit-log", "-", `file to append audit events (JSON Lines) to; "-" for standard output`)
 	flag.StringVar(&cfg.trustedProxies, "trusted-proxies", "", "comma-separated IPs or CIDRs of proxies whose X-Forwarded-For is trusted")
+	flag.StringVar(&cfg.rateLimit, "rate-limit", "", `maximum requests per client (IP address, /64 for IPv6) as N/WINDOW, e.g. "300/1m"; excess requests get 429`)
+	flag.Var(&cfg.rateLimitPaths, "rate-limit-path", `per-client limit for one path as "[METHOD ]PATH=N/WINDOW", e.g. "POST /login=5/1m" or "/api/*=100/1m"; repeatable`)
+	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited")
+	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once")
 	flag.Var(&cfg.tlsCerts, "tls-cert", "PEM certificate chain file; enables HTTPS on -listen. Repeat with -tls-key for several domains (SNI); the first is the default")
 	flag.Var(&cfg.tlsKeys, "tls-key", "PEM private key file for the -tls-cert at the same position")
 	flag.StringVar(&cfg.acmeDomains, "acme-domains", "", "comma-separated domains to obtain certificates for from an ACME CA (Let's Encrypt); enables HTTPS on -listen")
@@ -67,35 +72,39 @@ func main() {
 }
 
 type config struct {
-	listen          string
-	backends        stringList
-	lbPolicy        string
-	failTimeout     time.Duration
-	healthPath      string
-	healthInterval  time.Duration
-	healthTimeout   time.Duration
-	maxBody         int64
-	engine          string
-	crsParanoia     int
-	crsThreshold    int
-	crsMaxArgs      int
-	crsBefore       stringList
-	crsAfter        stringList
-	mode            string
-	auditLog        string
-	trustedProxies  string
-	tlsCerts        stringList
-	tlsKeys         stringList
-	acmeDomains     string
-	acmeCache       string
-	acmeEmail       string
-	acmeDirectory   string
-	httpRedirect    string
-	hsts            tlsutil.HSTSPolicy
-	clientCA        string
-	clientAuth      string
-	backendCA       string
-	backendInsecure bool
+	listen              string
+	backends            stringList
+	lbPolicy            string
+	failTimeout         time.Duration
+	healthPath          string
+	healthInterval      time.Duration
+	healthTimeout       time.Duration
+	maxBody             int64
+	engine              string
+	crsParanoia         int
+	crsThreshold        int
+	crsMaxArgs          int
+	crsBefore           stringList
+	crsAfter            stringList
+	mode                string
+	auditLog            string
+	trustedProxies      string
+	rateLimit           string
+	rateLimitPaths      stringList
+	rateLimitExempt     string
+	rateLimitMaxClients int
+	tlsCerts            stringList
+	tlsKeys             stringList
+	acmeDomains         string
+	acmeCache           string
+	acmeEmail           string
+	acmeDirectory       string
+	httpRedirect        string
+	hsts                tlsutil.HSTSPolicy
+	clientCA            string
+	clientAuth          string
+	backendCA           string
+	backendInsecure     bool
 }
 
 // stringList is a flag that can be repeated.
@@ -141,6 +150,28 @@ func (c config) backendURLs() []string {
 	return urls
 }
 
+func (c config) rateLimitEnabled() bool { return c.rateLimit != "" || len(c.rateLimitPaths) > 0 }
+
+// rateLimitRules parses -rate-limit and -rate-limit-path.
+func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
+	var rules []ratelimit.Rule
+	if c.rateLimit != "" {
+		limit, window, err := ratelimit.ParseRate(c.rateLimit)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -rate-limit: %w", err)
+		}
+		rules = append(rules, ratelimit.Rule{Limit: limit, Window: window})
+	}
+	for _, v := range c.rateLimitPaths {
+		r, err := ratelimit.ParseRule(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -rate-limit-path: %w", err)
+		}
+		rules = append(rules, r)
+	}
+	return rules, nil
+}
+
 func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
 
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
@@ -170,6 +201,18 @@ func (c config) validate() error {
 		if c.healthInterval <= 0 || c.healthTimeout <= 0 {
 			return errors.New("-health-check-interval and -health-check-timeout must be positive")
 		}
+	}
+	if !c.rateLimitEnabled() && c.rateLimitExempt != "" {
+		return errors.New("-rate-limit-exempt requires -rate-limit or -rate-limit-path")
+	}
+	if _, err := c.rateLimitRules(); err != nil {
+		return err
+	}
+	if _, err := ratelimit.ParsePrefixes(c.rateLimitExempt); err != nil {
+		return fmt.Errorf("invalid -rate-limit-exempt: %w", err)
+	}
+	if c.rateLimitMaxClients < 0 {
+		return errors.New("-rate-limit-max-clients must not be negative")
 	}
 	if len(c.tlsCerts) != len(c.tlsKeys) {
 		return errors.New("each -tls-cert needs a matching -tls-key")
@@ -267,6 +310,26 @@ func run(cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var limiter *ratelimit.Limiter
+	if cfg.rateLimitEnabled() {
+		rules, err := cfg.rateLimitRules()
+		if err != nil {
+			return err
+		}
+		exempt, err := ratelimit.ParsePrefixes(cfg.rateLimitExempt)
+		if err != nil {
+			return err
+		}
+		limiter, err = ratelimit.New(ratelimit.Config{
+			Rules:      rules,
+			Exempt:     exempt,
+			MaxClients: cfg.rateLimitMaxClients,
+			Logger:     logger,
+		})
+		if err != nil {
+			return err
+		}
+	}
 	auditLogger, closeAudit, err := audit.Open(cfg.auditLog)
 	if err != nil {
 		return err
@@ -279,6 +342,7 @@ func run(cfg config, logger *slog.Logger) error {
 	var handler http.Handler = waf.Middleware(rp, waf.Config{
 		Inspector:      inspector,
 		CRS:            crsEngine,
+		RateLimiter:    limiter,
 		Mode:           mode,
 		Audit:          auditLogger,
 		TrustedProxies: tp,
@@ -377,6 +441,16 @@ func run(cfg config, logger *slog.Logger) error {
 		scheme = "https"
 	}
 	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backends", cfg.backendURLs(), "lb_policy", cfg.lbPolicy, "engine", cfg.engine, "mode", mode, "audit_log", cfg.auditLog)
+	if limiter != nil {
+		rules := make([]string, len(limiter.Rules()))
+		for i, r := range limiter.Rules() {
+			rules[i] = r.String()
+		}
+		logger.Info("rate limiting enabled", "rules", rules, "exempt", cfg.rateLimitExempt)
+		if len(tp) == 0 {
+			logger.Info("rate limits count requests per TCP peer; behind a load balancer or CDN, set -trusted-proxies or all clients share one limit")
+		}
+	}
 	if cfg.healthPath != "" {
 		logger.Info("health checks enabled", "path", cfg.healthPath, "interval", cfg.healthInterval)
 	}

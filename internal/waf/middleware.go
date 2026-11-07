@@ -12,6 +12,7 @@ import (
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
 // Limits on how much request data is copied into an audit event, so that a
@@ -63,6 +64,9 @@ type Config struct {
 	// CRS, if set, inspects requests that the built-in signatures let
 	// through with the OWASP Core Rule Set.
 	CRS *crs.Engine
+	// RateLimiter, if set, limits the request rate of each client before
+	// requests are inspected.
+	RateLimiter *ratelimit.Limiter
 	// Mode is ModeBlock or ModeDetect. The zero value means ModeBlock.
 	Mode Mode
 	// Audit receives an event for every blocked request. Nil disables audit
@@ -76,11 +80,12 @@ type Config struct {
 }
 
 // Middleware inspects each request before passing it to next. Requests that
-// match a signature or the CRS, and requests whose body exceeds the
-// inspection limit, are recorded in the audit log. In ModeBlock they are
-// then rejected with 403 Forbidden (or the status a CRS rule asks for, such
-// as 400 for an unparsable body) and 413 Request Entity Too Large
-// respectively; in ModeDetect they are forwarded to next unchanged.
+// match a signature or the CRS, requests whose body exceeds the inspection
+// limit, and requests over a rate limit are recorded in the audit log. In
+// ModeBlock they are then rejected with 403 Forbidden (or the status a CRS
+// rule asks for, such as 400 for an unparsable body), 413 Request Entity
+// Too Large and 429 Too Many Requests respectively; in ModeDetect they are
+// forwarded to next unchanged.
 func Middleware(next http.Handler, cfg Config) http.Handler {
 	logger := cfg.Logger
 	if logger == nil {
@@ -88,6 +93,22 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 	}
 	detect := cfg.Mode == ModeDetect
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Rate limits come first: rejecting a flood is cheaper than
+		// inspecting it.
+		if cfg.RateLimiter != nil {
+			d := cfg.RateLimiter.Allow(r, cfg.TrustedProxies.ClientIP(r))
+			if !d.Allowed {
+				if d.First {
+					logRateLimitEvent(cfg, logger, r, d)
+				}
+				if !detect {
+					w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(d.RetryAfter)))
+					blockResponse(w, http.StatusTooManyRequests, d.EventID)
+					return
+				}
+			}
+		}
+
 		m, err := cfg.Inspector.Inspect(r)
 		switch {
 		case errors.Is(err, ErrBodyTooLarge):
@@ -185,6 +206,23 @@ func logCRSEvent(cfg Config, logger *slog.Logger, r *http.Request, id string, re
 		}
 	}
 	writeEvent(cfg, logger, e)
+}
+
+// logRateLimitEvent writes an audit event for the first request of a
+// client over a rate limit.
+func logRateLimitEvent(cfg Config, logger *slog.Logger, r *http.Request, d ratelimit.Decision) {
+	e := newEvent(cfg, r, d.EventID, "rate_limit", nil)
+	e.RateLimit = &audit.RateLimit{
+		Rule:       d.Rule.String(),
+		Client:     d.Client.String(),
+		RetryAfter: retryAfterSeconds(d.RetryAfter),
+	}
+	writeEvent(cfg, logger, e)
+}
+
+// retryAfterSeconds rounds a wait up to whole seconds for Retry-After.
+func retryAfterSeconds(d time.Duration) int {
+	return max(1, int((d+time.Second-1)/time.Second))
 }
 
 // crsCategory derives a category such as "sqli" from a CRS rule's

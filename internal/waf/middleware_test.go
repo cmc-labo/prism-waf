@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
+	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
 func serveWithAudit(t *testing.T, cfg Config, r *http.Request) (*httptest.ResponseRecorder, []audit.Event) {
@@ -250,6 +252,115 @@ func TestParseMode(t *testing.T) {
 	for _, s := range []string{"", "Block", "off", "monitor"} {
 		if _, err := ParseMode(s); err == nil {
 			t.Errorf("ParseMode(%q) succeeded, want error", s)
+		}
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	for _, mode := range []Mode{ModeBlock, ModeDetect} {
+		t.Run(string(mode), func(t *testing.T) {
+			rule, _ := ratelimit.ParseRule("POST /login=2/1m")
+			limiter, err := ratelimit.New(ratelimit.Config{Rules: []ratelimit.Rule{rule}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tp, _ := ParseTrustedProxies("10.0.0.0/8")
+			var buf bytes.Buffer
+			forwarded := 0
+			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded++ }), Config{
+				Inspector:      mustInspector(t, 0),
+				RateLimiter:    limiter,
+				Mode:           mode,
+				Audit:          audit.New(&buf),
+				TrustedProxies: tp,
+			})
+			login := func(client string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest("POST", "/login", strings.NewReader("user=a&password=b"))
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				r.Header.Set("Cookie", "session=secret")
+				r.RemoteAddr = "10.0.0.5:4321"
+				r.Header.Set("X-Forwarded-For", client)
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, r)
+				return rec
+			}
+			var recs []*httptest.ResponseRecorder
+			for range 5 {
+				recs = append(recs, login("203.0.113.7"))
+			}
+			// Clients behind the trusted proxy are counted separately.
+			if rec := login("203.0.113.8"); rec.Code != http.StatusOK {
+				t.Errorf("other client: status %d", rec.Code)
+			}
+
+			var events []audit.Event
+			dec := json.NewDecoder(&buf)
+			for dec.More() {
+				var e audit.Event
+				if err := dec.Decode(&e); err != nil {
+					t.Fatal(err)
+				}
+				events = append(events, e)
+			}
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1 for the excess", len(events))
+			}
+			e := events[0]
+			if e.Reason != "rate_limit" || e.Action != map[Mode]string{ModeBlock: "block", ModeDetect: "detect"}[mode] ||
+				e.ClientIP != "203.0.113.7" || e.Request.Headers["Cookie"] != "[REDACTED]" {
+				t.Errorf("event = %+v", e)
+			}
+			if e.RateLimit == nil || e.RateLimit.Rule != "POST /login=2/1m" || e.RateLimit.Client != "203.0.113.7/32" ||
+				e.RateLimit.RetryAfter != 30 {
+				t.Errorf("rate_limit = %+v", e.RateLimit)
+			}
+
+			if mode == ModeDetect {
+				if forwarded != 6 {
+					t.Errorf("forwarded %d requests, want 6", forwarded)
+				}
+				return
+			}
+			if forwarded != 3 {
+				t.Errorf("forwarded %d requests, want 3", forwarded)
+			}
+			for i, rec := range recs[2:] {
+				if rec.Code != http.StatusTooManyRequests {
+					t.Errorf("request %d: status %d, want 429", i+3, rec.Code)
+				}
+				if ra := rec.Header().Get("Retry-After"); ra != "30" {
+					t.Errorf("request %d: Retry-After = %q", i+3, ra)
+				}
+				if !strings.Contains(rec.Body.String(), "Event ID: "+e.ID) {
+					t.Errorf("request %d: body %q lacks event ID %s", i+3, rec.Body.String(), e.ID)
+				}
+			}
+		})
+	}
+}
+
+func TestRateLimitBeforeInspection(t *testing.T) {
+	limit, window, _ := ratelimit.ParseRate("1/1m")
+	limiter, _ := ratelimit.New(ratelimit.Config{Rules: []ratelimit.Rule{{Limit: limit, Window: window}}})
+	cfg := Config{RateLimiter: limiter}
+	// Attacks count towards the limit too.
+	attack := httptest.NewRequest("GET", "/items?id=1+UNION+SELECT+password+FROM+users", nil)
+	if rec, _ := serveWithAudit(t, cfg, attack); rec.Code != http.StatusForbidden {
+		t.Fatalf("attack: status %d", rec.Code)
+	}
+	attack = httptest.NewRequest("GET", "/items?id=1+UNION+SELECT+password+FROM+users", nil)
+	rec, events := serveWithAudit(t, cfg, attack)
+	if rec.Code != http.StatusTooManyRequests || len(events) != 1 || events[0].Reason != "rate_limit" {
+		t.Errorf("status %d, events %+v", rec.Code, events)
+	}
+}
+
+func TestRetryAfterSeconds(t *testing.T) {
+	for d, want := range map[time.Duration]int{
+		time.Millisecond: 1, time.Second: 1, 1001 * time.Millisecond: 2, 12 * time.Second: 12, 0: 1,
+	} {
+		if got := retryAfterSeconds(d); got != want {
+			t.Errorf("retryAfterSeconds(%v) = %d, want %d", d, got, want)
 		}
 	}
 }

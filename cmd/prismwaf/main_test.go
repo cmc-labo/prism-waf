@@ -51,6 +51,14 @@ func TestConfigValidate(t *testing.T) {
 		{"invalid engine", config{engine: "modsecurity"}, true},
 		{"crs rules without crs", config{crsBefore: stringList{"x.conf"}}, true},
 
+		{"rate limit", config{rateLimit: "300/1m", rateLimitPaths: stringList{"POST /login=5/1m"}, rateLimitExempt: "10.0.0.0/8"}, false},
+		{"path rate limit only", config{rateLimitPaths: stringList{"/api/*=100/1m"}}, false},
+		{"invalid rate limit", config{rateLimit: "300"}, true},
+		{"invalid path rate limit", config{rateLimitPaths: stringList{"login=5/1m"}}, true},
+		{"invalid rate limit exemption", config{rateLimit: "300/1m", rateLimitExempt: "office"}, true},
+		{"rate limit exemption without limits", config{rateLimitExempt: "10.0.0.0/8"}, true},
+		{"negative max clients", config{rateLimit: "300/1m", rateLimitMaxClients: -1}, true},
+
 		{"least-conn", config{lbPolicy: "least-conn"}, false},
 		{"invalid lb policy", config{lbPolicy: "random"}, true},
 		{"negative fail timeout", config{failTimeout: -time.Second}, true},

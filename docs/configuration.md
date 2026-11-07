@@ -56,6 +56,18 @@ See [OWASP Core Rule Set](crs.md#options) for details and use cases.
 See [Audit log](audit-log.md#audit-log) and
 [Client IP](audit-log.md#client-ip).
 
+## Rate limiting
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-rate-limit` | (none) | Maximum requests per client, as `N/WINDOW`, e.g. `300/1m`; excess requests get `429` |
+| `-rate-limit-path` | (none) | Limit per client for one path, as `[METHOD ]PATH=N/WINDOW`, e.g. `POST /login=5/1m` or `/api/*=100/1m`; repeatable |
+| `-rate-limit-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never limited |
+| `-rate-limit-max-clients` | `100000` | Maximum number of clients tracked at once |
+
+A client is an IP address, or a `/64` network for IPv6. See
+[Rate limiting](rate-limiting.md).
+
 ## HTTPS
 
 | Flag | Default | Description |
@@ -102,6 +114,7 @@ prismwaf -listen :443 -http-redirect :80 \
   -hsts-max-age 8760h \
   -backend http://10.0.0.11:8080,http://10.0.0.12:8080 -health-check-path /healthz \
   -engine both -crs-rules-before /etc/prismwaf/before.conf -crs-rules-after /etc/prismwaf/after.conf \
+  -rate-limit 600/1m -rate-limit-path "POST /login=5/1m" \
   -audit-log /var/log/prismwaf/audit.log
 ```
 

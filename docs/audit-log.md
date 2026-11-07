@@ -4,7 +4,7 @@
 
 | Mode | `-mode` | Detected requests |
 |------|---------|-------------------|
-| Block (default) | `block` | Rejected with `403 Forbidden` (`413` if the body is too large; `400` for some [CRS](crs.md#responses-and-audit-events) rules) and logged with `"action": "block"` |
+| Block (default) | `block` | Rejected with `403 Forbidden` (`413` if the body is too large; `400` for some [CRS](crs.md#responses-and-audit-events) rules; `429` over a [rate limit](rate-limiting.md)) and logged with `"action": "block"` |
 | Detect | `detect` | Forwarded to the backend unchanged and logged with `"action": "detect"` |
 
 Detection mode lets you find false positives on real traffic before
@@ -62,16 +62,17 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 
 | Field | Description |
 |-------|-------------|
-| `id` | Event ID. In block mode it is also returned in the `403`/`413` response body, so users can report false positives. |
+| `id` | Event ID. In block mode it is also returned in the `403`/`413`/`429` response body, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
 | `action` | `block`, or `detect` in detection mode. |
-| `reason` | `signature`, `crs` or `body_too_large`. |
+| `reason` | `signature`, `crs`, `body_too_large` or `rate_limit`. |
 | `rule` | The signature that matched. For the CRS, the most severe matched rule, e.g. `{"id": "942100", "category": "sqli"}`, or the rule that rejected the request on its own (e.g. 200002). |
 | `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
 | `match.data` | The text the signature matched, after normalization. |
 | `match.value` | The raw value that was inspected, i.e. the payload as sent. Truncated to 4 KiB (`value_truncated`, `value_length`). |
 | `match.base64` | `true` if the match was in Base64-decoded data. |
 | `crs` | CRS details: `anomaly_score`, `deciding_rule` (usually 949110, "anomaly score exceeded") and `rules`, every matched rule with its `id`, `message`, `severity`, `variable` and matched `value`. |
+| `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
 | `request.headers` | Request headers. `Authorization`, `Cookie` and other credential headers are `[REDACTED]`, unless the attack was found in that header. |
 
 The response to the client only contains the event ID; rule details are not

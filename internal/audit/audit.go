@@ -29,14 +29,30 @@ type Event struct {
 	// Action is what PrismWAF did: "block" (rejected) or "detect" (only
 	// logged and forwarded, in detection mode).
 	Action string `json:"action"`
-	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS)
-	// or "body_too_large".
+	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS),
+	// "body_too_large" or "rate_limit".
 	Reason string `json:"reason"`
 	Rule   *Rule  `json:"rule,omitempty"`
 	Match  *Match `json:"match,omitempty"`
 	// CRS holds the details of an OWASP CRS detection.
-	CRS     *CRS    `json:"crs,omitempty"`
-	Request Request `json:"request"`
+	CRS *CRS `json:"crs,omitempty"`
+	// RateLimit holds the details of an exceeded rate limit.
+	RateLimit *RateLimit `json:"rate_limit,omitempty"`
+	Request   Request    `json:"request"`
+}
+
+// RateLimit describes an exceeded rate limit. Only the first rejected
+// request of an excess is logged; the following ones share its event ID.
+type RateLimit struct {
+	// Rule is the exceeded rule, e.g. "POST /login=5/1m", or just the
+	// rate for the limit on all requests, e.g. "300/1m".
+	Rule string `json:"rule"`
+	// Client is the address the requests were counted for: the client IP,
+	// or its /64 network for IPv6.
+	Client string `json:"client"`
+	// RetryAfter is the number of seconds until the client may send the
+	// next request.
+	RetryAfter int `json:"retry_after"`
 }
 
 // CRS describes an OWASP CRS detection.
