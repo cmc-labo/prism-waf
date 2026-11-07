@@ -62,7 +62,7 @@ See [Audit log](audit-log.md#audit-log) and
 |------|---------|-------------|
 | `-tls-cert`, `-tls-key` | (none) | PEM certificate chain and private key; enables HTTPS on `-listen`. Repeat for several domains |
 | `-acme-domains` | (none) | Comma-separated domains to obtain certificates for via ACME; enables HTTPS on `-listen` |
-| `-acme-cache` | (none) | Directory for ACME account keys and certificates (required with `-acme-domains`) |
+| `-acme-cache` | (none) | Directory for ACME account keys and certificates, with one subdirectory per CA (required with `-acme-domains`) |
 | `-acme-email` | (none) | Contact email for the ACME CA |
 | `-acme-directory` | Let's Encrypt | ACME directory URL, or `staging` for Let's Encrypt's staging environment |
 | `-http-redirect` | (none) | Address of an HTTP listener that redirects to HTTPS and answers ACME HTTP-01 challenges, e.g. `:80` |

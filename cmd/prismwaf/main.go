@@ -46,8 +46,8 @@ func main() {
 	flag.Var(&cfg.tlsCerts, "tls-cert", "PEM certificate chain file; enables HTTPS on -listen. Repeat with -tls-key for several domains (SNI); the first is the default")
 	flag.Var(&cfg.tlsKeys, "tls-key", "PEM private key file for the -tls-cert at the same position")
 	flag.StringVar(&cfg.acmeDomains, "acme-domains", "", "comma-separated domains to obtain certificates for from an ACME CA (Let's Encrypt); enables HTTPS on -listen")
-	flag.StringVar(&cfg.acmeCache, "acme-cache", "", "directory to store ACME account keys and certificates in (required with -acme-domains)")
-	flag.StringVar(&cfg.acmeEmail, "acme-email", "", "contact email for the ACME CA's expiry notices")
+	flag.StringVar(&cfg.acmeCache, "acme-cache", "", "directory to store ACME account keys and certificates in, one subdirectory per CA (required with -acme-domains)")
+	flag.StringVar(&cfg.acmeEmail, "acme-email", "", "contact email registered with the ACME account")
 	flag.StringVar(&cfg.acmeDirectory, "acme-directory", "", "ACME directory URL; default Let's Encrypt, \"staging\" for its staging environment")
 	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80"; also answers ACME HTTP-01 challenges (requires HTTPS)`)
 	flag.DurationVar(&cfg.hsts.MaxAge, "hsts-max-age", 0, `send Strict-Transport-Security with this max-age on HTTPS responses, e.g. "8760h"; 0 disables`)
@@ -299,6 +299,7 @@ func run(cfg config, logger *slog.Logger) error {
 	servers := []*http.Server{srv}
 
 	var certs *tlsutil.CertReloader
+	var acmeManager *tlsutil.ACMEManager
 	if cfg.tlsEnabled() {
 		opts := tlsutil.ServerOptions{}
 		var redirect http.Handler
@@ -315,10 +316,12 @@ func run(cfg config, logger *slog.Logger) error {
 				CacheDir:     cfg.acmeCache,
 				Email:        cfg.acmeEmail,
 				DirectoryURL: acmeDirectoryURL(cfg.acmeDirectory),
+				Logger:       logger,
 			})
 			if err != nil {
 				return err
 			}
+			acmeManager = m
 			opts.GetCertificate = m.GetCertificate
 			opts.ACME = true
 			if redirect != nil {
@@ -381,7 +384,7 @@ func run(cfg config, logger *slog.Logger) error {
 		logger.Info("redirecting HTTP to HTTPS", "listen", cfg.httpRedirect)
 	}
 	if cfg.acmeEnabled() {
-		logger.Info("obtaining certificates via ACME", "domains", cfg.acmeDomains, "directory", acmeDirectoryURL(cfg.acmeDirectory), "cache", cfg.acmeCache)
+		logger.Info("obtaining certificates via ACME", "domains", cfg.acmeDomains, "directory", acmeManager.DirectoryURL(), "cache", acmeManager.CacheDir())
 		if cfg.httpRedirect == "" {
 			logger.Info("ACME HTTP-01 challenge disabled; TLS-ALPN-01 requires -listen to be reachable on port 443")
 		}
@@ -399,16 +402,32 @@ func run(cfg config, logger *slog.Logger) error {
 		logger.Warn("backend certificate verification is disabled")
 	}
 
+	// Listen before serving, so that the ACME CA can connect as soon as
+	// certificates are requested.
+	listeners := make([]net.Listener, len(servers))
+	for i, s := range servers {
+		ln, err := net.Listen("tcp", s.Addr)
+		if err != nil {
+			for _, l := range listeners[:i] {
+				l.Close()
+			}
+			return err
+		}
+		listeners[i] = ln
+	}
 	errCh := make(chan error, len(servers))
-	for _, s := range servers {
+	for i, s := range servers {
 		go func() {
 			if s.TLSConfig != nil {
 				// The certificate comes from TLSConfig.GetCertificate.
-				errCh <- s.ListenAndServeTLS("", "")
+				errCh <- s.ServeTLS(listeners[i], "", "")
 			} else {
-				errCh <- s.ListenAndServe()
+				errCh <- s.Serve(listeners[i])
 			}
 		}()
+	}
+	if acmeManager != nil {
+		go acmeManager.Run(ctx)
 	}
 
 	var runErr error

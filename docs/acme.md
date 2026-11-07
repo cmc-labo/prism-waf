@@ -10,6 +10,7 @@ certificate files. No separate client such as certbot is needed.
 - [Options](#options)
 - [Requirements](#requirements)
 - [Caveats](#caveats)
+- [Logs](#logs)
 - [Use cases](#use-cases)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -27,35 +28,35 @@ prismwaf -listen :443 -http-redirect :80 \
   -backend http://127.0.0.1:8081
 ```
 
-Then request each domain once to obtain its certificate:
+PrismWAF obtains the certificates right after starting and logs the
+result:
 
-```sh
-curl -sI https://example.com/      # staging certificates are untrusted: add -k
-curl -sI https://www.example.com/
+```
+level=INFO msg="ACME certificate obtained" certificate=example.com issuer="CN=(STAGING) …,O=(STAGING) Let's Encrypt,C=US" not_after=2027-02-05T02:55:43Z serial=…
 ```
 
-Once this works, switch to the production CA: remove `-acme-directory
-staging` **and use a new, empty `-acme-cache` directory** (see
-[Staging and production](#staging-and-production)).
+Once this works, remove `-acme-directory staging` and restart. The
+production certificates are obtained and cached separately from the
+staging ones (see [Staging and production](#staging-and-production)).
 
 ## How it works
 
 ```
                  ┌──────────────────────── PrismWAF ────────────────────────┐
-client ─TLS:443─▶│ -listen        certificate from cache, or obtained now  │─▶ backend
+client ─TLS:443─▶│ -listen        certificate from the cache               │─▶ backend
                  │                answers TLS-ALPN-01 challenges           │
 CA ─────HTTP:80─▶│ -http-redirect answers HTTP-01 challenges,              │
                  │                redirects everything else to HTTPS (308) │
                  └──────────────────┬───────────────────────────────────────┘
                                     ▼
-                         -acme-cache (account key, certificates)
+              -acme-cache/<CA>/ (account key, certificates)
 ```
 
-1. **On demand.** A certificate is obtained the first time a client
-   connects with that name (TLS SNI), not at startup. That client's
-   handshake waits until the certificate is issued, which usually takes a
-   few seconds and is given up after 5 minutes. Clients connecting at the
-   same time for the same name wait for the same certificate.
+1. **At startup.** Right after its listeners are open, PrismWAF loads the
+   certificate of every domain from the cache, and requests the ones that
+   are missing or expired. Issuance usually takes a few seconds. A client
+   that connects before then waits for the certificate (at most 5
+   minutes).
 2. **Validation.** The CA checks that you control the domain by connecting
    back to it. PrismWAF answers two challenge types:
    - **TLS-ALPN-01** on `-listen`: the CA must reach it as port 443. Always
@@ -65,15 +66,18 @@ CA ─────HTTP:80─▶│ -http-redirect answers HTTP-01 challenges,   
 
    TLS-ALPN-01 is tried first; with both enabled, either one succeeding is
    enough.
-3. **Caching.** The account key and every certificate are stored in
-   `-acme-cache` and reused after a restart.
+3. **Caching.** The account key and every certificate are stored in a
+   directory for the CA below `-acme-cache` and reused after a restart.
 4. **Renewal.** Each certificate is renewed in the background a third of
    its lifetime before it expires (30 days for Let's Encrypt's 90-day
    certificates), with a small random delay. If the CA issues shorter
    certificates, renewal starts correspondingly earlier. Renewal needs no
-   restart and does not interrupt connections. After a restart, a cached
-   certificate's renewal is scheduled when it is first used; an expired
-   cached certificate is replaced on the next connection.
+   restart and does not interrupt connections. A failed renewal is retried
+   every 30 to 60 minutes while the current certificate stays in use.
+5. **Monitoring.** Every minute, PrismWAF checks each domain: a missing
+   certificate is requested again once its [retry delay](#retries-after-failures)
+   has passed, and a certificate that should have been renewed by now is
+   logged (see [Logs](#logs)).
 
 Each domain gets its own certificate. Clients that support ECDSA (all
 current browsers) get an ECDSA P-256 certificate. Very old clients that
@@ -114,26 +118,58 @@ CA's rate limits.
 
 ### `-acme-cache`
 
-Holds the private keys of the account and of every certificate. The
-directory is created with mode `0700` and the files with mode `0600` when
-the first certificate is obtained, not at startup, so make sure the user
-running PrismWAF can create it:
+Holds the private keys of the account and of every certificate, in one
+subdirectory per CA, named after its directory URL:
+
+```
+/var/lib/prismwaf/acme/
+├── acme-v02.api.letsencrypt.org-directory/           Let's Encrypt
+│   ├── directory-url        the CA's directory URL
+│   ├── acme_account+key     the ACME account key
+│   ├── example.com          ECDSA certificate chain and private key
+│   ├── example.com+rsa      RSA certificate, if an RSA-only client connected
+│   └── *+token, *+http-01   temporary challenge data
+└── acme-staging-v02.api.letsencrypt.org-directory/   Let's Encrypt staging
+    └── …
+```
+
+At startup, PrismWAF:
+
+- creates the directories with mode `0700` if they do not exist, and
+  checks that it can write to them. If not, it stops with an error such as
+  `ACME cache directory is not writable: … permission denied`, instead of
+  failing later when the first certificate is issued.
+- warns if `-acme-cache` is accessible by other users
+  (`ACME cache directory is accessible by other users`). Fix it with
+  `chmod 700`.
+- refuses to start if the subdirectory's `directory-url` names another CA,
+  which can only happen if files were copied by hand.
+
+To prepare the directory for an unprivileged user:
 
 ```sh
 sudo install -d -o prismwaf -g prismwaf -m 0700 /var/lib/prismwaf/acme
 ```
 
-| File | Contents |
-|------|----------|
-| `acme_account+key` | The ACME account key |
-| `example.com` | ECDSA certificate chain and private key for `example.com` |
-| `example.com+rsa` | RSA certificate for `example.com`, if an RSA-only client connected |
-| `*+token`, `*+http-01` | Temporary challenge data, deleted after validation |
-
 Keep the directory across restarts, deployments and container rebuilds
 (e.g. on a persistent volume). Losing it means requesting all
 certificates again, which can hit the rate limits. Back it up like any
 other private key material.
+
+**Caches of older versions.** Versions before the per-CA layout kept the
+files directly in `-acme-cache`. They are moved automatically at startup,
+and each move is logged (`ACME cache: moved file to the directory of its
+CA`):
+
+| Old file | Moved to |
+|----------|----------|
+| Certificate from Let's Encrypt staging (issuer `(STAGING) …`) | The staging directory |
+| Other certificate | The directory of the configured CA. If that is staging, the file stays in place until PrismWAF runs with its CA |
+| Account key | The directory of the configured CA, together with the certificates |
+| Temporary challenge data | Deleted |
+
+Files that are not cache entries are left alone. If the target already
+exists, the old file stays in place and a warning names both.
 
 ### `-acme-email`
 
@@ -221,25 +257,59 @@ name in `-acme-domains` counts separately. To stay within the limits:
 
 - Test new setups with `-acme-directory staging`.
 - Keep `-acme-cache` across restarts.
-- Fix validation errors before retrying; a failed request is retried at
-  the next connection for that name after one minute, so a broken setup
-  that receives traffic keeps failing.
+- Read the `ACME validation failed` log and fix the cause before
+  restarting: PrismWAF waits between attempts (see below), but a restart
+  starts over and tries again immediately.
+
+### Retries after failures
+
+A failed certificate request is not retried at every connection. PrismWAF
+waits, doubling the delay after each consecutive failure of the same
+certificate:
+
+| Failure | Next attempt after |
+|--------:|-------------------:|
+| 1 | 10 minutes |
+| 2 | 20 minutes |
+| 3 | 40 minutes |
+| 4 | 80 minutes |
+| 5 and later | 2 hours |
+
+If the CA answers with a rate limit error, PrismWAF waits at least as long
+as the CA's `Retry-After` says (one hour if it says nothing). During the
+delay, clients connecting with that name fail the TLS handshake at once
+instead of waiting. Other domains, and the RSA certificate of the same
+domain, are not affected.
+
+The delays are kept in memory. To try again right away after fixing a
+problem, restart PrismWAF.
+
+Renewals of existing certificates are retried by the ACME library every
+30 to 60 minutes instead; the current certificate stays in use meanwhile.
 
 ### Staging and production
 
-The cache does not record which CA issued a certificate. A certificate
-obtained from staging stays in the cache after removing `-acme-directory
-staging`, and PrismWAF keeps serving the untrusted staging certificate
-until it is renewed. Use a separate cache directory for each CA:
+Every CA has its own cache directory, so switching between Let's
+Encrypt's staging environment and production needs no manual steps:
 
 ```sh
-# staging
-prismwaf ... -acme-directory staging -acme-cache /var/lib/prismwaf/acme-staging
-# production
+# 1. Test: certificates go to acme/acme-staging-v02.api.letsencrypt.org-directory/
+prismwaf ... -acme-directory staging -acme-cache /var/lib/prismwaf/acme
+# 2. Production: certificates go to acme/acme-v02.api.letsencrypt.org-directory/
 prismwaf ... -acme-cache /var/lib/prismwaf/acme
 ```
 
-The same applies when switching between any two CAs.
+In step 2, PrismWAF finds no production certificates and requests them;
+the staging certificates are kept but not used. Switching back to staging
+uses the staging certificates again, if they have not expired. The same
+applies to any two CAs.
+
+A staging certificate in the production directory, for example copied
+there by hand or left by an older version, is moved to the staging
+directory at startup with the warning `ACME cache: moving a Let's Encrypt
+staging certificate out of the cache of another CA`. While staging is
+configured, PrismWAF logs `using the Let's Encrypt staging environment:
+certificates are not trusted by browsers` at startup.
 
 ### `SIGHUP` terminates PrismWAF
 
@@ -250,14 +320,48 @@ handled, so it terminates the process like `SIGTERM`. Do not reuse a
 
 ### First connection
 
-The first client to connect with a new name waits for the certificate to
-be issued. Warm up the cache after deploying or adding a domain by
-requesting each name once, e.g. `curl -sI https://example.com/`.
+Certificates are requested at startup, so clients normally do not wait.
+Only a client that connects in the few seconds while a certificate is
+being issued, or an RSA-only client (whose certificate is only requested
+when needed), waits for it.
 
 ### Mutual exclusions
 
 `-acme-domains` cannot be combined with `-tls-cert`/`-tls-key`. All
 domains of one PrismWAF instance use either ACME or certificate files.
+
+## Logs
+
+PrismWAF writes ACME events to its operational log (standard error):
+
+| Level | Message | Meaning |
+|-------|---------|---------|
+| INFO | `ACME certificate obtained` | A certificate was issued or renewed and stored in the cache. With `issuer`, `not_after` and `serial` |
+| INFO | `ACME certificate ready` | A certificate from the cache is in use, logged once after startup |
+| WARN | `ACME validation failed` | The CA could not validate a domain. With the `challenge`, the CA's `problem` type and `detail`, and a `hint` |
+| WARN | `ACME request rejected` | The CA rejected a request, e.g. with a rate limit. With `status`, `problem`, `detail`, `retry_after` and a `hint` |
+| ERROR | `ACME certificate request failed` | A certificate could not be obtained. With the `error`, the `validation` errors of the attempt, a `hint`, the number of consecutive `failures` and when the next attempt is made (`retry_in`, `retry_at`) |
+| INFO | `ACME certificate available again` | A certificate was obtained after failures |
+| WARN | `ACME certificate not renewed yet` | Less than half of the renewal period is left, so renewal has been failing for a while. Logged daily |
+| ERROR | `ACME certificate expired` | The certificate in use has expired. Logged hourly |
+| ERROR | `cannot write ACME cache; …` | A certificate could not be stored, e.g. because the disk is full; it would be requested again after a restart |
+| WARN | `using the Let's Encrypt staging environment: …` | Staging is configured |
+
+The library that implements ACME only reports that no challenge
+succeeded; the CA's reason is taken from its responses and logged as
+`ACME validation failed`, then repeated in the `validation` field of the
+error:
+
+```
+level=WARN msg="ACME validation failed" domain=example.com challenge=tls-alpn-01 problem=urn:ietf:params:acme:error:connection detail="203.0.113.10: Timeout during connect (likely firewall problem)" hint="the CA could not connect: check that the domain's DNS records point to this server and that -listen is reachable as port 443 (TLS-ALPN-01) or -http-redirect as port 80 (HTTP-01) from the internet"
+level=ERROR msg="ACME certificate request failed" domain=example.com certificate=example.com error="acme/autocert: unable to satisfy … for domain \"example.com\": no viable challenge type found" validation="tls-alpn-01: urn:ietf:params:acme:error:connection: 203.0.113.10: Timeout during connect (likely firewall problem)" hint="the CA could not connect: …" failures=1 retry_in=10m0s retry_at=2026-11-07T12:05:05Z
+```
+
+To follow only ACME events:
+
+```sh
+journalctl -u prismwaf -f | grep -E 'ACME|acme'
+```
 
 ## Use cases
 
@@ -292,19 +396,20 @@ redirect, so combine this with HSTS.
 
 ### Testing a new setup
 
-Try the setup with the staging environment and its own cache, and check
-the certificate's issuer:
+Try the setup with the staging environment and check the log and the
+certificate's issuer:
 
 ```sh
 prismwaf -listen :443 -http-redirect :80 \
   -acme-domains example.com -acme-directory staging \
-  -acme-cache /var/lib/prismwaf/acme-staging
+  -acme-cache /var/lib/prismwaf/acme
 
 curl -skv https://example.com/ 2>&1 | grep 'issuer:'
 # issuer: C=US; O=(STAGING) Let's Encrypt; ...
 ```
 
-Then switch to production with the production cache directory.
+Then remove `-acme-directory staging` and restart; keep the same
+`-acme-cache` (see [Staging and production](#staging-and-production)).
 
 ### Run as a systemd service
 
@@ -400,19 +505,24 @@ the system trust store instead.
 ### Several PrismWAF instances
 
 Running several instances with ACME for the same domains is possible but
-not recommended. Each instance renews certificates on its own, and the
-challenge must be answered by the instance the CA connects to. If you do,
-share one `-acme-cache` directory between them (e.g. on a network file
-system): PrismWAF stores the challenge data there as well, so any instance
-can answer. For larger clusters, obtain certificates with a separate ACME
+not recommended. Each instance requests and renews certificates on its
+own, instances started at the same time may each request the same
+certificate, retry delays are not shared, and the challenge must be
+answered by the instance the CA connects to. If you do, share one
+`-acme-cache` directory between them (e.g. on a network file system):
+PrismWAF stores the challenge data there as well, so any instance can
+answer, and an instance started later uses the certificates already
+there. For larger clusters, obtain certificates with a separate ACME
 client (e.g. certbot) and distribute them as files for `-tls-cert`, which
 also supports reloading with `SIGHUP`.
 
 ### Monitor certificate expiry
 
-Renewal is automatic, but monitor it, since a failing renewal is only
-visible in PrismWAF's log. For example, check the expiry date from
-outside:
+Renewal is automatic, but monitor it. PrismWAF logs `ACME certificate
+not renewed yet` (WARN) and `ACME certificate expired` (ERROR); alert on
+these and on `ACME certificate request failed`. Also check the expiry
+date from outside, which catches problems the log cannot, such as a
+stopped process:
 
 ```sh
 echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
@@ -434,26 +544,34 @@ To replace a certbot setup that used `-tls-cert` and `-tls-key`:
 2. Remove the certbot deploy hook that sends `SIGHUP` to PrismWAF and
    disable certbot's renewal for these domains (`certbot delete --cert-name …`
    or its systemd timer), so that it no longer needs port 80.
-3. Request each domain once to obtain the new certificates.
+3. Restart PrismWAF; it obtains the new certificates at startup.
 
 ## Troubleshooting
 
-Certificate errors appear in PrismWAF's operational log (standard error)
-as failed TLS handshakes, and the client sees a TLS error:
+Look for `ACME validation failed`, `ACME request rejected` and `ACME
+certificate request failed` in the log (see [Logs](#logs)); the `hint`
+field suggests what to check. The most common problems:
 
-```
-level=WARN msg="http: TLS handshake error from 198.51.100.7:51234: acme/autocert: host \"test.example.com\" not configured in HostWhitelist"
-```
+| Problem type or message | Cause | Fix |
+|-------------------------|-------|-----|
+| `…:connection` | The CA could not connect to port 443 or 80 | Check DNS, firewall, port forwarding, and IPv6 (`AAAA` records) |
+| `…:dns` | The CA could not resolve the domain | Check the `A` and `AAAA` records |
+| `…:unauthorized` | The CA reached a server that gave the wrong answer | Make sure the DNS records point to this server and nothing in front of it terminates TLS |
+| `…:tls` | TLS failed during validation | A proxy in front of PrismWAF may terminate TLS |
+| `…:caa` | A CAA record does not allow the CA | Add the CA to the CAA records |
+| `…:rateLimited` | A rate limit was hit | Wait until `retry_at`; test with staging |
+| `…:externalAccountRequired` | The CA requires EAB | Not supported; use another CA or certificate files |
+| `cannot reach the ACME CA` (hint) | No connection to the CA's directory | Check outgoing HTTPS, proxies and `-acme-directory` |
+| `ACME cache directory is not writable` (at startup) | Wrong owner or mode of `-acme-cache` | `chown` the directory to the PrismWAF user and `chmod 700` it |
+| `ACME cache directory … belongs to …` (at startup) | A CA's subdirectory was copied by hand | Move it back or remove it |
 
-| Message contains | Cause | Fix |
-|------------------|-------|-----|
-| `not configured in HostWhitelist` | A client used a name that is not in `-acme-domains` | Add the name if it is yours; otherwise this is a scanner and can be ignored |
-| `missing server name` | A client connected without SNI, e.g. by IP address | Expected; connect by domain name |
-| `server name component count invalid` | A single-label name such as `localhost` | Use a fully qualified domain name |
-| `Timeout during connect`, `Connection refused` | The CA could not reach port 443 or 80 | Check DNS, firewall, port forwarding, IPv6 (`AAAA`) |
-| `CAA record … prevents issuance` | A CAA record does not allow the CA | Add the CA to the CAA records |
-| `rateLimited` | A rate limit was hit | Wait for the time in the message; test with staging |
-| `permission denied` | The cache directory cannot be created or written | Fix the owner and mode of `-acme-cache` |
+Failed TLS handshakes of clients are logged as well, at WARN:
+
+| Message contains | Cause |
+|------------------|-------|
+| `not configured in HostWhitelist` | A client used a name that is not in `-acme-domains`; add it if it is yours, otherwise it is a scanner |
+| `missing server name` | A client connected without SNI, e.g. by IP address |
+| `no certificate for … next attempt in …` | The certificate is waiting for its retry delay after a failure |
 
 To check what certificate is served for a name:
 
@@ -471,3 +589,6 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
   that require it.
 - Certificates cannot be revoked through PrismWAF.
 - `-acme-domains` and `-tls-cert` cannot be mixed in one instance.
+- Retry delays are kept in memory and start over after a restart.
+- Renewal failures of existing certificates are retried every 30 to 60
+  minutes by the ACME library, without the longer delays above.
