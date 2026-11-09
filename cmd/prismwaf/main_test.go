@@ -33,6 +33,13 @@ func TestConfigValidate(t *testing.T) {
 		{"ACME without cache", config{acmeDomains: "example.com"}, true},
 		{"ACME and certificate files", https(config{acmeDomains: "example.com", acmeCache: "c"}), true},
 		{"ACME email without domains", config{acmeEmail: "admin@example.com"}, true},
+		{"ACME webhook", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "https://hooks.example.com/x", acmeNotifyFormat: "slack"}, false},
+		{"ACME command", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "mail admin", acmeNotifyFormat: "json"}, false},
+		{"ACME notification test", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyTest: true}, false},
+		{"ACME notification test without target", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyTest: true}, true},
+		{"ACME invalid webhook", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "hooks.example.com/x"}, true},
+		{"ACME invalid webhook format", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "https://hooks.example.com/x", acmeNotifyFormat: "teams"}, true},
+		{"notifications without ACME", config{acmeNotifyWebhook: "https://hooks.example.com/x"}, true},
 
 		{"HSTS", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year}}), false},
 		{"HSTS preload", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year, IncludeSubdomains: true, Preload: true}}), false},

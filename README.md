@@ -24,7 +24,8 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   failover and health checks ([details](docs/load-balancing.md))
 - **HTTPS**: TLS termination, HTTP/2, SNI, HSTS, mutual TLS, HTTPS
   backends ([details](docs/https.md)), and automatic certificates from
-  Let's Encrypt or any ACME CA ([details](docs/acme.md))
+  Let's Encrypt or any ACME CA, with expiry notifications by webhook or
+  command ([details](docs/acme.md))
 
 ## Quick start
 

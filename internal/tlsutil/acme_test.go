@@ -27,6 +27,8 @@ import (
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/cmc-labo/prism-waf/internal/notify"
 )
 
 const (
@@ -584,5 +586,181 @@ func TestACMECacheReportsStoredCertificates(t *testing.T) {
 	os.WriteFile(string(c.DirCache), nil, 0o600) // a file, not a directory
 	if c.Put(ctx, "example.com", []byte("x")) == nil || len(logs.records("cannot write ACME cache; certificates will be requested again after a restart")) != 1 {
 		t.Error("write error not reported")
+	}
+}
+
+// recorder is a Notifier that records events.
+type recorder struct {
+	mu     sync.Mutex
+	events []notify.Event
+}
+
+func (r *recorder) Notify(e notify.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+// take returns the "event domain" of the events recorded since the last
+// call.
+func (r *recorder) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, e := range r.events {
+		out = append(out, e.Event+" "+e.Domain)
+	}
+	r.events = nil
+	return out
+}
+
+func TestRenewalOverdue(t *testing.T) {
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	for _, tc := range []struct {
+		lifetime, left time.Duration
+		want           bool
+	}{
+		{90 * day, 31 * day, false}, // before renewal
+		{90 * day, 30 * day, false}, // renewing
+		{90 * day, 29*day + time.Hour, false},
+		{90 * day, 29 * day, true}, // a day of failed renewals
+		{90 * day, -time.Hour, true},
+		{45 * day, 14*day + time.Hour, false},
+		{45 * day, 14 * day, true},
+		{6 * day, 25 * time.Hour, false}, // short-lived: renewed 2 days before expiry
+		{6 * day, 24 * time.Hour, true},
+	} {
+		leaf := &x509.Certificate{NotBefore: now.Add(tc.left - tc.lifetime), NotAfter: now.Add(tc.left)}
+		if got := renewalOverdue(leaf, now); got != tc.want {
+			t.Errorf("lifetime %v, left %v: overdue = %v, want %v", tc.lifetime, tc.left, got, tc.want)
+		}
+	}
+}
+
+func TestACMENotifiesExpiry(t *testing.T) {
+	var cert atomic.Pointer[tls.Certificate]
+	a, now, _ := fakeACME(t, func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) { return cert.Load(), nil })
+	rec := &recorder{}
+	a.notifier = rec
+	day := 24 * time.Hour
+	issued := now.Add(-60 * day)
+	cert.Store(leafCert(t, "example.com", issued, issued.Add(90*day)))
+
+	// In the renewal period, but renewal may still succeed.
+	a.check()
+	if got := rec.take(); got != nil {
+		t.Errorf("notified %v while renewal is pending", got)
+	}
+	*now = now.Add(day)
+	a.check()
+	if got := strings.Join(rec.take(), ","); got != "certificate_expiring example.com,certificate_expiring www.example.com" {
+		t.Errorf("after a day of failed renewals: %v", got)
+	}
+	// Repeated once a day.
+	*now = now.Add(23 * time.Hour)
+	a.check()
+	if got := rec.take(); got != nil {
+		t.Errorf("repeated within a day: %v", got)
+	}
+	*now = now.Add(time.Hour)
+	a.check()
+	if got := rec.take(); len(got) != 2 {
+		t.Errorf("not repeated after a day: %v", got)
+	}
+
+	// Expiry is notified at once.
+	*now = issued.Add(90*day + time.Minute)
+	a.check()
+	got := rec.events
+	if strings.Join(rec.take(), ",") != "certificate_expired example.com,certificate_expired www.example.com" {
+		t.Errorf("after expiry: %v", got)
+	} else if e := got[0]; e.Severity != notify.SeverityCritical || e.NotAfter == nil || !e.NotAfter.Equal(issued.Add(90*day)) ||
+		e.Serial != "2a" || !strings.Contains(e.Message, "expired at") || !e.Time.Equal(*now) {
+		t.Errorf("event = %+v", e)
+	}
+
+	// A renewed certificate ends the problem.
+	cert.Store(leafCert(t, "example.com", *now, now.Add(90*day)))
+	a.check()
+	got = rec.events
+	if strings.Join(rec.take(), ",") != "certificate_recovered example.com,certificate_recovered www.example.com" {
+		t.Errorf("after renewal: %v", got)
+	} else if got[0].Severity != notify.SeverityInfo || !strings.Contains(got[0].Message, "valid again") {
+		t.Errorf("event = %+v", got[0])
+	}
+	a.check()
+	if got := rec.take(); got != nil {
+		t.Errorf("notified again: %v", got)
+	}
+}
+
+func TestACMENotifiesMissingCertificates(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	a, now, _ := fakeACME(t, func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if failing.Load() && hello.ServerName == "www.example.com" {
+			return nil, errors.New("acme/autocert: no viable challenge type found")
+		}
+		return leafCert(t, hello.ServerName, time.Now(), time.Now().Add(90*24*time.Hour)), nil
+	})
+	rec := &recorder{}
+	a.notifier = rec
+
+	a.check()
+	got := rec.events
+	if strings.Join(rec.take(), ",") != "certificate_unavailable www.example.com" {
+		t.Fatalf("events: %v", got)
+	}
+	if e := got[0]; e.Severity != notify.SeverityCritical || e.Failures != 1 || e.RetryAt == nil ||
+		!e.RetryAt.Equal(now.Add(acmeMinBackoff)) || !strings.Contains(e.Error, "no viable challenge") {
+		t.Errorf("event = %+v", e)
+	}
+	// Further failures and checks during the retry delay are not notified
+	// again on the same day.
+	for range 3 {
+		*now = now.Add(acmeMaxBackoff)
+		a.check()
+	}
+	if got := rec.take(); got != nil {
+		t.Errorf("notified again: %v", got)
+	}
+	failing.Store(false)
+	*now = now.Add(acmeMaxBackoff)
+	a.check()
+	if got := strings.Join(rec.take(), ","); got != "certificate_recovered www.example.com" {
+		t.Errorf("after recovery: %v", got)
+	}
+}
+
+func TestACMEWithoutNotifier(t *testing.T) {
+	a, _, _ := fakeACME(t, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return nil, errors.New("acme/autocert: no viable challenge type found")
+	})
+	a.check() // must not panic
+}
+
+func TestACMEConnectionErrorsAreLogged(t *testing.T) {
+	a, _, logs := fakeACME(t, nil)
+	tr := newACMETransport(http.DefaultTransport, a)
+	srv := httptest.NewServer(http.NotFoundHandler())
+	url := srv.URL + "/directory"
+	srv.Close()
+	req, _ := http.NewRequest("GET", url, nil)
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("request to a closed server succeeded")
+	}
+	r := logs.records("cannot reach the ACME CA")
+	if len(r) != 1 || r[0]["url"] != url || !strings.Contains(r[0]["hint"].(string), "outgoing HTTPS") {
+		t.Errorf("records = %v", r)
+	}
+
+	// Canceled requests are not errors of the CA.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, _ = http.NewRequestWithContext(ctx, "GET", url, nil)
+	tr.RoundTrip(req)
+	if len(logs.records("cannot reach the ACME CA")) != 1 {
+		t.Error("canceled request logged")
 	}
 }

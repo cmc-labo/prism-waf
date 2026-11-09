@@ -17,5 +17,6 @@ internal/normalize/  decoding and canonicalization of request data
 internal/waf/        signatures, request inspection, JSON/XML body parsing
 internal/crs/        OWASP CRS v4 with the Coraza engine
 internal/ratelimit/  request rate limits per client and path
+internal/notify/     notifications to administrators (webhooks, commands)
 examples/backend/    echo server for local testing
 ```

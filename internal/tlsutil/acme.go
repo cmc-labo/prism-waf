@@ -17,6 +17,8 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/idna"
+
+	"github.com/cmc-labo/prism-waf/internal/notify"
 )
 
 // Directory URLs of Let's Encrypt.
@@ -42,6 +44,24 @@ const (
 // acmeCheckInterval is how often Run checks the certificates.
 const acmeCheckInterval = time.Minute
 
+// acmeNotifyInterval is how often a notification is repeated while its
+// problem lasts.
+const acmeNotifyInterval = 24 * time.Hour
+
+// Events notified to administrators.
+const (
+	eventExpiring    = "certificate_expiring"
+	eventExpired     = "certificate_expired"
+	eventUnavailable = "certificate_unavailable"
+	eventRecovered   = "certificate_recovered"
+)
+
+// Notifier receives events for administrators; *notify.Notifier
+// implements it.
+type Notifier interface {
+	Notify(notify.Event)
+}
+
 // ACMEConfig configures automatic certificates from an ACME CA such as
 // Let's Encrypt.
 type ACMEConfig struct {
@@ -61,6 +81,10 @@ type ACMEConfig struct {
 	// Logger receives certificate events and errors. Nil uses
 	// slog.Default().
 	Logger *slog.Logger
+	// Notifier, if set, is told when a certificate is about to expire
+	// without having been renewed, has expired or cannot be obtained, and
+	// when it is fine again.
+	Notifier Notifier
 }
 
 // ACMEManager obtains and renews certificates for the configured domains
@@ -69,6 +93,7 @@ type ACMEConfig struct {
 type ACMEManager struct {
 	m            *autocert.Manager
 	logger       *slog.Logger
+	notifier     Notifier
 	directoryURL string
 	cacheDir     string
 	domains      []string // normalized
@@ -91,6 +116,9 @@ type certStatus struct {
 	lastErr   error
 	announced bool      // its details were logged
 	warnedAt  time.Time // last expiry warning
+
+	alert      string    // the event of the current problem notified, if any
+	notifiedAt time.Time // when it was last notified
 }
 
 // validationError is a failed challenge reported by the CA.
@@ -119,6 +147,7 @@ func NewACMEManager(c ACMEConfig) (*ACMEManager, error) {
 	}
 	a := &ACMEManager{
 		logger:       c.Logger,
+		notifier:     c.Notifier,
 		directoryURL: c.DirectoryURL,
 		domainSet:    map[string]bool{},
 		now:          time.Now,
@@ -364,43 +393,156 @@ func (a *ACMEManager) Run(ctx context.Context) {
 func (a *ACMEManager) check() {
 	for _, d := range a.domains {
 		cert, err := a.GetCertificate(ecdsaHello(d))
-		if err != nil || cert.Leaf == nil {
-			continue // logged when the request failed
+		if err != nil {
+			a.unavailable(d, err) // logged when the request failed
+			continue
 		}
-		a.checkExpiry(d, cert.Leaf)
+		if cert.Leaf != nil {
+			a.checkExpiry(d, cert.Leaf)
+		}
 	}
 }
 
-// checkExpiry logs certificates that should have been renewed. autocert
-// renews a third of the lifetime (at most 30 days) before expiry and
-// retries failed renewals every 30 to 60 minutes, so a certificate in the
-// second half of that period means renewal keeps failing.
-func (a *ACMEManager) checkExpiry(key string, leaf *x509.Certificate) {
-	now := a.now()
-	left := leaf.NotAfter.Sub(now)
+// renewalOverdue reports whether a certificate should have been renewed
+// by now. autocert starts renewing a third of the lifetime (at most 30
+// days) before expiry, plus up to an hour of jitter, and retries failed
+// renewals every 30 to 60 minutes. A certificate that is still in use a
+// day after that (or half the period, for short-lived certificates)
+// therefore means that renewal keeps failing.
+func renewalOverdue(leaf *x509.Certificate, now time.Time) bool {
 	window := min(leaf.NotAfter.Sub(leaf.NotBefore)/3, 30*24*time.Hour)
-	if left > window/2 {
+	grace := min(window/2, 24*time.Hour)
+	return leaf.NotAfter.Sub(now) <= window-grace
+}
+
+// checkExpiry logs and notifies certificates that should have been
+// renewed, and notifies when a certificate is fine again.
+func (a *ACMEManager) checkExpiry(domain string, leaf *x509.Certificate) {
+	now := a.now()
+	if !renewalOverdue(leaf, now) {
+		a.recovered(domain, leaf)
 		return
 	}
+	left := leaf.NotAfter.Sub(now)
 	a.mu.Lock()
-	s := a.status(key)
+	s := a.status(domain)
 	interval := 24 * time.Hour
 	if left <= 0 {
 		interval = time.Hour
 	}
-	if !s.warnedAt.IsZero() && now.Sub(s.warnedAt) < interval {
+	logIt := s.warnedAt.IsZero() || now.Sub(s.warnedAt) >= interval
+	if logIt {
+		s.warnedAt = now
+	}
+	a.mu.Unlock()
+
+	notAfter := leaf.NotAfter.UTC()
+	e := notify.Event{
+		Domain:   domain,
+		Issuer:   leaf.Issuer.String(),
+		Serial:   leaf.SerialNumber.Text(16),
+		NotAfter: &notAfter,
+	}
+	args := append(certArgs(domain, leaf), "hint", "renewal keeps failing; see the ACME errors in this log")
+	if left <= 0 {
+		if logIt {
+			a.logger.Error("ACME certificate expired", args...)
+		}
+		e.Event, e.Severity = eventExpired, notify.SeverityCritical
+		e.Message = fmt.Sprintf("The certificate for %s expired at %s. Clients get certificate errors. Renewal keeps failing; see the ACME errors in the PrismWAF log.",
+			domain, notAfter.Format(time.RFC3339))
+	} else {
+		if logIt {
+			a.logger.Warn("ACME certificate not renewed yet", append(args, "expires_in", left.Round(time.Hour))...)
+		}
+		e.Event, e.Severity = eventExpiring, notify.SeverityWarning
+		e.Message = fmt.Sprintf("The certificate for %s expires in %s (%s) and has not been renewed. Renewal keeps failing; see the ACME errors in the PrismWAF log.",
+			domain, formatDays(left), notAfter.Format(time.RFC3339))
+	}
+	a.raise(domain, e)
+}
+
+// unavailable notifies that a domain has no certificate because requesting
+// one failed.
+func (a *ACMEManager) unavailable(domain string, err error) {
+	a.mu.Lock()
+	s := a.status(domain)
+	failures, retryAt := s.failures, s.retryAt.UTC().Truncate(time.Second)
+	a.mu.Unlock()
+	if failures == 0 {
+		return // not a failed request
+	}
+	a.raise(domain, notify.Event{
+		Event:    eventUnavailable,
+		Severity: notify.SeverityCritical,
+		Domain:   domain,
+		Error:    err.Error(),
+		Failures: failures,
+		RetryAt:  &retryAt,
+		Message: fmt.Sprintf("There is no certificate for %s: %s; HTTPS connections to it fail. Next attempt at %s. See the ACME errors in the PrismWAF log.",
+			domain, failedTimes(failures), retryAt.Format(time.RFC3339)),
+	})
+}
+
+// recovered notifies that the certificate of a domain is fine again after
+// a problem was notified.
+func (a *ACMEManager) recovered(domain string, leaf *x509.Certificate) {
+	a.mu.Lock()
+	s := a.status(domain)
+	was := s.alert
+	s.alert, s.notifiedAt = "", time.Time{}
+	a.mu.Unlock()
+	if was == "" || a.notifier == nil {
+		return
+	}
+	notAfter := leaf.NotAfter.UTC()
+	a.notifier.Notify(notify.Event{
+		Event:    eventRecovered,
+		Severity: notify.SeverityInfo,
+		Domain:   domain,
+		Issuer:   leaf.Issuer.String(),
+		Serial:   leaf.SerialNumber.Text(16),
+		NotAfter: &notAfter,
+		Message:  fmt.Sprintf("The certificate for %s is valid again until %s.", domain, notAfter.Format(time.RFC3339)),
+	})
+}
+
+// raise notifies a problem with the certificate of a domain: at once if it
+// is new or worse than the one notified before, otherwise once a day.
+func (a *ACMEManager) raise(domain string, e notify.Event) {
+	if a.notifier == nil {
+		return
+	}
+	now := a.now()
+	a.mu.Lock()
+	s := a.status(domain)
+	if s.alert == e.Event && now.Sub(s.notifiedAt) < acmeNotifyInterval {
 		a.mu.Unlock()
 		return
 	}
-	s.warnedAt = now
+	s.alert, s.notifiedAt = e.Event, now
 	a.mu.Unlock()
+	e.Time = now.UTC()
+	a.notifier.Notify(e)
+}
 
-	args := append(certArgs(key, leaf), "hint", "renewal keeps failing; see the ACME errors in this log")
-	if left <= 0 {
-		a.logger.Error("ACME certificate expired", args...)
-	} else {
-		a.logger.Warn("ACME certificate not renewed yet", append(args, "expires_in", left.Round(time.Hour))...)
+func failedTimes(n int) string {
+	if n == 1 {
+		return "requesting one failed"
 	}
+	return fmt.Sprintf("requesting one failed %d times in a row", n)
+}
+
+// formatDays formats a duration in whole days, e.g. "9 days", or as a
+// duration if it is less than a day.
+func formatDays(d time.Duration) string {
+	switch days := int(d.Round(24*time.Hour) / (24 * time.Hour)); {
+	case days > 1:
+		return fmt.Sprintf("%d days", days)
+	case days == 1:
+		return "1 day"
+	}
+	return d.Round(time.Minute).String()
 }
 
 func certArgs(key string, leaf *x509.Certificate) []any {

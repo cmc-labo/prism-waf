@@ -55,6 +55,15 @@ const maxACMEResponse = 1 << 20
 func (t *acmeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(r)
 	if err != nil {
+		// Renewals run in the background and report nothing, so this is
+		// the only trace of a CA that cannot be reached.
+		if r.Context().Err() == nil {
+			args := []any{"url", r.URL.String(), "error", err}
+			if hint := acmeHint("", err); hint != "" {
+				args = append(args, "hint", hint)
+			}
+			t.a.logger.Warn("cannot reach the ACME CA", args...)
+		}
 		return resp, err
 	}
 	ct := resp.Header.Get("Content-Type")

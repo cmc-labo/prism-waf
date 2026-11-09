@@ -77,6 +77,10 @@ A client is an IP address, or a `/64` network for IPv6. See
 | `-acme-cache` | (none) | Directory for ACME account keys and certificates, with one subdirectory per CA (required with `-acme-domains`) |
 | `-acme-email` | (none) | Contact email for the ACME CA |
 | `-acme-directory` | Let's Encrypt | ACME directory URL, or `staging` for Let's Encrypt's staging environment |
+| `-acme-notify-webhook` | (none) | URL to `POST` a notification to when an ACME certificate is not renewed, expires or cannot be obtained |
+| `-acme-notify-webhook-format` | `json` | `json`, `slack` (also Mattermost, Google Chat) or `discord` |
+| `-acme-notify-command` | (none) | Shell command run for each notification, with the event as JSON on stdin and in `PRISMWAF_*` variables |
+| `-acme-notify-test` | `false` | Send a test notification and exit |
 | `-http-redirect` | (none) | Address of an HTTP listener that redirects to HTTPS and answers ACME HTTP-01 challenges, e.g. `:80` |
 | `-hsts-max-age` | `0` (off) | Send `Strict-Transport-Security` with this max-age, e.g. `8760h` |
 | `-hsts-include-subdomains` | `false` | Add `includeSubDomains` to the HSTS header |
@@ -111,6 +115,7 @@ signatures:
 ```sh
 prismwaf -listen :443 -http-redirect :80 \
   -acme-domains example.com -acme-cache /var/lib/prismwaf/acme \
+  -acme-notify-webhook https://hooks.slack.com/services/T000/B000/XXXX -acme-notify-webhook-format slack \
   -hsts-max-age 8760h \
   -backend http://10.0.0.11:8080,http://10.0.0.12:8080 -health-check-path /healthz \
   -engine both -crs-rules-before /etc/prismwaf/before.conf -crs-rules-after /etc/prismwaf/after.conf \

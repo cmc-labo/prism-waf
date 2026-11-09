@@ -19,6 +19,7 @@ import (
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/notify"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
@@ -54,6 +55,10 @@ func main() {
 	flag.StringVar(&cfg.acmeCache, "acme-cache", "", "directory to store ACME account keys and certificates in, one subdirectory per CA (required with -acme-domains)")
 	flag.StringVar(&cfg.acmeEmail, "acme-email", "", "contact email registered with the ACME account")
 	flag.StringVar(&cfg.acmeDirectory, "acme-directory", "", "ACME directory URL; default Let's Encrypt, \"staging\" for its staging environment")
+	flag.StringVar(&cfg.acmeNotifyWebhook, "acme-notify-webhook", "", "URL to POST a notification to when a certificate is about to expire, has expired or cannot be obtained")
+	flag.StringVar(&cfg.acmeNotifyFormat, "acme-notify-webhook-format", notify.FormatJSON, `payload of -acme-notify-webhook: "json", "slack" (also Mattermost, Google Chat) or "discord"`)
+	flag.StringVar(&cfg.acmeNotifyCommand, "acme-notify-command", "", "shell command to run for each certificate notification; the event is passed as JSON on stdin and in PRISMWAF_* variables")
+	flag.BoolVar(&cfg.acmeNotifyTest, "acme-notify-test", false, "send a test notification to the -acme-notify-* targets and exit")
 	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80"; also answers ACME HTTP-01 challenges (requires HTTPS)`)
 	flag.DurationVar(&cfg.hsts.MaxAge, "hsts-max-age", 0, `send Strict-Transport-Security with this max-age on HTTPS responses, e.g. "8760h"; 0 disables`)
 	flag.BoolVar(&cfg.hsts.IncludeSubdomains, "hsts-include-subdomains", false, "add includeSubDomains to the HSTS header")
@@ -99,6 +104,10 @@ type config struct {
 	acmeCache           string
 	acmeEmail           string
 	acmeDirectory       string
+	acmeNotifyWebhook   string
+	acmeNotifyFormat    string
+	acmeNotifyCommand   string
+	acmeNotifyTest      bool
 	httpRedirect        string
 	hsts                tlsutil.HSTSPolicy
 	clientCA            string
@@ -174,6 +183,24 @@ func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
 
 func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
 
+func (c config) acmeNotifyEnabled() bool {
+	return c.acmeNotifyWebhook != "" || c.acmeNotifyCommand != ""
+}
+
+// notifier returns the notifier for ACME certificate events.
+func (c config) notifier(logger *slog.Logger) (*notify.Notifier, error) {
+	format := c.acmeNotifyFormat
+	if c.acmeNotifyWebhook == "" {
+		format = "" // the default of the flag; irrelevant without a webhook
+	}
+	return notify.New(notify.Config{
+		WebhookURL:    c.acmeNotifyWebhook,
+		WebhookFormat: format,
+		Command:       c.acmeNotifyCommand,
+		Logger:        logger,
+	})
+}
+
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
 
 func (c config) validate() error {
@@ -226,6 +253,17 @@ func (c config) validate() error {
 	if c.acmeEnabled() && c.acmeCache == "" {
 		return errors.New("-acme-domains requires -acme-cache")
 	}
+	if !c.acmeEnabled() && (c.acmeNotifyEnabled() || c.acmeNotifyTest) {
+		return errors.New("-acme-notify-* options require -acme-domains")
+	}
+	if c.acmeNotifyTest && !c.acmeNotifyEnabled() {
+		return errors.New("-acme-notify-test requires -acme-notify-webhook or -acme-notify-command")
+	}
+	if c.acmeNotifyEnabled() {
+		if _, err := c.notifier(nil); err != nil {
+			return err
+		}
+	}
 	if !c.tlsEnabled() {
 		switch {
 		case c.httpRedirect != "":
@@ -254,6 +292,16 @@ func (c config) validate() error {
 func run(cfg config, logger *slog.Logger) error {
 	if err := cfg.validate(); err != nil {
 		return err
+	}
+	var notifier *notify.Notifier
+	if cfg.acmeNotifyEnabled() {
+		var err error
+		if notifier, err = cfg.notifier(logger); err != nil {
+			return err
+		}
+	}
+	if cfg.acmeNotifyTest {
+		return sendTestNotification(notifier, cfg, logger)
 	}
 	var backends []*url.URL
 	for _, raw := range cfg.backendURLs() {
@@ -375,13 +423,18 @@ func run(cfg config, logger *slog.Logger) error {
 			redirect = tlsutil.RedirectHandler(httpsPort)
 		}
 		if cfg.acmeEnabled() {
-			m, err := tlsutil.NewACMEManager(tlsutil.ACMEConfig{
+			acmeCfg := tlsutil.ACMEConfig{
 				Domains:      splitList(cfg.acmeDomains),
 				CacheDir:     cfg.acmeCache,
 				Email:        cfg.acmeEmail,
 				DirectoryURL: acmeDirectoryURL(cfg.acmeDirectory),
 				Logger:       logger,
-			})
+			}
+			if notifier != nil {
+				// Not a typed nil in the interface.
+				acmeCfg.Notifier = notifier
+			}
+			m, err := tlsutil.NewACMEManager(acmeCfg)
 			if err != nil {
 				return err
 			}
@@ -459,6 +512,11 @@ func run(cfg config, logger *slog.Logger) error {
 	}
 	if cfg.acmeEnabled() {
 		logger.Info("obtaining certificates via ACME", "domains", cfg.acmeDomains, "directory", acmeManager.DirectoryURL(), "cache", acmeManager.CacheDir())
+		if notifier != nil {
+			logger.Info("ACME certificate notifications enabled", "targets", notifier.Targets())
+		} else {
+			logger.Info("ACME certificate notifications disabled; set -acme-notify-webhook or -acme-notify-command to be told when certificates are not renewed")
+		}
 		if cfg.httpRedirect == "" {
 			logger.Info("ACME HTTP-01 challenge disabled; TLS-ALPN-01 requires -listen to be reachable on port 443")
 		}
@@ -500,6 +558,9 @@ func run(cfg config, logger *slog.Logger) error {
 			}
 		}()
 	}
+	if notifier != nil {
+		go notifier.Run(ctx)
+	}
 	if acmeManager != nil {
 		go acmeManager.Run(ctx)
 	}
@@ -522,6 +583,25 @@ func run(cfg config, logger *slog.Logger) error {
 		}
 	}
 	return runErr
+}
+
+// sendTestNotification sends a test notification to check the
+// -acme-notify-* settings.
+func sendTestNotification(n *notify.Notifier, cfg config, logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	domains := splitList(cfg.acmeDomains)
+	err := n.Send(ctx, notify.Event{
+		Event:    "test",
+		Severity: notify.SeverityInfo,
+		Domain:   domains[0],
+		Message:  "Test notification: PrismWAF will notify here when a certificate for " + strings.Join(domains, ", ") + " is about to expire, has expired or cannot be obtained.",
+	})
+	if err != nil {
+		return fmt.Errorf("test notification failed: %w", err)
+	}
+	logger.Info("test notification sent", "targets", n.Targets())
+	return nil
 }
 
 // splitList splits a comma-separated flag value, ignoring blanks.

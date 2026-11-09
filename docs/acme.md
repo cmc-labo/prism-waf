@@ -77,7 +77,8 @@ CA ─────HTTP:80─▶│ -http-redirect answers HTTP-01 challenges,   
 5. **Monitoring.** Every minute, PrismWAF checks each domain: a missing
    certificate is requested again once its [retry delay](#retries-after-failures)
    has passed, and a certificate that should have been renewed by now is
-   logged (see [Logs](#logs)).
+   logged (see [Logs](#logs)) and, if configured, reported to
+   administrators (see [Expiry notifications](#expiry-notifications)).
 
 Each domain gets its own certificate. Clients that support ECDSA (all
 current browsers) get an ECDSA P-256 certificate. Very old clients that
@@ -93,6 +94,10 @@ first time such a client connects.
 | `-acme-email` | (none) | Contact address registered with the CA account |
 | `-acme-directory` | Let's Encrypt | ACME directory URL of the CA, or `staging` for Let's Encrypt's staging environment |
 | `-http-redirect` | (none) | Plain HTTP listener, e.g. `:80`: answers HTTP-01 challenges and redirects all other requests to HTTPS |
+| `-acme-notify-webhook` | (none) | URL to `POST` [notifications](#expiry-notifications) to |
+| `-acme-notify-webhook-format` | `json` | Payload of the webhook: `json`, `slack` or `discord` |
+| `-acme-notify-command` | (none) | Shell command to run for each notification |
+| `-acme-notify-test` | `false` | Send a test notification and exit |
 
 Related options that work with ACME: `-hsts-max-age` (see
 [HSTS](https.md#hsts)) and `-tls-client-ca` (see
@@ -175,7 +180,7 @@ exists, the old file stays in place and a warning names both.
 
 Registered as the contact address of the CA account. Let's Encrypt no
 longer sends expiry reminder emails, so do not rely on it for monitoring;
-see [Monitor certificate expiry](#monitor-certificate-expiry). The address
+use [Expiry notifications](#expiry-notifications) instead. The address
 is registered when the account is created, on the first certificate
 request with an empty cache; changing `-acme-email` later does not update
 an existing account.
@@ -330,6 +335,162 @@ when needed), waits for it.
 `-acme-domains` cannot be combined with `-tls-cert`/`-tls-key`. All
 domains of one PrismWAF instance use either ACME or certificate files.
 
+## Expiry notifications
+
+Renewal is automatic, but when it keeps failing, someone has to fix the
+cause before the certificate expires. PrismWAF can notify administrators
+through a webhook (Slack, Discord, Mattermost, Google Chat, or any service
+that accepts JSON) or by running a command (e.g. to send an email):
+
+```sh
+prismwaf -listen :443 -http-redirect :80 \
+  -acme-domains example.com -acme-cache /var/lib/prismwaf/acme \
+  -acme-notify-webhook https://hooks.slack.com/services/T000/B000/XXXX \
+  -acme-notify-webhook-format slack \
+  -backend http://127.0.0.1:3000
+```
+
+```
+[PrismWAF waf1] WARNING: The certificate for example.com expires in 29 days (2027-02-04T10:12:33Z) and has not been renewed. Renewal keeps failing; see the ACME errors in the PrismWAF log.
+```
+
+Check the setup with `-acme-notify-test`, which sends a test notification
+with the same flags and exits with an error if it could not be delivered:
+
+```sh
+prismwaf -acme-domains example.com -acme-cache /var/lib/prismwaf/acme \
+  -acme-notify-webhook https://hooks.slack.com/services/T000/B000/XXXX \
+  -acme-notify-webhook-format slack -acme-notify-test
+```
+
+Without notification options, PrismWAF logs a reminder at startup.
+
+### When PrismWAF notifies
+
+| Event | Severity | When |
+|-------|----------|------|
+| `certificate_expiring` | `warning` | The certificate should have been renewed by now but has not been |
+| `certificate_expired` | `critical` | The certificate in use has expired; clients get certificate errors |
+| `certificate_unavailable` | `critical` | A domain has no certificate at all, because requesting one failed (at startup with an empty or expired cache, or for a new domain); HTTPS connections to it fail |
+| `certificate_recovered` | `info` | The certificate is fine again after one of the events above |
+| `test` | `info` | Sent by `-acme-notify-test` |
+
+A problem is notified as soon as it is detected (PrismWAF checks every
+minute) and then once a day while it lasts. A worse problem, e.g.
+`certificate_expired` after `certificate_expiring`, is notified at once.
+`certificate_recovered` closes the problem, so an alert can be resolved
+automatically.
+
+`certificate_expiring` is sent once renewal has been failing for **a day**.
+Renewal starts a third of the lifetime before expiry (at most 30 days) and
+is retried every 30 to 60 minutes, so a certificate that is still not
+renewed a day later will not be renewed without help:
+
+| Certificate lifetime | Renewal starts | `certificate_expiring` |
+|----------------------|----------------|------------------------|
+| 90 days (Let's Encrypt today) | 30 days before expiry | 29 days before expiry |
+| 45 days | 15 days before expiry | 14 days before expiry |
+| 6 days (short-lived) | 2 days before expiry | 1 day before expiry |
+
+This leaves almost the whole renewal period to fix the cause, and adapts
+automatically when the CA shortens certificate lifetimes. Transient
+failures that a later renewal attempt overcomes are not notified. The
+cause is in the log: look for `ACME validation failed` and `ACME request
+rejected` (see [Troubleshooting](#troubleshooting)).
+
+Notifications concern the ECDSA certificates of the configured domains.
+They are only sent while PrismWAF runs; see
+[Monitor certificate expiry](#monitor-certificate-expiry) for a check from
+outside.
+
+### Webhooks
+
+`-acme-notify-webhook` receives a `POST` with a JSON body for each
+notification. `-acme-notify-webhook-format` selects the body:
+
+| Format | Body | For |
+|--------|------|-----|
+| `json` (default) | The full event, see below | Your own automation, alerting systems, Zapier, n8n and similar |
+| `slack` | `{"text": "…"}` | Slack, Mattermost, Google Chat and Rocket.Chat incoming webhooks |
+| `discord` | `{"content": "…"}` | Discord webhooks |
+
+The `json` format:
+
+```json
+{
+  "time": "2026-11-09T01:03:46Z",
+  "event": "certificate_expiring",
+  "severity": "warning",
+  "host": "waf1",
+  "message": "The certificate for example.com expires in 29 days (2027-02-04T10:12:33Z) and has not been renewed. Renewal keeps failing; see the ACME errors in the PrismWAF log.",
+  "domain": "example.com",
+  "issuer": "CN=R11,O=Let's Encrypt,C=US",
+  "serial": "4a1b9c…",
+  "not_after": "2027-02-04T10:12:33Z",
+  "text": "[PrismWAF waf1] WARNING: The certificate for example.com expires in 29 days …"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `event`, `severity` | See [When PrismWAF notifies](#when-prismwaf-notifies) |
+| `host` | Host name of the machine PrismWAF runs on |
+| `message` | A sentence describing the problem |
+| `text` | `message` with host and severity, as sent to chat services |
+| `domain` | The domain of the certificate |
+| `issuer`, `serial`, `not_after` | The certificate, for `certificate_expiring`, `certificate_expired` and `certificate_recovered` |
+| `error`, `failures`, `retry_at` | For `certificate_unavailable`: the last error, the number of failed requests in a row and the next attempt |
+
+A response other than `2xx` counts as a failure. Each notification is
+tried three times (immediately, after 10 seconds and after another
+minute), with a timeout of 10 seconds; failures are logged with the
+response (see [Logs](#logs)).
+
+Webhook URLs usually contain a secret token. PrismWAF logs only their
+host, but command-line arguments can be read by other local users (e.g.
+with `ps`). On shared machines, use `-acme-notify-command` with a script
+that reads the URL from a protected file instead (see below).
+
+### Commands
+
+`-acme-notify-command` is run with `sh -c` for each notification, as the
+user PrismWAF runs as. The event is passed as JSON (the `json` webhook
+format without `text`) on standard input and in environment variables:
+
+| Variable | Content |
+|----------|---------|
+| `PRISMWAF_EVENT`, `PRISMWAF_SEVERITY` | Event and severity |
+| `PRISMWAF_MESSAGE`, `PRISMWAF_TEXT` | The message, and the message with host and severity |
+| `PRISMWAF_DOMAIN`, `PRISMWAF_HOST`, `PRISMWAF_TIME` | Domain, host name and time (RFC 3339) |
+| `PRISMWAF_NOT_AFTER` | Expiry of the certificate (RFC 3339), if known |
+| `PRISMWAF_ERROR`, `PRISMWAF_FAILURES` | For `certificate_unavailable` |
+
+A non-zero exit status counts as a failure and is retried like a webhook;
+the first 512 bytes of the command's output are logged. Commands are
+stopped after 30 seconds.
+
+Send an email with `mail` (from mailutils or s-nail):
+
+```sh
+-acme-notify-command 'mail -s "$PRISMWAF_TEXT" admin@example.com'
+```
+
+The JSON on standard input becomes the mail body. With `sendmail` only:
+
+```sh
+-acme-notify-command 'printf "Subject: %s\n\n%s\n" "$PRISMWAF_TEXT" "$PRISMWAF_MESSAGE" | sendmail admin@example.com'
+```
+
+Post to a webhook whose URL is kept in a file only root and PrismWAF can
+read:
+
+```sh
+-acme-notify-command 'curl -fsS -H "Content-Type: application/json" --data-binary @- "$(cat /etc/prismwaf/webhook-url)"'
+```
+
+`-acme-notify-webhook` and `-acme-notify-command` can be used together;
+each notification is then sent to both.
+
 ## Logs
 
 PrismWAF writes ACME events to its operational log (standard error):
@@ -340,12 +501,17 @@ PrismWAF writes ACME events to its operational log (standard error):
 | INFO | `ACME certificate ready` | A certificate from the cache is in use, logged once after startup |
 | WARN | `ACME validation failed` | The CA could not validate a domain. With the `challenge`, the CA's `problem` type and `detail`, and a `hint` |
 | WARN | `ACME request rejected` | The CA rejected a request, e.g. with a rate limit. With `status`, `problem`, `detail`, `retry_after` and a `hint` |
+| WARN | `cannot reach the ACME CA` | A connection to the CA failed, also during background renewals, which report nothing else. With `url`, `error` and a `hint` |
 | ERROR | `ACME certificate request failed` | A certificate could not be obtained. With the `error`, the `validation` errors of the attempt, a `hint`, the number of consecutive `failures` and when the next attempt is made (`retry_in`, `retry_at`) |
 | INFO | `ACME certificate available again` | A certificate was obtained after failures |
-| WARN | `ACME certificate not renewed yet` | Less than half of the renewal period is left, so renewal has been failing for a while. Logged daily |
+| WARN | `ACME certificate not renewed yet` | Renewal has been failing for a day (see [When PrismWAF notifies](#when-prismwaf-notifies)). Logged daily |
 | ERROR | `ACME certificate expired` | The certificate in use has expired. Logged hourly |
 | ERROR | `cannot write ACME cache; …` | A certificate could not be stored, e.g. because the disk is full; it would be requested again after a restart |
 | WARN | `using the Let's Encrypt staging environment: …` | Staging is configured |
+| INFO | `notification sent` | A [notification](#expiry-notifications) was delivered. With `event`, `domain` and `target` |
+| WARN | `notification failed; retrying` | Delivery failed and is retried. With the `error` |
+| ERROR | `notification failed` | Delivery failed three times. With the `error` and the `message` that could not be delivered |
+| ERROR | `notification dropped: …` | More than 100 notifications were waiting to be sent |
 
 The library that implements ACME only reports that no challenge
 succeeded; the CA's reason is taken from its responses and logged as
@@ -435,6 +601,7 @@ ExecStart=/usr/local/bin/prismwaf \
   -listen :443 -http-redirect :80 \
   -acme-domains example.com,www.example.com \
   -acme-cache /var/lib/prismwaf/acme \
+  -acme-notify-command '/usr/local/bin/prismwaf-notify' \
   -backend http://127.0.0.1:3000 \
   -audit-log /var/log/prismwaf/audit.log
 Restart=on-failure
@@ -452,6 +619,11 @@ journalctl -u prismwaf -f
 ```
 
 There is no `ExecReload=`; see [`SIGHUP` terminates PrismWAF](#sighup-terminates-prismwaf).
+
+`/usr/local/bin/prismwaf-notify` is a script of your choice, e.g. one of
+the [commands](#commands) above. `NoNewPrivileges=true` keeps the command
+from gaining privileges, so a mail program that needs setuid or setgid
+(some `sendmail` implementations) has to submit mail over SMTP instead.
 
 ### Behind a TCP load balancer or port forwarding
 
@@ -518,11 +690,16 @@ also supports reloading with `SIGHUP`.
 
 ### Monitor certificate expiry
 
-Renewal is automatic, but monitor it. PrismWAF logs `ACME certificate
-not renewed yet` (WARN) and `ACME certificate expired` (ERROR); alert on
-these and on `ACME certificate request failed`. Also check the expiry
-date from outside, which catches problems the log cannot, such as a
-stopped process:
+Renewal is automatic, but monitor it:
+
+1. Enable [expiry notifications](#expiry-notifications) and test them with
+   `-acme-notify-test`.
+2. If you collect logs centrally, alert on `ACME certificate not renewed
+   yet` (WARN), `ACME certificate expired` and `notification failed`
+   (ERROR).
+3. Also check the expiry date from outside. This catches problems that
+   PrismWAF cannot report itself, such as a stopped process or a machine
+   that is down:
 
 ```sh
 echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
@@ -561,7 +738,7 @@ field suggests what to check. The most common problems:
 | `…:caa` | A CAA record does not allow the CA | Add the CA to the CAA records |
 | `…:rateLimited` | A rate limit was hit | Wait until `retry_at`; test with staging |
 | `…:externalAccountRequired` | The CA requires EAB | Not supported; use another CA or certificate files |
-| `cannot reach the ACME CA` (hint) | No connection to the CA's directory | Check outgoing HTTPS, proxies and `-acme-directory` |
+| `cannot reach the ACME CA` | No connection to the CA | Check outgoing HTTPS, proxies and `-acme-directory` |
 | `ACME cache directory is not writable` (at startup) | Wrong owner or mode of `-acme-cache` | `chown` the directory to the PrismWAF user and `chmod 700` it |
 | `ACME cache directory … belongs to …` (at startup) | A CA's subdirectory was copied by hand | Move it back or remove it |
 
@@ -592,3 +769,5 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - Retry delays are kept in memory and start over after a restart.
 - Renewal failures of existing certificates are retried every 30 to 60
   minutes by the ACME library, without the longer delays above.
+- Notifications are only sent while PrismWAF runs, and their state is
+  kept in memory: after a restart, an ongoing problem is notified again.
