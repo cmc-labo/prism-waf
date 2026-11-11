@@ -1,6 +1,7 @@
 package waf
 
 import (
+	"crypto/tls"
 	"net/http/httptest"
 	"testing"
 )
@@ -48,6 +49,41 @@ func TestParseTrustedProxiesInvalid(t *testing.T) {
 	for _, s := range []string{"10.0.0.0/33", "not-an-ip", "10.0.0.0/8,,bad"} {
 		if _, err := ParseTrustedProxies(s); err == nil {
 			t.Errorf("ParseTrustedProxies(%q) succeeded, want error", s)
+		}
+	}
+}
+
+func TestIsHTTPS(t *testing.T) {
+	tp, _ := ParseTrustedProxies("10.0.0.0/8")
+	tests := []struct {
+		name   string
+		tls    bool
+		remote string
+		xfp    []string
+		want   bool
+	}{
+		{"direct HTTPS", true, "203.0.113.7:5555", nil, true},
+		{"direct HTTP", false, "203.0.113.7:5555", nil, false},
+		{"untrusted peer, spoofed header ignored", false, "203.0.113.7:5555", []string{"https"}, false},
+		{"trusted proxy, HTTPS", false, "10.0.0.1:5555", []string{"https"}, true},
+		{"trusted proxy, HTTP", false, "10.0.0.1:5555", []string{"http"}, false},
+		{"trusted proxy without header", false, "10.0.0.1:5555", nil, false},
+		{"value of the proxy wins", false, "10.0.0.1:5555", []string{"https, http"}, false},
+		{"last header wins", false, "10.0.0.1:5555", []string{"http", "HTTPS"}, true},
+	}
+	for _, tc := range tests {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = tc.remote
+		if !tc.tls {
+			r.TLS = nil
+		} else {
+			r.TLS = &tls.ConnectionState{}
+		}
+		for _, v := range tc.xfp {
+			r.Header.Add("X-Forwarded-Proto", v)
+		}
+		if got := tp.IsHTTPS(r); got != tc.want {
+			t.Errorf("%s: IsHTTPS = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

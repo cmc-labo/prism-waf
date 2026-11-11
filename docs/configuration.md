@@ -68,6 +68,24 @@ See [Audit log](audit-log.md#audit-log) and
 A client is an IP address, or a `/64` network for IPv6. See
 [Rate limiting](rate-limiting.md).
 
+## Bot protection
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-bot-protection` | `false` | Score how likely each request comes from a bot and challenge clients that look automated |
+| `-bot-challenge-score` | `50` | Bot score (1-100) from which clients must solve a proof-of-work challenge |
+| `-bot-block-score` | `0` (disabled) | Bot score (1-100) from which requests get `403` without a challenge |
+| `-bot-difficulty` | `18` | Leading zero bits of the challenge's SHA-256 hash, 1-30; every bit doubles the work |
+| `-bot-clearance-ttl` | `24h` | How long a solved challenge lets a client through |
+| `-bot-secret-file` | (random key) | File with a key of at least 32 bytes to sign challenges and cookies; share it between instances |
+| `-bot-path` | (all paths) | Protect only this path, e.g. `/search` or `/articles/*`; repeatable |
+| `-bot-exempt-path` | (none) | Never protect this path, e.g. `/api/*`; repeatable |
+| `-bot-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never challenged |
+
+`/robots.txt`, `/favicon.ico` and `/.well-known/*` are always exempt. See
+[Bot protection](bot-protection.md), including its effect on
+[search engines](bot-protection.md#search-engines-and-link-previews).
+
 ## HTTPS
 
 | Flag | Default | Description |

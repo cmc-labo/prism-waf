@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
+	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/notify"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
@@ -49,6 +50,15 @@ func main() {
 	flag.Var(&cfg.rateLimitPaths, "rate-limit-path", `per-client limit for one path as "[METHOD ]PATH=N/WINDOW", e.g. "POST /login=5/1m" or "/api/*=100/1m"; repeatable`)
 	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited")
 	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once")
+	flag.BoolVar(&cfg.botProtection, "bot-protection", false, "score how likely each request comes from a bot and make clients that look automated solve a proof-of-work challenge in JavaScript")
+	flag.IntVar(&cfg.botChallengeScore, "bot-challenge-score", bot.DefaultChallengeScore, "bot score (0-100) from which clients must solve the challenge")
+	flag.IntVar(&cfg.botBlockScore, "bot-block-score", 0, "bot score (0-100) from which requests are rejected with 403 without a challenge; 0 disables")
+	flag.IntVar(&cfg.botDifficulty, "bot-difficulty", bot.DefaultDifficulty, fmt.Sprintf("leading zero bits of the challenge's SHA-256 hash (1-%d); each bit doubles the work of the browser", bot.MaxDifficulty))
+	flag.DurationVar(&cfg.botClearanceTTL, "bot-clearance-ttl", bot.DefaultClearanceTTL, "how long a solved challenge lets a client through")
+	flag.StringVar(&cfg.botSecretFile, "bot-secret-file", "", fmt.Sprintf("file with a key of at least %d bytes to sign challenges and cookies; share it between instances (default: a random key per process)", bot.MinSecretLength))
+	flag.Var(&cfg.botPaths, "bot-path", `protect only this path, e.g. "/search" or "/articles/*"; repeatable (default: all paths)`)
+	flag.Var(&cfg.botExemptPaths, "bot-exempt-path", `never protect this path, e.g. "/api/*"; repeatable (/robots.txt, /favicon.ico and /.well-known/* are always exempt)`)
+	flag.StringVar(&cfg.botExempt, "bot-exempt", "", "comma-separated IPs or CIDRs of clients that are never challenged")
 	flag.Var(&cfg.tlsCerts, "tls-cert", "PEM certificate chain file; enables HTTPS on -listen. Repeat with -tls-key for several domains (SNI); the first is the default")
 	flag.Var(&cfg.tlsKeys, "tls-key", "PEM private key file for the -tls-cert at the same position")
 	flag.StringVar(&cfg.acmeDomains, "acme-domains", "", "comma-separated domains to obtain certificates for from an ACME CA (Let's Encrypt); enables HTTPS on -listen")
@@ -98,6 +108,15 @@ type config struct {
 	rateLimitPaths      stringList
 	rateLimitExempt     string
 	rateLimitMaxClients int
+	botProtection       bool
+	botChallengeScore   int
+	botBlockScore       int
+	botDifficulty       int
+	botClearanceTTL     time.Duration
+	botSecretFile       string
+	botPaths            stringList
+	botExemptPaths      stringList
+	botExempt           string
 	tlsCerts            stringList
 	tlsKeys             stringList
 	acmeDomains         string
@@ -181,6 +200,39 @@ func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
 	return rules, nil
 }
 
+// botConfig returns the configuration of the bot guard, without the
+// secret, which is read from -bot-secret-file by run.
+func (c config) botConfig() (bot.Config, error) {
+	exempt, err := ratelimit.ParsePrefixes(c.botExempt)
+	if err != nil {
+		return bot.Config{}, fmt.Errorf("invalid -bot-exempt: %w", err)
+	}
+	return bot.Config{
+		ChallengeScore: c.botChallengeScore,
+		BlockScore:     c.botBlockScore,
+		Difficulty:     c.botDifficulty,
+		ClearanceTTL:   c.botClearanceTTL,
+		Paths:          c.botPaths,
+		ExemptPaths:    c.botExemptPaths,
+		Exempt:         exempt,
+	}, nil
+}
+
+// readBotSecret reads -bot-secret-file. Surrounding whitespace, such as
+// the newline of a key generated with "openssl rand -base64 32", is
+// ignored.
+func readBotSecret(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid -bot-secret-file: %w", err)
+	}
+	b = []byte(strings.TrimSpace(string(b)))
+	if len(b) < bot.MinSecretLength {
+		return nil, fmt.Errorf("invalid -bot-secret-file: the key must be at least %d bytes, e.g. from \"openssl rand -base64 32\"", bot.MinSecretLength)
+	}
+	return b, nil
+}
+
 func (c config) acmeEnabled() bool { return c.acmeDomains != "" }
 
 func (c config) acmeNotifyEnabled() bool {
@@ -240,6 +292,18 @@ func (c config) validate() error {
 	}
 	if c.rateLimitMaxClients < 0 {
 		return errors.New("-rate-limit-max-clients must not be negative")
+	}
+	if !c.botProtection && (c.botSecretFile != "" || len(c.botPaths) > 0 || len(c.botExemptPaths) > 0 || c.botExempt != "") {
+		return errors.New("-bot-* options require -bot-protection")
+	}
+	if c.botProtection {
+		bc, err := c.botConfig()
+		if err != nil {
+			return err
+		}
+		if _, err := bot.New(bc); err != nil {
+			return fmt.Errorf("invalid -bot-* option: %w", err)
+		}
 	}
 	if len(c.tlsCerts) != len(c.tlsKeys) {
 		return errors.New("each -tls-cert needs a matching -tls-key")
@@ -378,6 +442,21 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
+	var guard *bot.Guard
+	if cfg.botProtection {
+		bc, err := cfg.botConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.botSecretFile != "" {
+			if bc.Secret, err = readBotSecret(cfg.botSecretFile); err != nil {
+				return err
+			}
+		}
+		if guard, err = bot.New(bc); err != nil {
+			return err
+		}
+	}
 	auditLogger, closeAudit, err := audit.Open(cfg.auditLog)
 	if err != nil {
 		return err
@@ -391,6 +470,7 @@ func run(cfg config, logger *slog.Logger) error {
 		Inspector:      inspector,
 		CRS:            crsEngine,
 		RateLimiter:    limiter,
+		Bot:            guard,
 		Mode:           mode,
 		Audit:          auditLogger,
 		TrustedProxies: tp,
@@ -502,6 +582,20 @@ func run(cfg config, logger *slog.Logger) error {
 		logger.Info("rate limiting enabled", "rules", rules, "exempt", cfg.rateLimitExempt)
 		if len(tp) == 0 {
 			logger.Info("rate limits count requests per TCP peer; behind a load balancer or CDN, set -trusted-proxies or all clients share one limit")
+		}
+	}
+	if guard != nil {
+		blockScore := "disabled"
+		if guard.BlockScore() > 0 {
+			blockScore = fmt.Sprint(guard.BlockScore())
+		}
+		logger.Info("bot protection enabled", "challenge_score", guard.ChallengeScore(), "block_score", blockScore,
+			"difficulty", guard.Difficulty(), "clearance_ttl", cfg.botClearanceTTL, "paths", cfg.botPaths, "exempt_paths", cfg.botExemptPaths, "exempt", cfg.botExempt)
+		if cfg.botSecretFile == "" {
+			logger.Info("bot clearance cookies are signed with a random key: they become invalid when PrismWAF restarts, and other instances do not accept them; set -bot-secret-file to keep them")
+		}
+		if len(tp) == 0 {
+			logger.Info("bot clearance is bound to the TCP peer address; behind a load balancer or CDN, set -trusted-proxies")
 		}
 	}
 	if cfg.healthPath != "" {

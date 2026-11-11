@@ -26,11 +26,12 @@ type Event struct {
 	ClientIP string `json:"client_ip"`
 	// RemoteAddr is the address of the TCP peer.
 	RemoteAddr string `json:"remote_addr"`
-	// Action is what PrismWAF did: "block" (rejected) or "detect" (only
-	// logged and forwarded, in detection mode).
+	// Action is what PrismWAF did: "block" (rejected), "challenge" (asked
+	// to prove it is a browser) or "detect" (only logged and forwarded, in
+	// detection mode).
 	Action string `json:"action"`
 	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS),
-	// "body_too_large" or "rate_limit".
+	// "body_too_large", "rate_limit" or "bot".
 	Reason string `json:"reason"`
 	Rule   *Rule  `json:"rule,omitempty"`
 	Match  *Match `json:"match,omitempty"`
@@ -38,7 +39,23 @@ type Event struct {
 	CRS *CRS `json:"crs,omitempty"`
 	// RateLimit holds the details of an exceeded rate limit.
 	RateLimit *RateLimit `json:"rate_limit,omitempty"`
-	Request   Request    `json:"request"`
+	// Bot holds the details of a client that looks like a bot.
+	Bot     *Bot    `json:"bot,omitempty"`
+	Request Request `json:"request"`
+}
+
+// Bot describes why a client was considered a bot. Only the first
+// challenged or blocked request of a client in a minute is logged; the
+// following ones share its event ID.
+type Bot struct {
+	// Score is from 0 (nothing suspicious) to 100 (certainly a bot).
+	Score int `json:"score"`
+	// Signals are the reasons for the score, e.g. "automation_tool" or
+	// "missing_accept_language".
+	Signals []string `json:"signals"`
+	// Client is the address that a clearance cookie would be bound to:
+	// the client IP, or its /64 network for IPv6.
+	Client string `json:"client"`
 }
 
 // RateLimit describes an exceeded rate limit. Only the first rejected

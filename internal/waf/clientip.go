@@ -78,3 +78,27 @@ func (tp TrustedProxies) ClientIP(r *http.Request) string {
 	}
 	return client.String()
 }
+
+// IsHTTPS reports whether the client connected with HTTPS: to PrismWAF
+// directly, or to a trusted proxy that says so in X-Forwarded-Proto.
+func (tp TrustedProxies) IsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	peer, err := netip.ParseAddr(host)
+	if err != nil || !tp.contains(peer) {
+		return false
+	}
+	// The last value is the one the trusted proxy set; earlier ones could
+	// come from the client.
+	values := r.Header.Values("X-Forwarded-Proto")
+	if len(values) == 0 {
+		return false
+	}
+	protos := strings.Split(values[len(values)-1], ",")
+	return strings.EqualFold(strings.TrimSpace(protos[len(protos)-1]), "https")
+}

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
 )
 
@@ -66,6 +70,17 @@ func TestConfigValidate(t *testing.T) {
 		{"rate limit exemption without limits", config{rateLimitExempt: "10.0.0.0/8"}, true},
 		{"negative max clients", config{rateLimit: "300/1m", rateLimitMaxClients: -1}, true},
 
+		{"bot protection", config{botProtection: true, botChallengeScore: 50, botDifficulty: 18, botClearanceTTL: time.Hour}, false},
+		{"bot protection with paths", config{botProtection: true, botPaths: stringList{"/articles/*"}, botExemptPaths: stringList{"/api/*"}, botExempt: "10.0.0.0/8", botBlockScore: 90}, false},
+		{"bot options without bot protection", config{botExemptPaths: stringList{"/api/*"}}, true},
+		{"bot secret without bot protection", config{botSecretFile: "secret"}, true},
+		{"invalid bot challenge score", config{botProtection: true, botChallengeScore: 101}, true},
+		{"invalid bot block score", config{botProtection: true, botBlockScore: -1}, true},
+		{"invalid bot difficulty", config{botProtection: true, botDifficulty: 64}, true},
+		{"too short bot clearance", config{botProtection: true, botClearanceTTL: time.Second}, true},
+		{"invalid bot path", config{botProtection: true, botPaths: stringList{"articles"}}, true},
+		{"invalid bot exemption", config{botProtection: true, botExempt: "office"}, true},
+
 		{"least-conn", config{lbPolicy: "least-conn"}, false},
 		{"invalid lb policy", config{lbPolicy: "random"}, true},
 		{"negative fail timeout", config{failTimeout: -time.Second}, true},
@@ -77,6 +92,23 @@ func TestConfigValidate(t *testing.T) {
 		if err := tc.cfg.validate(); (err != nil) != tc.wantErr {
 			t.Errorf("%s: validate() = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
+	}
+}
+
+func TestReadBotSecret(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good")
+	os.WriteFile(good, []byte(strings.Repeat("k", bot.MinSecretLength)+"\n"), 0o600)
+	short := filepath.Join(dir, "short")
+	os.WriteFile(short, []byte("secret\n"), 0o600)
+	if b, err := readBotSecret(good); err != nil || len(b) != bot.MinSecretLength {
+		t.Errorf("good key: %q, %v", b, err)
+	}
+	if _, err := readBotSecret(short); err == nil {
+		t.Error("short key accepted")
+	}
+	if _, err := readBotSecret(filepath.Join(dir, "missing")); err == nil {
+		t.Error("missing file accepted")
 	}
 }
 

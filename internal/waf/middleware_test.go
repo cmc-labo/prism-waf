@@ -2,15 +2,21 @@ package waf
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"math/bits"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
+	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
@@ -361,6 +367,147 @@ func TestRetryAfterSeconds(t *testing.T) {
 	} {
 		if got := retryAfterSeconds(d); got != want {
 			t.Errorf("retryAfterSeconds(%v) = %d, want %d", d, got, want)
+		}
+	}
+}
+
+func TestBotProtection(t *testing.T) {
+	const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+	for _, mode := range []Mode{ModeBlock, ModeDetect} {
+		t.Run(string(mode), func(t *testing.T) {
+			guard, err := bot.New(bot.Config{Difficulty: 4, BlockScore: 80})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tp, _ := ParseTrustedProxies("10.0.0.0/8")
+			var buf bytes.Buffer
+			var scores []string
+			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				scores = append(scores, r.Header.Get(bot.ScoreHeader))
+			}), Config{
+				Inspector:      mustInspector(t, 0),
+				Bot:            guard,
+				Mode:           mode,
+				Audit:          audit.New(&buf),
+				TrustedProxies: tp,
+			})
+			serve := func(r *http.Request) *httptest.ResponseRecorder {
+				r.RemoteAddr = "10.0.0.5:4321"
+				r.Header.Set("X-Forwarded-For", "203.0.113.7")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, r)
+				return rec
+			}
+			get := func(target, ua string, extra ...string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest("GET", target, nil)
+				r.Header.Set("User-Agent", ua)
+				for i := 0; i+1 < len(extra); i += 2 {
+					r.Header.Set(extra[i], extra[i+1])
+				}
+				return serve(r)
+			}
+			browser := []string{"Accept", "text/html", "Accept-Language", "ja", "Accept-Encoding", "gzip"}
+
+			// A browser passes, and a score sent by the client is replaced.
+			if rec := get("/", chromeUA, append(browser, bot.ScoreHeader, "99")...); rec.Code != http.StatusOK {
+				t.Errorf("browser: %d", rec.Code)
+			}
+			// curl is challenged, twice, with one audit event.
+			first := get("/page?id=1", "curl/8.5.0", bot.ScoreHeader, "0")
+			get("/page?id=2", "curl/8.5.0")
+			// Only a browser User-Agent without its headers: blocked.
+			blocked := get("/", chromeUA)
+
+			events := decodeEvents(t, &buf)
+			if len(events) != 2 {
+				t.Fatalf("got %d events, want 2: %+v", len(events), events)
+			}
+			action := func(a string) string { return map[Mode]string{ModeBlock: a, ModeDetect: "detect"}[mode] }
+			c, b := events[0], events[1]
+			if c.Reason != "bot" || c.Action != action("challenge") || c.ClientIP != "203.0.113.7" || c.Bot == nil ||
+				c.Bot.Score != 60 || strings.Join(c.Bot.Signals, ",") != "automation_tool" || c.Bot.Client != "203.0.113.7/32" {
+				t.Errorf("challenge event = %+v %+v", c, c.Bot)
+			}
+			if b.Reason != "bot" || b.Action != action("block") || b.Bot == nil || b.Bot.Score != 80 {
+				t.Errorf("block event = %+v %+v", b, b.Bot)
+			}
+
+			if mode == ModeDetect {
+				if strings.Join(scores, ",") != "0,60,60,80" {
+					t.Errorf("scores at the backend: %q", scores)
+				}
+				return
+			}
+			if strings.Join(scores, ",") != "0" {
+				t.Errorf("scores at the backend: %q", scores)
+			}
+			if first.Code != http.StatusForbidden || !strings.Contains(first.Body.String(), "Checking your browser") ||
+				!strings.Contains(first.Body.String(), "Event ID: "+c.ID) {
+				t.Errorf("challenge: %d\n%s", first.Code, first.Body)
+			}
+			if blocked.Code != http.StatusForbidden || !strings.Contains(blocked.Body.String(), "Event ID: "+b.ID) {
+				t.Errorf("block: %d %q", blocked.Code, blocked.Body)
+			}
+
+			// Solve the challenge like the browser. The solution is not
+			// forwarded to the backend.
+			token := regexp.MustCompile(`name="c" value="([^"]+)"`).FindStringSubmatch(first.Body.String())
+			if token == nil {
+				t.Fatalf("no challenge in\n%s", first.Body)
+			}
+			form := url.Values{"c": {token[1]}, "n": {solvePoW(token[1])}, "r": {"/page?id=1"}}
+			r := httptest.NewRequest("POST", bot.VerifyPath, strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			r.Header.Set("User-Agent", "curl/8.5.0")
+			rec := serve(r)
+			cookies := rec.Result().Cookies()
+			if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/page?id=1" || len(cookies) != 1 || len(scores) != 1 {
+				t.Fatalf("verify: %d %v", rec.Code, rec.Header())
+			}
+			if rec := get("/page?id=1", "curl/8.5.0", "Cookie", cookies[0].Name+"="+cookies[0].Value); rec.Code != http.StatusOK {
+				t.Errorf("with clearance: %d", rec.Code)
+			}
+			if strings.Join(scores, ",") != "0,60" {
+				t.Errorf("scores at the backend: %q", scores)
+			}
+		})
+	}
+}
+
+func TestBotProtectionBeforeInspection(t *testing.T) {
+	guard, _ := bot.New(bot.Config{})
+	h := Middleware(http.NotFoundHandler(), Config{Inspector: mustInspector(t, 0), Bot: guard})
+	r := httptest.NewRequest("GET", "/?q=1'%20OR%201=1--", nil)
+	r.Header.Set("User-Agent", "sqlmap/1.8")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if !strings.Contains(rec.Body.String(), "Checking your browser") {
+		t.Errorf("got %d %q, want the challenge", rec.Code, rec.Body)
+	}
+}
+
+func decodeEvents(t *testing.T, buf *bytes.Buffer) []audit.Event {
+	t.Helper()
+	var events []audit.Event
+	dec := json.NewDecoder(buf)
+	for dec.More() {
+		var e audit.Event
+		if err := dec.Decode(&e); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, e)
+	}
+	return events
+}
+
+// solvePoW finds the nonce for a challenge token "issued.difficulty.seed.mac".
+func solvePoW(token string) string {
+	f := strings.Split(token, ".")
+	d, _ := strconv.Atoi(f[1])
+	for n := 0; ; n++ {
+		h := sha256.Sum256([]byte(f[2] + strconv.Itoa(n)))
+		if bits.LeadingZeros32(uint32(h[0])<<24|uint32(h[1])<<16|uint32(h[2])<<8|uint32(h[3])) >= d {
+			return strconv.Itoa(n)
 		}
 	}
 }

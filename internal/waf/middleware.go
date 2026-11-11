@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
+	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
@@ -67,6 +68,11 @@ type Config struct {
 	// RateLimiter, if set, limits the request rate of each client before
 	// requests are inspected.
 	RateLimiter *ratelimit.Limiter
+	// Bot, if set, scores how likely each request comes from a bot,
+	// passes the score to the backend in bot.ScoreHeader and challenges
+	// or blocks clients that look automated, after rate limiting and
+	// before inspection.
+	Bot *bot.Guard
 	// Mode is ModeBlock or ModeDetect. The zero value means ModeBlock.
 	Mode Mode
 	// Audit receives an event for every blocked request. Nil disables audit
@@ -85,7 +91,8 @@ type Config struct {
 // ModeBlock they are then rejected with 403 Forbidden (or the status a CRS
 // rule asks for, such as 400 for an unparsable body), 413 Request Entity
 // Too Large and 429 Too Many Requests respectively; in ModeDetect they are
-// forwarded to next unchanged.
+// forwarded to next unchanged. Likewise, clients that look like bots are
+// challenged or blocked in ModeBlock and only logged in ModeDetect.
 func Middleware(next http.Handler, cfg Config) http.Handler {
 	logger := cfg.Logger
 	if logger == nil {
@@ -107,6 +114,31 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 					return
 				}
 			}
+		}
+
+		if cfg.Bot != nil {
+			clientIP, secure := cfg.TrustedProxies.ClientIP(r), cfg.TrustedProxies.IsHTTPS(r)
+			if r.URL.Path == bot.VerifyPath {
+				cfg.Bot.ServeVerify(w, r, clientIP, secure)
+				return
+			}
+			d := cfg.Bot.Check(r, clientIP, secure)
+			if d.First {
+				logBotEvent(cfg, logger, r, d)
+			}
+			if !detect {
+				switch d.Action {
+				case bot.Challenge:
+					cfg.Bot.ServeChallenge(w, r, d)
+					return
+				case bot.Block:
+					blockResponse(w, http.StatusForbidden, d.EventID)
+					return
+				}
+			}
+			// The backend can use the score, e.g. to hide content from
+			// likely bots. A client must not set it itself.
+			r.Header.Set(bot.ScoreHeader, strconv.Itoa(d.Score))
 		}
 
 		m, err := cfg.Inspector.Inspect(r)
@@ -217,6 +249,17 @@ func logRateLimitEvent(cfg Config, logger *slog.Logger, r *http.Request, d ratel
 		Client:     d.Client.String(),
 		RetryAfter: retryAfterSeconds(d.RetryAfter),
 	}
+	writeEvent(cfg, logger, e)
+}
+
+// logBotEvent writes an audit event for the first challenged or blocked
+// request of a client in a minute.
+func logBotEvent(cfg Config, logger *slog.Logger, r *http.Request, d bot.Decision) {
+	e := newEvent(cfg, r, d.EventID, "bot", nil)
+	if cfg.Mode != ModeDetect {
+		e.Action = d.Action.String()
+	}
+	e.Bot = &audit.Bot{Score: d.Score, Signals: d.Signals, Client: d.Client.String()}
 	writeEvent(cfg, logger, e)
 }
 
