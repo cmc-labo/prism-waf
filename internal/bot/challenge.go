@@ -12,15 +12,15 @@ import (
 )
 
 // ServeChallenge answers a request that has to solve a challenge first.
-// GET and HEAD requests get a page that solves the challenge in JavaScript
-// and then reloads the requested URL; other requests cannot be repeated
-// after a challenge and get a plain 403 Forbidden.
+// GET and HEAD requests get a page with the proof-of-work challenge or the
+// CAPTCHA, which then reloads the requested URL; other requests cannot be
+// repeated after a challenge and get a plain 403 Forbidden.
 func (g *Guard) ServeChallenge(w http.ResponseWriter, r *http.Request, d Decision) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeForbidden(w, "This request needs a browser check. Reload the page and try again.", d.EventID)
 		return
 	}
-	g.writePage(w, r, pageData{Redirect: safeRedirect(r.URL.RequestURI()), EventID: d.EventID}, d.Client)
+	g.writePage(w, r, pageData{Redirect: safeRedirect(r.URL.RequestURI()), EventID: d.EventID, Captcha: d.Captcha}, d.Client)
 }
 
 // ServeVerify handles the solution of a challenge, posted to VerifyPath.
@@ -32,16 +32,20 @@ func (g *Guard) ServeVerify(w http.ResponseWriter, r *http.Request, clientIP str
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 	client := clientKey(clientIP)
 	redirect := safeRedirect(r.PostForm.Get("r"))
+	if r.PostForm.Has("captcha") {
+		g.verifyCaptcha(w, r, clientIP, secure, redirect)
+		return
+	}
 	switch err := g.verify(r.PostForm.Get("c"), r.PostForm.Get("n"), client, r.UserAgent()); {
 	case err == nil:
-		http.SetCookie(w, g.clearanceCookie(client, r.UserAgent(), secure))
+		http.SetCookie(w, g.clearanceCookie(client, r.UserAgent(), levelPoW, secure))
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, redirect, http.StatusSeeOther)
 	case errors.Is(err, errExpired):
@@ -52,6 +56,28 @@ func (g *Guard) ServeVerify(w http.ResponseWriter, r *http.Request, clientIP str
 		// again automatically, which could loop forever.
 		g.writePage(w, r, pageData{Redirect: redirect, Failed: true}, client)
 	}
+}
+
+// verifyCaptcha handles the solution of a CAPTCHA.
+func (g *Guard) verifyCaptcha(w http.ResponseWriter, r *http.Request, clientIP string, secure bool, redirect string) {
+	client := clientKey(clientIP)
+	failed := pageData{Redirect: redirect, Failed: true, Message: "The CAPTCHA could not be verified."}
+	if g.captcha == nil {
+		g.writePage(w, r, failed, client)
+		return
+	}
+	err := g.captcha.verify(r.Context(), r.PostForm.Get("captcha"), clientIP, r.Host)
+	switch {
+	case err == nil:
+		http.SetCookie(w, g.clearanceCookie(client, r.UserAgent(), levelCaptcha, secure))
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, redirect, http.StatusSeeOther)
+		return
+	case errors.Is(err, errCaptchaConfig), errors.Is(err, errCaptchaUnavailable):
+		// Every user is affected: tell the administrator.
+		g.logger.Warn("cannot verify CAPTCHA solutions", "provider", g.captcha.name, "error", err)
+	}
+	g.writePage(w, r, failed, client)
 }
 
 // safeRedirect returns target if it is a path on this site, and "/"
@@ -75,8 +101,16 @@ func writeForbidden(w http.ResponseWriter, msg, eventID string) {
 type pageData struct {
 	Redirect string
 	EventID  string
-	// Failed shows that the last solution was rejected.
-	Failed bool
+	// Failed shows that the last solution was rejected, with Message.
+	Failed  bool
+	Message string
+	// Captcha shows the CAPTCHA instead of the proof of work.
+	Captcha bool
+
+	CaptchaScript string
+	WidgetClass   string
+	SiteKey       string
+	Action        string
 
 	Token      string
 	Seed       string
@@ -91,14 +125,30 @@ func (g *Guard) writePage(w http.ResponseWriter, r *http.Request, data pageData,
 	data.VerifyPath = VerifyPath
 	var b [16]byte
 	rand.Read(b[:])
-	data.Nonce = base64.RawStdEncoding.EncodeToString(b[:])
+	data.Nonce = base64.RawURLEncoding.EncodeToString(b[:])
+
+	if data.Failed && data.Message == "" {
+		data.Message = "Your network address or browser may have changed during the check."
+	}
+	csp := "default-src 'none'; script-src 'nonce-" + data.Nonce + "'; style-src 'unsafe-inline'; " +
+		"worker-src blob:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+	if data.Captcha && g.captcha != nil {
+		data.CaptchaScript = g.captcha.p.script
+		data.WidgetClass = g.captcha.p.widgetClass
+		data.SiteKey = g.captcha.siteKey
+		if g.captcha.name == CaptchaRecaptchaV3 {
+			data.Action = recaptchaAction
+		}
+		csp = g.captcha.csp(data.Nonce)
+	} else {
+		data.Captcha = false
+	}
 
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Robots-Tag", "noindex")
-	h.Set("Content-Security-Policy", "default-src 'none'; script-src 'nonce-"+data.Nonce+"'; style-src 'unsafe-inline'; "+
-		"worker-src blob:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	h.Set("Content-Security-Policy", csp)
 	// 403, as the requested page was not served. Clients that cannot run
 	// JavaScript see an error instead of an empty success.
 	w.WriteHeader(http.StatusForbidden)
@@ -129,14 +179,64 @@ p { margin: .5rem 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 4s; } }
 a { color: var(--accent); }
+.captcha { display: flex; justify-content: center; margin: 1.5rem 0; min-height: 65px; }
 </style>
 </head>
 <body>
 <main>
 {{- if .Failed}}
 <h1>The browser check failed</h1>
-<p>Your network address or browser may have changed during the check.</p>
+<p>{{.Message}}</p>
 <p><a href="{{.Redirect}}">Try again</a></p>
+{{- else if .Captcha}}
+{{- if .WidgetClass}}
+<h1>Confirm that you are human</h1>
+<p>Complete the check below to continue to the site.</p>
+{{- else}}
+<h1>Checking your browser</h1>
+<div class="spinner"></div>
+{{- end}}
+<form id="form" method="post" action="{{.VerifyPath}}">
+<input type="hidden" name="r" value="{{.Redirect}}">
+<input type="hidden" name="captcha" value="">
+{{- if .WidgetClass}}
+<div class="captcha {{.WidgetClass}}" data-sitekey="{{.SiteKey}}" data-callback="prismwafSolved"></div>
+{{- end}}
+</form>
+<p id="status" class="muted"></p>
+<noscript><p>This site checks that it is visited with a browser. Please enable JavaScript and reload the page.</p></noscript>
+<script nonce="{{.Nonce}}">
+(function () {
+  "use strict";
+  var status = document.getElementById("status");
+  document.cookie = "prismwaf_cookietest=1; path=/; SameSite=Lax";
+  if (document.cookie.indexOf("prismwaf_cookietest=1") < 0) {
+    status.textContent = "Please enable cookies for this site and reload the page.";
+    return;
+  }
+  document.cookie = "prismwaf_cookietest=; path=/; max-age=0";
+
+  // Called by the CAPTCHA with the token of a solution.
+  window.prismwafSolved = function (token) {
+    var form = document.getElementById("form");
+    form.elements.captcha.value = token;
+    form.submit();
+  };
+  var script = document.createElement("script");
+  script.src = {{.CaptchaScript}};
+  script.async = true;
+  script.onerror = function () { status.textContent = "The CAPTCHA could not be loaded. Please reload the page."; };
+  {{- if .Action}}
+  // reCAPTCHA v3 is invisible: ask for a token as soon as it is loaded.
+  script.onload = function () {
+    grecaptcha.ready(function () {
+      grecaptcha.execute({{.SiteKey}}, { action: {{.Action}} }).then(window.prismwafSolved);
+    });
+  };
+  {{- end}}
+  document.head.appendChild(script);
+})();
+</script>
 {{- else}}
 <h1>Checking your browser</h1>
 <div class="spinner" id="spinner"></div>

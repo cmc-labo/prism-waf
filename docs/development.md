@@ -18,6 +18,6 @@ internal/waf/        signatures, request inspection, JSON/XML body parsing
 internal/crs/        OWASP CRS v4 with the Coraza engine
 internal/ratelimit/  request rate limits per client and path
 internal/notify/     notifications to administrators (webhooks, commands)
-internal/bot/        bot score, proof-of-work challenge, clearance cookies
+internal/bot/        bot score, categories, DNS verification of bots, proof-of-work and CAPTCHA challenges
 examples/backend/    echo server for local testing
 ```

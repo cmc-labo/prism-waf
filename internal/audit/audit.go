@@ -53,6 +53,16 @@ type Bot struct {
 	// Signals are the reasons for the score, e.g. "automation_tool" or
 	// "missing_accept_language".
 	Signals []string `json:"signals"`
+	// Category is the kind of client, e.g. "browser", "search_engine" or
+	// "ai_crawler".
+	Category string `json:"category"`
+	// Name is the name of a known bot, e.g. "Googlebot".
+	Name string `json:"name,omitempty"`
+	// Verified reports whether the bot was verified with DNS.
+	Verified bool `json:"verified,omitempty"`
+	// Challenge is the challenge that was served: "pow" (proof of work)
+	// or "captcha".
+	Challenge string `json:"challenge,omitempty"`
 	// Client is the address that a clearance cookie would be bound to:
 	// the client IP, or its /64 network for IPv6.
 	Client string `json:"client"`

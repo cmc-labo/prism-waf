@@ -381,9 +381,10 @@ func TestBotProtection(t *testing.T) {
 			}
 			tp, _ := ParseTrustedProxies("10.0.0.0/8")
 			var buf bytes.Buffer
-			var scores []string
+			var scores, categories []string
 			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				scores = append(scores, r.Header.Get(bot.ScoreHeader))
+				categories = append(categories, r.Header.Get(bot.CategoryHeader)+"/"+r.Header.Get(bot.VerifiedHeader))
 			}), Config{
 				Inspector:      mustInspector(t, 0),
 				Bot:            guard,
@@ -409,7 +410,7 @@ func TestBotProtection(t *testing.T) {
 			browser := []string{"Accept", "text/html", "Accept-Language", "ja", "Accept-Encoding", "gzip"}
 
 			// A browser passes, and a score sent by the client is replaced.
-			if rec := get("/", chromeUA, append(browser, bot.ScoreHeader, "99")...); rec.Code != http.StatusOK {
+			if rec := get("/", chromeUA, append(browser, bot.ScoreHeader, "99", bot.VerifiedHeader, "true")...); rec.Code != http.StatusOK {
 				t.Errorf("browser: %d", rec.Code)
 			}
 			// curl is challenged, twice, with one audit event.
@@ -425,16 +426,18 @@ func TestBotProtection(t *testing.T) {
 			action := func(a string) string { return map[Mode]string{ModeBlock: a, ModeDetect: "detect"}[mode] }
 			c, b := events[0], events[1]
 			if c.Reason != "bot" || c.Action != action("challenge") || c.ClientIP != "203.0.113.7" || c.Bot == nil ||
-				c.Bot.Score != 60 || strings.Join(c.Bot.Signals, ",") != "automation_tool" || c.Bot.Client != "203.0.113.7/32" {
+				c.Bot.Score != 60 || strings.Join(c.Bot.Signals, ",") != "automation_tool" || c.Bot.Client != "203.0.113.7/32" ||
+				c.Bot.Category != "automation" || c.Bot.Challenge != "pow" {
 				t.Errorf("challenge event = %+v %+v", c, c.Bot)
 			}
-			if b.Reason != "bot" || b.Action != action("block") || b.Bot == nil || b.Bot.Score != 80 {
+			if b.Reason != "bot" || b.Action != action("block") || b.Bot == nil || b.Bot.Score != 80 || b.Bot.Category != "browser" || b.Bot.Challenge != "" {
 				t.Errorf("block event = %+v %+v", b, b.Bot)
 			}
 
 			if mode == ModeDetect {
-				if strings.Join(scores, ",") != "0,60,60,80" {
-					t.Errorf("scores at the backend: %q", scores)
+				if strings.Join(scores, ",") != "0,60,60,80" ||
+					strings.Join(categories, ",") != "browser/false,automation/false,automation/false,browser/false" {
+					t.Errorf("at the backend: %q %q", scores, categories)
 				}
 				return
 			}

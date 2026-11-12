@@ -19,7 +19,9 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   5 login attempts per minute ([details](docs/rate-limiting.md))
 - **Bot protection**: score how likely each request comes from a bot and
   make HTTP libraries, crawlers and scrapers solve a proof-of-work
-  challenge that browsers pass automatically ([details](docs/bot-protection.md))
+  challenge that browsers pass automatically, or a CAPTCHA (Turnstile,
+  hCaptcha, reCAPTCHA); allow or block categories such as AI crawlers,
+  and let DNS-verified search engines through ([details](docs/bot-protection.md))
 - **Detection mode and audit log**: log instead of block while tuning;
   JSON Lines events with the matched rule and payload
   ([details](docs/audit-log.md))

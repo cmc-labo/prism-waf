@@ -73,7 +73,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `match.base64` | `true` if the match was in Base64-decoded data. |
 | `crs` | CRS details: `anomaly_score`, `deciding_rule` (usually 949110, "anomaly score exceeded") and `rules`, every matched rule with its `id`, `message`, `severity`, `variable` and matched `value`. |
 | `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
-| `bot` | Why the client looks like a [bot](bot-protection.md#responses-and-audit-events): `score`, `signals` and `client`. Logged for the first challenged or blocked request of a client, then at most once a minute. |
+| `bot` | Why the client looks like a [bot](bot-protection.md#responses-and-audit-events): `score`, `signals`, `category`, `name` and `verified` of a known bot, `challenge` (`pow` or `captcha`) and `client`. Logged for the first challenged or blocked request of a client, then at most once a minute. |
 | `request.headers` | Request headers. `Authorization`, `Cookie` and other credential headers are `[REDACTED]`, unless the attack was found in that header. |
 
 The response to the client only contains the event ID; rule details are not

@@ -106,3 +106,42 @@ func TestParseBrowser(t *testing.T) {
 		}
 	}
 }
+
+func TestCategories(t *testing.T) {
+	for ua, want := range map[string][2]string{
+		chromeUA: {CategoryBrowser, ""},
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 YaBrowser/24.10.0.0 Safari/537.36": {CategoryBrowser, ""},
+		"Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36 [Pinterest/Android]":    {CategoryBrowser, ""},
+		"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)":                                                            {CategorySearchEngine, "Googlebot"},
+		"Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)":                                                             {CategorySearchEngine, "Bingbot"},
+		"Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)":                                                                    {CategorySearchEngine, "YandexBot"},
+		"Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)":                              {CategoryAICrawler, "GPTBot"},
+		"Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)":                                                                   {CategoryAICrawler, "ClaudeBot"},
+		"CCBot/2.0 (https://commoncrawl.org/faq/)":                                                                                            {CategoryAICrawler, "CCBot"},
+		"Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)":                                                                  {CategorySEO, "AhrefsBot"},
+		"facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)":                                                           {CategorySocial, "facebookexternalhit"},
+		"Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)":                                                                          {CategorySocial, "Slackbot"},
+		"Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)":                                                              {CategoryMonitoring, "UptimeRobot"},
+		"Mozilla/5.0 (compatible; ExampleBot/1.0)":                                                                                            {CategoryCrawler, ""},
+		"curl/8.5.0":                             {CategoryAutomation, ""},
+		"sqlmap/1.8#stable (https://sqlmap.org)": {CategoryScanner, ""},
+		"MyApp/2.1":                              {CategoryUnknown, ""},
+		"":                                       {CategoryUnknown, ""},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("User-Agent", ua)
+		a := Score(r, false)
+		if a.Category != want[0] || a.BotName != want[1] {
+			t.Errorf("%q: %s %q, want %s %q", ua, a.Category, a.BotName, want[0], want[1])
+		}
+	}
+}
+
+func TestParseCategories(t *testing.T) {
+	if got, err := ParseCategories(" AI_Crawler, seo,"); err != nil || !slices.Equal(got, []string{"ai_crawler", "seo"}) {
+		t.Errorf("ParseCategories = %q, %v", got, err)
+	}
+	if _, err := ParseCategories("ai"); err == nil {
+		t.Error("unknown category accepted")
+	}
+}

@@ -339,3 +339,73 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckVerifiedBots(t *testing.T) {
+	r := &fakeResolver{
+		ptr:     map[string][]string{"66.249.66.1": {"crawl-66-249-66-1.googlebot.com."}},
+		forward: map[string][]string{"crawl-66-249-66-1.googlebot.com.": {"66.249.66.1"}},
+	}
+	const googlebotUA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+	check := func(g *Guard, ua, ip string) Decision {
+		req := request("GET", "/", "")
+		req.Header.Set("User-Agent", ua)
+		return g.Check(req, ip, false)
+	}
+
+	g, _ := newTestGuard(t, Config{VerifyBots: true, Resolver: r})
+	if d := check(g, googlebotUA, "66.249.66.1"); d.Action != Allow || !d.Verified || d.Category != CategorySearchEngine ||
+		d.BotName != "Googlebot" || d.Score != 50 {
+		t.Errorf("Googlebot: %+v", d)
+	}
+	// An impostor scores higher and is challenged.
+	d := check(g, googlebotUA, "203.0.113.7")
+	if d.Action != Challenge || d.Verified || d.Score != 90 || strings.Join(d.Signals, ",") != "crawler,fake_bot" {
+		t.Errorf("fake Googlebot: %+v", d)
+	}
+	// Bots that cannot be verified are scored as before.
+	if d := check(g, "Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)", "203.0.113.7"); d.Action != Challenge ||
+		d.Score != 50 || d.Category != CategoryAICrawler {
+		t.Errorf("GPTBot: %+v", d)
+	}
+
+	// Without verification, Googlebot is just a crawler.
+	g, _ = newTestGuard(t, Config{})
+	if d := check(g, googlebotUA, "66.249.66.1"); d.Action != Challenge || d.Verified {
+		t.Errorf("unverified Googlebot: %+v", d)
+	}
+}
+
+func TestCheckCategories(t *testing.T) {
+	r := &fakeResolver{
+		ptr:     map[string][]string{"66.249.66.1": {"crawl-66-249-66-1.googlebot.com."}},
+		forward: map[string][]string{"crawl-66-249-66-1.googlebot.com.": {"66.249.66.1"}},
+	}
+	g, _ := newTestGuard(t, Config{
+		VerifyBots:      true,
+		Resolver:        r,
+		AllowCategories: []string{CategorySocial},
+		BlockCategories: []string{CategoryAICrawler, CategorySearchEngine, CategoryScanner},
+	})
+	for _, tc := range []struct {
+		ua, ip string
+		want   Action
+	}{
+		{"Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)", "203.0.113.7", Allow},
+		{"Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)", "203.0.113.7", Block},
+		{"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "66.249.66.1", Block}, // blocked although verified
+		{"sqlmap/1.8#stable (https://sqlmap.org)", "203.0.113.7", Block},
+		{"curl/8.5.0", "203.0.113.7", Challenge},
+	} {
+		req := request("GET", "/", "")
+		req.Header.Set("User-Agent", tc.ua)
+		if d := g.Check(req, tc.ip, false); d.Action != tc.want {
+			t.Errorf("%s: %v, want %v", tc.ua, d.Action, tc.want)
+		}
+	}
+	// Exempt paths win.
+	req := request("GET", "/robots.txt", "")
+	req.Header.Set("User-Agent", "GPTBot/1.2")
+	if d := g.Check(req, "203.0.113.7", false); d.Action != Allow {
+		t.Errorf("robots.txt: %v", d.Action)
+	}
+}

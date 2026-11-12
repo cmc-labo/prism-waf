@@ -44,6 +44,10 @@ const (
 	// SignalHTTP10: the User-Agent claims a browser, but the request uses
 	// HTTP/1.0, which browsers no longer do.
 	SignalHTTP10 = "http10"
+	// SignalFakeBot: the User-Agent names a bot whose identity can be
+	// checked with DNS, e.g. Googlebot, but the client address does not
+	// belong to it.
+	SignalFakeBot = "fake_bot"
 )
 
 var signalPoints = map[string]int{
@@ -58,18 +62,22 @@ var signalPoints = map[string]int{
 	SignalMissingFetchMetadata:  20,
 	SignalMissingClientHints:    20,
 	SignalHTTP10:                30,
+	SignalFakeBot:               40,
 }
 
 // automationTools are lower-case User-Agent substrings of HTTP libraries,
-// command-line tools, browser automation and scanners.
+// command-line tools and browser automation.
 var automationTools = []string{
 	"curl/", "wget/", "httpie/", "python-requests", "python-urllib", "python-httpx",
 	"aiohttp", "scrapy", "go-http-client", "colly", "java/", "okhttp", "apache-httpclient",
 	"jakarta commons-httpclient", "libwww-perl", "lwp::", "mechanize", "node-fetch",
 	"axios/", "undici", "got (", "guzzlehttp", "ruby", "php/", "postmanruntime",
 	"insomnia", "headlesschrome", "phantomjs", "selenium", "puppeteer", "playwright",
-	"zgrab", "masscan", "nmap", "sqlmap", "nikto", "nuclei", "wpscan",
 }
+
+// scanners are lower-case User-Agent substrings of vulnerability and port
+// scanners.
+var scanners = []string{"zgrab", "masscan", "nmap", "sqlmap", "nikto", "nuclei", "wpscan", "acunetix", "openvas"}
 
 // crawlerWords mark self-declared crawlers, e.g. "Baiduspider" or
 // "facebookexternalhit". Names ending in "bot" are recognized by isCrawler.
@@ -81,6 +89,16 @@ type Assessment struct {
 	Score int
 	// Signals are the reasons for the score, in a fixed order.
 	Signals []string
+	// Category is the kind of client that the User-Agent claims to be,
+	// one of Categories.
+	Category string
+	// BotName is the name of a known bot, e.g. "Googlebot", or empty.
+	BotName string
+	// Verified reports whether the client was confirmed to be the known
+	// bot with DNS. Score never sets it; Guard.Check does.
+	Verified bool
+
+	bot *knownBot
 }
 
 func (a *Assessment) add(signal string) {
@@ -95,22 +113,36 @@ func Score(r *http.Request, secure bool) Assessment {
 	var a Assessment
 	ua := r.Header.Get("User-Agent")
 	lower := strings.ToLower(ua)
+	if a.bot = findBot(lower); a.bot != nil {
+		a.BotName, a.Category = a.bot.Name, a.bot.Category
+		a.add(SignalCrawler)
+		return a
+	}
 	switch {
 	case strings.TrimSpace(ua) == "":
+		a.Category = CategoryUnknown
 		a.add(SignalNoUserAgent)
 		return a
+	case containsAny(lower, scanners):
+		a.Category = CategoryScanner
+		a.add(SignalAutomationTool)
+		return a
 	case containsAny(lower, automationTools):
+		a.Category = CategoryAutomation
 		a.add(SignalAutomationTool)
 		return a
 	case isCrawler(lower):
+		a.Category = CategoryCrawler
 		a.add(SignalCrawler)
 		return a
 	}
 	b := parseBrowser(ua)
 	if b.name == "" {
+		a.Category = CategoryUnknown
 		a.add(SignalUnknownClient)
 		return a
 	}
+	a.Category = CategoryBrowser
 
 	// The User-Agent claims a browser: check that the request looks like
 	// one. Each check only applies to versions that are known to behave

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/bits"
 	"net/http"
 	"net/netip"
@@ -37,8 +38,16 @@ const VerifyPath = "/.prismwaf/challenge"
 // CookieName is the name of the clearance cookie.
 const CookieName = "prismwaf_clearance"
 
-// ScoreHeader passes the bot score of each request to the backend.
-const ScoreHeader = "X-Prismwaf-Bot-Score"
+// Headers that pass the assessment of each request to the backend. Values
+// sent by the client are replaced.
+const (
+	// ScoreHeader is the bot score, e.g. "60".
+	ScoreHeader = "X-Prismwaf-Bot-Score"
+	// CategoryHeader is the category, e.g. "search_engine".
+	CategoryHeader = "X-Prismwaf-Bot-Category"
+	// VerifiedHeader is "true" for a bot verified with DNS, else "false".
+	VerifiedHeader = "X-Prismwaf-Bot-Verified"
+)
 
 // DefaultExemptPaths are never challenged: crawlers must be able to read
 // robots.txt, and /.well-known/ holds files for machines, such as
@@ -83,6 +92,30 @@ type Config struct {
 	ExemptPaths []string
 	// Exempt clients are never challenged or blocked.
 	Exempt []netip.Prefix
+
+	// VerifyBots checks with DNS that clients whose User-Agent names a
+	// verifiable bot, such as Googlebot, really are that bot. Verified
+	// bots are let through; impersonators get SignalFakeBot.
+	VerifyBots bool
+	// Resolver does the lookups of VerifyBots. Nil uses the system's.
+	Resolver Resolver
+	// AllowCategories are let through without a challenge, e.g.
+	// CategorySocial for link previews. User-Agents can be faked, so a
+	// category lets anyone through who claims to belong to it.
+	AllowCategories []string
+	// BlockCategories are rejected, e.g. CategoryAICrawler. They are
+	// blocked even if verified.
+	BlockCategories []string
+
+	// Captcha, if set, is shown instead of the proof-of-work challenge to
+	// clients whose score reaches CaptchaScore.
+	Captcha *CaptchaConfig
+	// CaptchaScore is the bot score from which the CAPTCHA is shown. Zero
+	// means ChallengeScore: every challenge is a CAPTCHA.
+	CaptchaScore int
+	// Logger is the operational log, for problems with the CAPTCHA
+	// provider. Nil uses slog.Default().
+	Logger *slog.Logger
 }
 
 // Guard decides which requests must solve a challenge and serves the
@@ -96,6 +129,12 @@ type Guard struct {
 	paths          []pathPattern
 	exemptPaths    []pathPattern
 	exempt         []netip.Prefix
+	verifier       *verifier // nil unless bots are verified
+	allowCategory  map[string]bool
+	blockCategory  map[string]bool
+	captcha        *captcha // nil without a CAPTCHA
+	captchaScore   int
+	logger         *slog.Logger
 	now            func() time.Time // for tests
 
 	mu     sync.Mutex
@@ -123,6 +162,12 @@ func New(cfg Config) (*Guard, error) {
 		exempt:         cfg.Exempt,
 		now:            time.Now,
 		events:         map[eventKey]event{},
+		allowCategory:  map[string]bool{},
+		blockCategory:  map[string]bool{},
+		logger:         cfg.Logger,
+	}
+	if g.logger == nil {
+		g.logger = slog.Default()
 	}
 	if g.challengeScore == 0 {
 		g.challengeScore = DefaultChallengeScore
@@ -149,6 +194,40 @@ func New(cfg Config) (*Guard, error) {
 	} else if len(g.secret) < MinSecretLength {
 		return nil, fmt.Errorf("bot: the secret must be at least %d bytes", MinSecretLength)
 	}
+	for _, c := range cfg.AllowCategories {
+		if !isCategory(c) {
+			return nil, fmt.Errorf("bot: unknown category %q", c)
+		}
+		g.allowCategory[c] = true
+	}
+	for _, c := range cfg.BlockCategories {
+		if !isCategory(c) {
+			return nil, fmt.Errorf("bot: unknown category %q", c)
+		}
+		if g.allowCategory[c] {
+			return nil, fmt.Errorf("bot: category %q is both allowed and blocked", c)
+		}
+		g.blockCategory[c] = true
+	}
+	if cfg.VerifyBots {
+		g.verifier = newVerifier(cfg.Resolver, func() time.Time { return g.now() })
+	}
+	if cfg.Captcha != nil {
+		c, err := newCaptcha(cfg.Captcha)
+		if err != nil {
+			return nil, err
+		}
+		g.captcha = c
+		g.captchaScore = cfg.CaptchaScore
+		if g.captchaScore == 0 {
+			g.captchaScore = g.challengeScore
+		}
+		if g.captchaScore < g.challengeScore || g.captchaScore > 100 {
+			return nil, errors.New("bot: the CAPTCHA score must be between the challenge score and 100")
+		}
+	} else if cfg.CaptchaScore != 0 {
+		return nil, errors.New("bot: a CAPTCHA score requires a CAPTCHA")
+	}
 	var err error
 	if g.paths, err = parsePaths(cfg.Paths); err != nil {
 		return nil, err
@@ -167,6 +246,10 @@ func (g *Guard) BlockScore() int { return g.blockScore }
 
 // Difficulty returns the difficulty of challenges.
 func (g *Guard) Difficulty() int { return g.difficulty }
+
+// CaptchaScore returns the score from which a CAPTCHA is shown, or 0
+// without a CAPTCHA.
+func (g *Guard) CaptchaScore() int { return g.captchaScore }
 
 // pathPattern is a path, or with a trailing "*" a path prefix, matched
 // like the paths of rate limit rules.
@@ -230,6 +313,9 @@ type Decision struct {
 	Assessment
 	// Cleared reports whether the client has a valid clearance cookie.
 	Cleared bool
+	// Captcha reports whether a challenge is a CAPTCHA rather than a
+	// proof of work.
+	Captcha bool
 	// Client is the address, or the /64 network of an IPv6 address, that
 	// clearance is bound to.
 	Client netip.Prefix
@@ -244,18 +330,34 @@ type Decision struct {
 // of the client; secure reports whether the client connected with HTTPS.
 func (g *Guard) Check(r *http.Request, clientIP string, secure bool) Decision {
 	d := Decision{Assessment: Score(r, secure), Client: clientKey(clientIP)}
+	if g.verifier != nil && d.bot != nil && d.bot.Verifiable() {
+		if g.verifier.verify(r.Context(), clientIP, d.bot) {
+			d.Verified = true
+		} else {
+			d.add(SignalFakeBot)
+		}
+	}
 	if !g.protects(r, d.Client) {
 		return d
 	}
-	if g.blockScore > 0 && d.Score >= g.blockScore {
+	switch {
+	case g.blockCategory[d.Category]:
 		d.Action = Block
-	} else if d.Score >= g.challengeScore {
-		if g.validClearance(r, d.Client) {
+	case d.Verified || g.allowCategory[d.Category]:
+		return d
+	case g.blockScore > 0 && d.Score >= g.blockScore:
+		d.Action = Block
+	case d.Score >= g.challengeScore:
+		need := levelPoW
+		if g.captcha != nil && d.Score >= g.captchaScore {
+			need = levelCaptcha
+		}
+		if g.validClearance(r, d.Client, need) {
 			d.Cleared = true
 			return d
 		}
-		d.Action = Challenge
-	} else {
+		d.Action, d.Captcha = Challenge, need == levelCaptcha
+	default:
 		return d
 	}
 	d.EventID, d.First = g.event(d.Client, d.Action)
@@ -328,23 +430,30 @@ func (g *Guard) mac(kind string, client netip.Prefix, ua string, fields ...strin
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
-// validClearance reports whether r carries a clearance cookie that is
-// valid for its client.
-func (g *Guard) validClearance(r *http.Request, client netip.Prefix) bool {
+// Levels of clearance: a solved CAPTCHA also clears clients that only
+// need a proof of work, but not the other way round.
+const (
+	levelPoW     = "1"
+	levelCaptcha = "2"
+)
+
+// validClearance reports whether r carries a clearance cookie of at least
+// the level that is valid for its client.
+func (g *Guard) validClearance(r *http.Request, client netip.Prefix, level string) bool {
 	c, err := r.Cookie(CookieName)
 	if err != nil {
 		return false
 	}
-	exp, mac, ok := strings.Cut(c.Value, ".")
-	if !ok {
+	f := strings.Split(c.Value, ".")
+	if len(f) != 3 || f[1] < level || (f[1] != levelPoW && f[1] != levelCaptcha) {
 		return false
 	}
-	t, err := strconv.ParseInt(exp, 10, 64)
+	t, err := strconv.ParseInt(f[0], 10, 64)
 	if err != nil || g.now().Unix() >= t {
 		return false
 	}
-	want := g.mac("clearance", client, r.UserAgent(), exp)
-	return hmac.Equal([]byte(mac), []byte(want))
+	want := g.mac("clearance", client, r.UserAgent(), f[0], f[1])
+	return hmac.Equal([]byte(f[2]), []byte(want))
 }
 
 // newChallenge returns a challenge for a client: a random seed that has to
@@ -405,12 +514,12 @@ func leadingZeroBits(h [32]byte) int {
 	return n
 }
 
-// clearanceCookie returns a clearance cookie for a client.
-func (g *Guard) clearanceCookie(client netip.Prefix, ua string, secure bool) *http.Cookie {
+// clearanceCookie returns a clearance cookie of a level for a client.
+func (g *Guard) clearanceCookie(client netip.Prefix, ua, level string, secure bool) *http.Cookie {
 	exp := strconv.FormatInt(g.now().Add(g.ttl).Unix(), 10)
 	return &http.Cookie{
 		Name:     CookieName,
-		Value:    exp + "." + g.mac("clearance", client, ua, exp),
+		Value:    exp + "." + level + "." + g.mac("clearance", client, ua, exp, level),
 		Path:     "/",
 		MaxAge:   int(g.ttl / time.Second),
 		HttpOnly: true,

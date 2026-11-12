@@ -59,6 +59,14 @@ func main() {
 	flag.Var(&cfg.botPaths, "bot-path", `protect only this path, e.g. "/search" or "/articles/*"; repeatable (default: all paths)`)
 	flag.Var(&cfg.botExemptPaths, "bot-exempt-path", `never protect this path, e.g. "/api/*"; repeatable (/robots.txt, /favicon.ico and /.well-known/* are always exempt)`)
 	flag.StringVar(&cfg.botExempt, "bot-exempt", "", "comma-separated IPs or CIDRs of clients that are never challenged")
+	flag.BoolVar(&cfg.botVerify, "bot-verify", true, "verify bots that name themselves, such as Googlebot and Bingbot, with reverse and forward DNS; let verified bots through and score impersonators higher")
+	flag.StringVar(&cfg.botAllowCategories, "bot-allow-category", "", "comma-separated bot categories to let through without a challenge, e.g. \"social,monitoring\" (the User-Agent is not verified)")
+	flag.StringVar(&cfg.botBlockCategories, "bot-block-category", "", "comma-separated bot categories to reject with 403, e.g. \"ai_crawler,seo\"")
+	flag.StringVar(&cfg.botCaptcha, "bot-captcha", "", "CAPTCHA to show instead of the proof-of-work challenge: "+strings.Join(bot.CaptchaProviders, ", "))
+	flag.StringVar(&cfg.botCaptchaSiteKey, "bot-captcha-site-key", "", "site key of the -bot-captcha provider")
+	flag.StringVar(&cfg.botCaptchaSecretFile, "bot-captcha-secret-file", "", "file with the secret key of the -bot-captcha provider")
+	flag.IntVar(&cfg.botCaptchaScore, "bot-captcha-score", 0, "bot score from which the CAPTCHA is shown instead of the proof-of-work challenge (default: -bot-challenge-score, i.e. always)")
+	flag.Float64Var(&cfg.botCaptchaMinScore, "bot-captcha-min-score", bot.DefaultCaptchaMinScore, "reCAPTCHA v3 score (0.0-1.0) from which a client passes")
 	flag.Var(&cfg.tlsCerts, "tls-cert", "PEM certificate chain file; enables HTTPS on -listen. Repeat with -tls-key for several domains (SNI); the first is the default")
 	flag.Var(&cfg.tlsKeys, "tls-key", "PEM private key file for the -tls-cert at the same position")
 	flag.StringVar(&cfg.acmeDomains, "acme-domains", "", "comma-separated domains to obtain certificates for from an ACME CA (Let's Encrypt); enables HTTPS on -listen")
@@ -87,52 +95,60 @@ func main() {
 }
 
 type config struct {
-	listen              string
-	backends            stringList
-	lbPolicy            string
-	failTimeout         time.Duration
-	healthPath          string
-	healthInterval      time.Duration
-	healthTimeout       time.Duration
-	maxBody             int64
-	engine              string
-	crsParanoia         int
-	crsThreshold        int
-	crsMaxArgs          int
-	crsBefore           stringList
-	crsAfter            stringList
-	mode                string
-	auditLog            string
-	trustedProxies      string
-	rateLimit           string
-	rateLimitPaths      stringList
-	rateLimitExempt     string
-	rateLimitMaxClients int
-	botProtection       bool
-	botChallengeScore   int
-	botBlockScore       int
-	botDifficulty       int
-	botClearanceTTL     time.Duration
-	botSecretFile       string
-	botPaths            stringList
-	botExemptPaths      stringList
-	botExempt           string
-	tlsCerts            stringList
-	tlsKeys             stringList
-	acmeDomains         string
-	acmeCache           string
-	acmeEmail           string
-	acmeDirectory       string
-	acmeNotifyWebhook   string
-	acmeNotifyFormat    string
-	acmeNotifyCommand   string
-	acmeNotifyTest      bool
-	httpRedirect        string
-	hsts                tlsutil.HSTSPolicy
-	clientCA            string
-	clientAuth          string
-	backendCA           string
-	backendInsecure     bool
+	listen               string
+	backends             stringList
+	lbPolicy             string
+	failTimeout          time.Duration
+	healthPath           string
+	healthInterval       time.Duration
+	healthTimeout        time.Duration
+	maxBody              int64
+	engine               string
+	crsParanoia          int
+	crsThreshold         int
+	crsMaxArgs           int
+	crsBefore            stringList
+	crsAfter             stringList
+	mode                 string
+	auditLog             string
+	trustedProxies       string
+	rateLimit            string
+	rateLimitPaths       stringList
+	rateLimitExempt      string
+	rateLimitMaxClients  int
+	botProtection        bool
+	botChallengeScore    int
+	botBlockScore        int
+	botDifficulty        int
+	botClearanceTTL      time.Duration
+	botSecretFile        string
+	botPaths             stringList
+	botExemptPaths       stringList
+	botExempt            string
+	botVerify            bool
+	botAllowCategories   string
+	botBlockCategories   string
+	botCaptcha           string
+	botCaptchaSiteKey    string
+	botCaptchaSecretFile string
+	botCaptchaScore      int
+	botCaptchaMinScore   float64
+	tlsCerts             stringList
+	tlsKeys              stringList
+	acmeDomains          string
+	acmeCache            string
+	acmeEmail            string
+	acmeDirectory        string
+	acmeNotifyWebhook    string
+	acmeNotifyFormat     string
+	acmeNotifyCommand    string
+	acmeNotifyTest       bool
+	httpRedirect         string
+	hsts                 tlsutil.HSTSPolicy
+	clientCA             string
+	clientAuth           string
+	backendCA            string
+	backendInsecure      bool
 }
 
 // stringList is a flag that can be repeated.
@@ -207,15 +223,48 @@ func (c config) botConfig() (bot.Config, error) {
 	if err != nil {
 		return bot.Config{}, fmt.Errorf("invalid -bot-exempt: %w", err)
 	}
-	return bot.Config{
-		ChallengeScore: c.botChallengeScore,
-		BlockScore:     c.botBlockScore,
-		Difficulty:     c.botDifficulty,
-		ClearanceTTL:   c.botClearanceTTL,
-		Paths:          c.botPaths,
-		ExemptPaths:    c.botExemptPaths,
-		Exempt:         exempt,
-	}, nil
+	allow, err := bot.ParseCategories(c.botAllowCategories)
+	if err != nil {
+		return bot.Config{}, fmt.Errorf("invalid -bot-allow-category: %w", err)
+	}
+	block, err := bot.ParseCategories(c.botBlockCategories)
+	if err != nil {
+		return bot.Config{}, fmt.Errorf("invalid -bot-block-category: %w", err)
+	}
+	bc := bot.Config{
+		ChallengeScore:  c.botChallengeScore,
+		BlockScore:      c.botBlockScore,
+		Difficulty:      c.botDifficulty,
+		ClearanceTTL:    c.botClearanceTTL,
+		Paths:           c.botPaths,
+		ExemptPaths:     c.botExemptPaths,
+		Exempt:          exempt,
+		VerifyBots:      c.botVerify,
+		AllowCategories: allow,
+		BlockCategories: block,
+		CaptchaScore:    c.botCaptchaScore,
+	}
+	if c.botCaptcha != "" {
+		bc.Captcha = &bot.CaptchaConfig{
+			Provider: c.botCaptcha,
+			SiteKey:  c.botCaptchaSiteKey,
+			MinScore: c.botCaptchaMinScore,
+		}
+	}
+	return bc, nil
+}
+
+// readCaptchaSecret reads -bot-captcha-secret-file.
+func readCaptchaSecret(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("invalid -bot-captcha-secret-file: %w", err)
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return "", errors.New("invalid -bot-captcha-secret-file: the file is empty")
+	}
+	return s, nil
 }
 
 // readBotSecret reads -bot-secret-file. Surrounding whitespace, such as
@@ -293,13 +342,23 @@ func (c config) validate() error {
 	if c.rateLimitMaxClients < 0 {
 		return errors.New("-rate-limit-max-clients must not be negative")
 	}
-	if !c.botProtection && (c.botSecretFile != "" || len(c.botPaths) > 0 || len(c.botExemptPaths) > 0 || c.botExempt != "") {
+	if !c.botProtection && (c.botSecretFile != "" || len(c.botPaths) > 0 || len(c.botExemptPaths) > 0 || c.botExempt != "" ||
+		c.botAllowCategories != "" || c.botBlockCategories != "" || c.botCaptcha != "") {
 		return errors.New("-bot-* options require -bot-protection")
+	}
+	if c.botCaptcha == "" && (c.botCaptchaSiteKey != "" || c.botCaptchaSecretFile != "" || c.botCaptchaScore != 0) {
+		return errors.New("-bot-captcha-* options require -bot-captcha")
+	}
+	if c.botCaptcha != "" && (c.botCaptchaSiteKey == "" || c.botCaptchaSecretFile == "") {
+		return errors.New("-bot-captcha requires -bot-captcha-site-key and -bot-captcha-secret-file")
 	}
 	if c.botProtection {
 		bc, err := c.botConfig()
 		if err != nil {
 			return err
+		}
+		if bc.Captcha != nil {
+			bc.Captcha.Secret = "checked at startup" // read by run
 		}
 		if _, err := bot.New(bc); err != nil {
 			return fmt.Errorf("invalid -bot-* option: %w", err)
@@ -453,6 +512,12 @@ func run(cfg config, logger *slog.Logger) error {
 				return err
 			}
 		}
+		if bc.Captcha != nil {
+			if bc.Captcha.Secret, err = readCaptchaSecret(cfg.botCaptchaSecretFile); err != nil {
+				return err
+			}
+		}
+		bc.Logger = logger
 		if guard, err = bot.New(bc); err != nil {
 			return err
 		}
@@ -590,7 +655,11 @@ func run(cfg config, logger *slog.Logger) error {
 			blockScore = fmt.Sprint(guard.BlockScore())
 		}
 		logger.Info("bot protection enabled", "challenge_score", guard.ChallengeScore(), "block_score", blockScore,
-			"difficulty", guard.Difficulty(), "clearance_ttl", cfg.botClearanceTTL, "paths", cfg.botPaths, "exempt_paths", cfg.botExemptPaths, "exempt", cfg.botExempt)
+			"difficulty", guard.Difficulty(), "clearance_ttl", cfg.botClearanceTTL, "paths", cfg.botPaths, "exempt_paths", cfg.botExemptPaths, "exempt", cfg.botExempt,
+			"verify_bots", cfg.botVerify, "allow_categories", cfg.botAllowCategories, "block_categories", cfg.botBlockCategories)
+		if cfg.botCaptcha != "" {
+			logger.Info("bot CAPTCHA enabled", "provider", cfg.botCaptcha, "score", guard.CaptchaScore())
+		}
 		if cfg.botSecretFile == "" {
 			logger.Info("bot clearance cookies are signed with a random key: they become invalid when PrismWAF restarts, and other instances do not accept them; set -bot-secret-file to keep them")
 		}

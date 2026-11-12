@@ -136,9 +136,11 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 					return
 				}
 			}
-			// The backend can use the score, e.g. to hide content from
-			// likely bots. A client must not set it itself.
+			// The backend can use the assessment, e.g. to hide content
+			// from likely bots. A client must not set it itself.
 			r.Header.Set(bot.ScoreHeader, strconv.Itoa(d.Score))
+			r.Header.Set(bot.CategoryHeader, d.Category)
+			r.Header.Set(bot.VerifiedHeader, strconv.FormatBool(d.Verified))
 		}
 
 		m, err := cfg.Inspector.Inspect(r)
@@ -259,7 +261,20 @@ func logBotEvent(cfg Config, logger *slog.Logger, r *http.Request, d bot.Decisio
 	if cfg.Mode != ModeDetect {
 		e.Action = d.Action.String()
 	}
-	e.Bot = &audit.Bot{Score: d.Score, Signals: d.Signals, Client: d.Client.String()}
+	e.Bot = &audit.Bot{
+		Score:    d.Score,
+		Signals:  d.Signals,
+		Category: d.Category,
+		Name:     d.BotName,
+		Verified: d.Verified,
+		Client:   d.Client.String(),
+	}
+	if d.Action == bot.Challenge {
+		e.Bot.Challenge = "pow"
+		if d.Captcha {
+			e.Bot.Challenge = "captcha"
+		}
+	}
 	writeEvent(cfg, logger, e)
 }
 

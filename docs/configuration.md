@@ -81,9 +81,18 @@ A client is an IP address, or a `/64` network for IPv6. See
 | `-bot-path` | (all paths) | Protect only this path, e.g. `/search` or `/articles/*`; repeatable |
 | `-bot-exempt-path` | (none) | Never protect this path, e.g. `/api/*`; repeatable |
 | `-bot-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never challenged |
+| `-bot-verify` | `true` | Verify Googlebot, Bingbot and other bots that document it with reverse and forward DNS; let verified bots through |
+| `-bot-allow-category` | (none) | Comma-separated bot categories to let through, e.g. `social,monitoring` (not verified) |
+| `-bot-block-category` | (none) | Comma-separated bot categories to reject with `403`, e.g. `ai_crawler,seo` |
+| `-bot-captcha` | (none) | CAPTCHA instead of the proof of work: `turnstile`, `hcaptcha`, `recaptcha` or `recaptcha-v3` |
+| `-bot-captcha-site-key` | (none) | Site key of the CAPTCHA |
+| `-bot-captcha-secret-file` | (none) | File with the secret key of the CAPTCHA |
+| `-bot-captcha-score` | `-bot-challenge-score` | Bot score from which the CAPTCHA is shown instead of the proof of work |
+| `-bot-captcha-min-score` | `0.5` | reCAPTCHA v3 score from which a client passes |
 
 `/robots.txt`, `/favicon.ico` and `/.well-known/*` are always exempt. See
-[Bot protection](bot-protection.md), including its effect on
+[Bot protection](bot-protection.md), including the
+[categories](bot-protection.md#categories) and its effect on
 [search engines](bot-protection.md#search-engines-and-link-previews).
 
 ## HTTPS
