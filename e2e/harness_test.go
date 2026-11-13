@@ -10,7 +10,6 @@
 package e2e
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -87,7 +86,9 @@ var browserHeaders = map[string]string{
 
 // backendHit is what the backend saw of a request.
 type backendHit struct {
+	Method   string `json:"method"`
 	URI      string `json:"uri"`
+	Body     string `json:"body"`
 	Score    string `json:"score"`
 	Category string `json:"category"`
 	Verified string `json:"verified"`
@@ -98,9 +99,12 @@ type backendHit struct {
 func startBackend(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(backendHit{
+			Method:   r.Method,
 			URI:      r.URL.RequestURI(),
+			Body:     string(body),
 			Score:    r.Header.Get("X-Prismwaf-Bot-Score"),
 			Category: r.Header.Get("X-Prismwaf-Bot-Category"),
 			Verified: r.Header.Get("X-Prismwaf-Bot-Verified"),
@@ -144,9 +148,15 @@ type wafOptions struct {
 	backend string
 }
 
-// startWAF starts prismwaf with -bot-protection and the options, and waits
-// until it accepts connections. The process is stopped at the end of the
-// test.
+// startBotWAF starts prismwaf with -bot-protection and the options.
+func startBotWAF(t *testing.T, o wafOptions) *waf {
+	t.Helper()
+	o.args = append([]string{"-bot-protection"}, o.args...)
+	return startWAF(t, o)
+}
+
+// startWAF starts prismwaf with the options, and waits until it accepts
+// connections. The process is stopped at the end of the test.
 func startWAF(t *testing.T, o wafOptions) *waf {
 	t.Helper()
 	if o.backend == "" {
@@ -155,7 +165,7 @@ func startWAF(t *testing.T, o wafOptions) *waf {
 	dir := t.TempDir()
 	addr := freeAddr(t)
 	w := &waf{URL: "http://" + addr, auditLog: filepath.Join(dir, "audit.jsonl"), stderr: &syncBuffer{}}
-	args := []string{"-listen", addr, "-backend", o.backend, "-audit-log", w.auditLog, "-bot-protection"}
+	args := []string{"-listen", addr, "-backend", o.backend, "-audit-log", w.auditLog}
 	if o.tls {
 		cert, key := selfSigned(t, dir, "localhost", "127.0.0.1")
 		args = append(args, "-tls-cert", cert, "-tls-key", key)
@@ -223,7 +233,25 @@ type auditEvent struct {
 	Reason   string `json:"reason"`
 	Action   string `json:"action"`
 	ClientIP string `json:"client_ip"`
-	Bot      *struct {
+	Rule     *struct {
+		ID       string `json:"id"`
+		Category string `json:"category"`
+	} `json:"rule"`
+	Match *struct {
+		Location string `json:"location"`
+		Field    string `json:"field"`
+		Value    string `json:"value"`
+	} `json:"match"`
+	CRS *struct {
+		AnomalyScore int       `json:"anomaly_score"`
+		DecidingRule int       `json:"deciding_rule"`
+		Rules        []crsRule `json:"rules"`
+	} `json:"crs"`
+	Request struct {
+		Method string `json:"method"`
+		URI    string `json:"uri"`
+	} `json:"request"`
+	Bot *struct {
 		Score     int      `json:"score"`
 		Signals   []string `json:"signals"`
 		Category  string   `json:"category"`
@@ -234,22 +262,32 @@ type auditEvent struct {
 	} `json:"bot"`
 }
 
+// crsRule is a CRS rule that matched, in an audit event.
+type crsRule struct {
+	ID       int    `json:"id"`
+	Severity string `json:"severity"`
+	Variable string `json:"variable"`
+}
+
 // events returns the audit events written so far.
 func (w *waf) events(t *testing.T) []auditEvent {
 	t.Helper()
-	f, err := os.Open(w.auditLog)
+	data, err := os.ReadFile(w.auditLog)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	// The last line may still be being written.
+	data = data[:bytes.LastIndexByte(data, '\n')+1]
 	var events []auditEvent
-	s := bufio.NewScanner(f)
-	for s.Scan() {
+	for _, line := range bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
 		var e auditEvent
-		if err := json.Unmarshal(s.Bytes(), &e); err != nil {
-			t.Fatalf("audit log: %v: %s", err, s.Bytes())
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Fatalf("audit log: %v: %s", err, line)
 		}
 		events = append(events, e)
 	}
@@ -327,22 +365,32 @@ type response struct {
 
 func (c *client) do(method, path string, body url.Values, extra ...string) response {
 	c.t.Helper()
+	if body == nil {
+		return c.send(method, path, "", "", extra...)
+	}
+	return c.send(method, path, "application/x-www-form-urlencoded", body.Encode(), extra...)
+}
+
+// send sends a request with a body of a content type; an empty content
+// type sends no body.
+func (c *client) send(method, path, contentType, body string, extra ...string) response {
+	c.t.Helper()
 	var rd io.Reader
-	if body != nil {
-		rd = strings.NewReader(body.Encode())
+	if contentType != "" {
+		rd = strings.NewReader(body)
 	}
 	req, err := http.NewRequest(method, c.base.String()+path, rd)
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	for k, v := range c.headers {
-		req.Header.Set(k, v)
+		setHeader(req, k, v)
 	}
 	for i := 0; i+1 < len(extra); i += 2 {
-		req.Header.Set(extra[i], extra[i+1])
+		setHeader(req, extra[i], extra[i+1])
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -351,6 +399,15 @@ func (c *client) do(method, path string, body url.Values, extra ...string) respo
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return response{resp, string(b)}
+}
+
+// setHeader sets a header, or the Host of the request.
+func setHeader(req *http.Request, k, v string) {
+	if http.CanonicalHeaderKey(k) == "Host" {
+		req.Host = v
+	} else {
+		req.Header.Set(k, v)
+	}
 }
 
 func (c *client) get(path string, extra ...string) response {

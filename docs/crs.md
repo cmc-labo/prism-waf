@@ -44,7 +44,12 @@ A few rules reject a request on their own, regardless of the score:
 | Rule | Status | Reason |
 |------|-------:|--------|
 | 200002 | 400 | The JSON, XML or multipart body cannot be parsed |
+| 200003 | 400 | The multipart body fails strict validation, e.g. it is unterminated |
 | 9500001 | 400 | More arguments than `-crs-max-args` (added by PrismWAF) |
+
+Coraza's XML parser is lenient: it rejects mismatched tags, but accepts
+unclosed elements and bodies that are not XML at all. Such bodies are
+still inspected as a whole, so payloads in them are detected.
 
 Only the request rules (`REQUEST-*.conf`) are loaded. PrismWAF's other
 features apply to the CRS as well: detection mode (`-mode detect`), the
@@ -64,7 +69,12 @@ response.
 
 For the numeric options, `0` selects the default. Invalid values, rule
 files that cannot be loaded, and `-crs-rules-*` without `-engine crs` or
-`both` stop PrismWAF at startup with an error. On a successful start,
+`both` stop PrismWAF at startup with an error. An error in a rule file
+starts with the file's name:
+
+```
+level=ERROR msg="prismwaf exited with error" error="crs: loading rules: /etc/prismwaf/after.conf: invalid WAF config from string: unknown directive \"secrulremovebyid\""
+``` On a successful start,
 PrismWAF logs the settings and how long loading took:
 
 ```
@@ -134,8 +144,9 @@ score.
 Coraza stops collecting arguments at a fixed limit and never inspects the
 rest, so without this check a payload placed after enough dummy arguments
 would pass unnoticed. Raising the limit is not free either: every argument
-costs about 0.1 ms of inspection. Keep the default unless legitimate
-requests have more arguments, e.g. a JSON API that accepts large arrays:
+costs about 0.1-0.25 ms of inspection, depending on the CPU. Keep the
+default unless legitimate requests have more arguments, e.g. a JSON API
+that accepts large arrays:
 
 ```sh
 prismwaf -engine crs -crs-max-args 5000 -max-body 1048576
@@ -183,7 +194,7 @@ Rules about files:
 | Body cannot be parsed (rule 200002) | `400 Bad Request` | `crs` |
 | Too many arguments (rule 9500001) | `400 Bad Request` | `crs` |
 | Body larger than `-max-body` | `413 Request Entity Too Large` | `body_too_large` |
-| Request line or headers over 64 KiB | `431 Request Header Fields Too Large` | (not logged) |
+| Request line or headers over 64 KiB (plus a few KiB of margin from Go's HTTP server) | `431 Request Header Fields Too Large` | (not logged) |
 | Internal error in the CRS engine | `500 Internal Server Error` (fail closed) | (operational log) |
 
 In detection mode, the request is forwarded instead and logged with
@@ -232,7 +243,9 @@ See [Audit log](audit-log.md) for all fields.
 
 ## Use cases
 
-All examples below were tested with PrismWAF and CRS 4.25.0. Each one shows
+All examples below were tested with PrismWAF and CRS 4.25.0, and are
+run by the end-to-end test `TestCRSExclusions` (see
+[Testing](testing.md#owasp-core-rule-set)). Each one shows
 the rule file and the command line; combine the rules into as many files
 as you like.
 
@@ -416,6 +429,11 @@ request at paranoia level 1:
 | 128 KiB JSON body | 14 ms | 260 ms |
 | 128 KiB body of other types (worst case) | 110 ms | 750 ms |
 | 1000 arguments | — | about 110 ms |
+
+The figures depend on the CPU: on a 2-vCPU ARM machine, the end-to-end
+tests measured about 0.25 ms per argument, e.g. 250 ms for a 19 KiB JSON
+body with 900 values, and 1 ms for a typical `GET`
+(see [Testing](testing.md#results-1)).
 
 Inspection time grows linearly with the body size: with `-max-body 32768`
 the worst case is about a quarter of the above. Higher paranoia levels run

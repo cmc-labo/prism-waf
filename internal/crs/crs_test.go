@@ -190,6 +190,23 @@ func TestUnparsableBodyIsRejected(t *testing.T) {
 	}
 }
 
+func TestBodyAtTheLimitIsInspected(t *testing.T) {
+	e, err := New(Config{MaxBodySize: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "q=" + strings.Repeat("a", 62)
+	r, b := browser("POST", "/form", "application/x-www-form-urlencoded", body)
+	if res := inspect(t, e, r, b); res != nil {
+		t.Errorf("clean body of the limit rejected: rule %d, status %d", res.RuleID, res.Status)
+	}
+	body = "q=1%27+OR+%271%27%3D%271" + strings.Repeat("+", 64-24)
+	r, b = browser("POST", "/form", "application/x-www-form-urlencoded", body)
+	if res := inspect(t, e, r, b); res == nil || res.RuleID != 949110 {
+		t.Errorf("attack in a body of the limit: %+v", res)
+	}
+}
+
 func TestAnomalyThreshold(t *testing.T) {
 	// One critical rule (942100, 5 points) matches this request.
 	r, _ := browser("GET", "/search?q=1%27%20OR%20%271%27=%271", "", "")
@@ -285,6 +302,12 @@ func TestNewValidates(t *testing.T) {
 		if _, err := New(cfg); err == nil {
 			t.Errorf("%s: New succeeded", name)
 		}
+	}
+	// The error names the file.
+	good := writeRules(t, "SecRuleRemoveById 920350\n")
+	bad := writeRules(t, "SecRuleRemoveById 920350\nSecNoSuchDirective On\n")
+	if _, err := New(Config{RulesBefore: []string{good}, RulesAfter: []string{good, bad}}); err == nil || !strings.Contains(err.Error(), bad+": ") || strings.Contains(err.Error(), good) {
+		t.Errorf("error %v does not name %s", err, bad)
 	}
 }
 

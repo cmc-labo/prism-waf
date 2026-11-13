@@ -133,7 +133,7 @@ func TestBrowserProofOfWork(t *testing.T) {
 	b := startChrome(t, "--ignore-certificate-errors")
 	for _, tls := range []bool{false, true} {
 		t.Run(map[bool]string{false: "HTTP", true: "HTTPS"}[tls], func(t *testing.T) {
-			w := startWAF(t, wafOptions{tls: tls})
+			w := startBotWAF(t, wafOptions{tls: tls})
 
 			r := b.open(t, w.URL+"/hello?x=1&y=<b>", "")
 			if h := r.hit(t); h.URI != "/hello?x=1&y=%3Cb%3E" || h.Score != "60" || h.Category != "automation" {
@@ -170,7 +170,7 @@ func TestLiveCaptcha(t *testing.T) {
 	b := startChrome(t, "--host-resolver-rules="+strings.Join(rules, ", "))
 	for _, k := range testKeys {
 		t.Run(k.provider, func(t *testing.T) {
-			w := startWAF(t, wafOptions{args: []string{
+			w := startBotWAF(t, wafOptions{args: []string{
 				"-bot-captcha", k.provider,
 				"-bot-captcha-site-key", k.siteKey,
 				"-bot-captcha-secret-file", writeFile(t, "secret", k.secret),

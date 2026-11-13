@@ -589,7 +589,7 @@ on all paths:
 - The CAPTCHA providers see the IP addresses and browser data of challenged
   visitors; mention them in your privacy policy. reCAPTCHA v3 was tested
   only with simulated provider responses, as Google offers no test keys for
-  it (see [Testing](testing.md#not-covered)).
+  it (see [Testing](testing.md#bot-protection)).
 - Clients without JavaScript or cookies cannot pass the challenge, which
   also affects some accessibility tools and very old browsers.
 - The clearance is bound to the client address: users whose address

@@ -136,7 +136,7 @@ func TestCaptcha(t *testing.T) {
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
 			p := startProvider(t)
-			w := startWAF(t, wafOptions{env: p.env, args: []string{
+			w := startBotWAF(t, wafOptions{env: p.env, args: []string{
 				"-trusted-proxies", "127.0.0.1",
 				"-bot-captcha", tc.provider,
 				"-bot-captcha-site-key", "site-key-1",
@@ -257,7 +257,7 @@ func equalForms(a, b url.Values) bool {
 // TestCaptchaProviderUnreachable checks that clients cannot pass while the
 // provider cannot be reached, and that the administrator is told.
 func TestCaptchaProviderUnreachable(t *testing.T) {
-	w := startWAF(t, wafOptions{
+	w := startBotWAF(t, wafOptions{
 		env: []string{"HTTPS_PROXY=http://" + freeAddr(t), "https_proxy=", "NO_PROXY=", "no_proxy="},
 		args: []string{
 			"-bot-captcha", "turnstile",

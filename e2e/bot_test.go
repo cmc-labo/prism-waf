@@ -34,7 +34,7 @@ func eventID(t *testing.T, r response) string {
 }
 
 func TestBotProtection(t *testing.T) {
-	w := startWAF(t, wafOptions{args: []string{
+	w := startBotWAF(t, wafOptions{args: []string{
 		"-trusted-proxies", "127.0.0.1",
 		"-bot-difficulty", "12",
 		"-bot-verify=false",
@@ -263,7 +263,7 @@ func TestBotProtection(t *testing.T) {
 }
 
 func TestBotBlockScore(t *testing.T) {
-	w := startWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1", "-bot-block-score", "80"}})
+	w := startBotWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1", "-bot-block-score", "80"}})
 	// A Chrome User-Agent without the headers of a browser scores 80.
 	r := w.client(t, xff(map[string]string{"User-Agent": chromeUA}, "198.51.100.1")).get("/")
 	if r.StatusCode != http.StatusForbidden || strings.Contains(r.body, "<form") {
@@ -276,7 +276,7 @@ func TestBotBlockScore(t *testing.T) {
 }
 
 func TestBotPaths(t *testing.T) {
-	w := startWAF(t, wafOptions{args: []string{"-bot-path", "/search", "-bot-path", "/articles/*"}})
+	w := startBotWAF(t, wafOptions{args: []string{"-bot-path", "/search", "-bot-path", "/articles/*"}})
 	c := w.client(t, map[string]string{"User-Agent": curlUA})
 	c.get("/").hit(t)
 	c.get("/search/x").hit(t)
@@ -290,7 +290,7 @@ func TestBotPaths(t *testing.T) {
 // TestBotHTTPS checks the signals that apply over HTTPS only and the Secure
 // cookie.
 func TestBotHTTPS(t *testing.T) {
-	w := startWAF(t, wafOptions{tls: true})
+	w := startBotWAF(t, wafOptions{tls: true})
 	// Over HTTPS, browsers send fetch metadata and client hints.
 	h := w.client(t, with(browserHeaders, "Sec-Fetch-Mode", "navigate", "Sec-CH-UA", `"Chromium";v="130"`)).get("/").hit(t)
 	if h.Score != "0" {
@@ -311,9 +311,9 @@ func TestBotHTTPS(t *testing.T) {
 func TestBotSharedSecret(t *testing.T) {
 	secret := writeFile(t, "secret", "0123456789abcdef0123456789abcdef\n")
 	backend := startBackend(t).URL
-	a := startWAF(t, wafOptions{backend: backend, args: []string{"-bot-secret-file", secret}})
-	b := startWAF(t, wafOptions{backend: backend, args: []string{"-bot-secret-file", secret}})
-	other := startWAF(t, wafOptions{backend: backend})
+	a := startBotWAF(t, wafOptions{backend: backend, args: []string{"-bot-secret-file", secret}})
+	b := startBotWAF(t, wafOptions{backend: backend, args: []string{"-bot-secret-file", secret}})
+	other := startBotWAF(t, wafOptions{backend: backend})
 
 	cookie := a.client(t, map[string]string{"User-Agent": curlUA}).pass("/").cookie()
 	for name, w := range map[string]*waf{"same secret": b, "random secret": other} {
@@ -328,7 +328,7 @@ func TestBotSharedSecret(t *testing.T) {
 // from an address that is not Google's is challenged. The DNS lookup
 // fails or finds no googlebot.com name, both of which count as fake.
 func TestBotFakeGooglebot(t *testing.T) {
-	w := startWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1"}})
+	w := startBotWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1"}})
 	r := w.client(t, xff(with(browserHeaders, "User-Agent", googleUA), "203.0.113.7")).get("/")
 	parseChallenge(t, r)
 	e := w.eventByID(t, eventID(t, r))
@@ -338,7 +338,7 @@ func TestBotFakeGooglebot(t *testing.T) {
 	}
 
 	// Without verification, Googlebot is a crawler like any other.
-	w = startWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1", "-bot-verify=false"}})
+	w = startBotWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1", "-bot-verify=false"}})
 	r = w.client(t, xff(with(browserHeaders, "User-Agent", googleUA), "203.0.113.7")).get("/")
 	parseChallenge(t, r)
 	if e := w.eventByID(t, eventID(t, r)); e.Bot.Score != 50 || slices.Contains(e.Bot.Signals, "fake_bot") {

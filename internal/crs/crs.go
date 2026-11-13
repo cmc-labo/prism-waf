@@ -98,13 +98,15 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Coraza rejects a body that reaches its limit, while a body of
+	// exactly MaxBodySize bytes is allowed: hence one byte more.
 	w, err := coraza.NewWAF(coraza.NewWAFConfig().
 		WithRootFS(coreruleset.FS).
 		WithDirectives(directives).
-		WithRequestBodyLimit(int(cfg.MaxBodySize)).
-		WithRequestBodyInMemoryLimit(int(cfg.MaxBodySize)))
+		WithRequestBodyLimit(int(cfg.MaxBodySize) + 1).
+		WithRequestBodyInMemoryLimit(int(cfg.MaxBodySize) + 1))
 	if err != nil {
-		return nil, fmt.Errorf("crs: loading rules: %w", err)
+		return nil, fmt.Errorf("crs: loading rules: %w", ruleFileError(err, append(cfg.RulesBefore, cfg.RulesAfter...)))
 	}
 	return &Engine{waf: w}, nil
 }
@@ -163,6 +165,25 @@ func includeFiles(b *strings.Builder, patterns []string) error {
 		}
 	}
 	return nil
+}
+
+// ruleFileError adds the name of the rule file that causes err, if one of
+// the files matching the patterns fails to load on its own; Coraza's
+// errors do not say where the rules came from.
+func ruleFileError(err error, patterns []string) error {
+	for _, p := range patterns {
+		files, _ := filepath.Glob(p)
+		for _, f := range files {
+			data, rerr := os.ReadFile(f)
+			if rerr != nil {
+				continue
+			}
+			if _, ferr := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(string(data))); ferr != nil {
+				return fmt.Errorf("%s: %w", f, err)
+			}
+		}
+	}
+	return err
 }
 
 var includeDirective = regexp.MustCompile(`(?m)^\s*Include\s`)

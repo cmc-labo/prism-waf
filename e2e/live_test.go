@@ -13,7 +13,7 @@ func TestLiveVerifiedBots(t *testing.T) {
 	if os.Getenv("PRISMWAF_E2E_LIVE") == "" {
 		t.Skip("set PRISMWAF_E2E_LIVE=1 to look up crawler addresses in DNS")
 	}
-	w := startWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1"}})
+	w := startBotWAF(t, wafOptions{args: []string{"-trusted-proxies", "127.0.0.1"}})
 	for _, tc := range []struct {
 		name, ua, ip string
 	}{
