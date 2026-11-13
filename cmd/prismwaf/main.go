@@ -86,6 +86,7 @@ func main() {
 	flag.StringVar(&cfg.backendCA, "backend-ca", "", "PEM CA file to verify an https:// backend with, instead of the system CAs")
 	flag.BoolVar(&cfg.backendInsecure, "backend-insecure-skip-verify", false, "do not verify the https:// backend certificate (testing only)")
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) { cfg.setFlags = append(cfg.setFlags, f.Name) })
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(cfg, logger); err != nil {
@@ -149,6 +150,10 @@ type config struct {
 	clientAuth           string
 	backendCA            string
 	backendInsecure      bool
+	// setFlags are the names of the flags given on the command line, to
+	// reject options that would be ignored even when they have their
+	// default value.
+	setFlags []string
 }
 
 // stringList is a flag that can be repeated.
@@ -342,11 +347,16 @@ func (c config) validate() error {
 	if c.rateLimitMaxClients < 0 {
 		return errors.New("-rate-limit-max-clients must not be negative")
 	}
-	if !c.botProtection && (c.botSecretFile != "" || len(c.botPaths) > 0 || len(c.botExemptPaths) > 0 || c.botExempt != "" ||
+	botFlags, captchaFlags := false, false
+	for _, name := range c.setFlags {
+		botFlags = botFlags || strings.HasPrefix(name, "bot-") && name != "bot-protection"
+		captchaFlags = captchaFlags || strings.HasPrefix(name, "bot-captcha-")
+	}
+	if !c.botProtection && (botFlags || c.botSecretFile != "" || len(c.botPaths) > 0 || len(c.botExemptPaths) > 0 || c.botExempt != "" ||
 		c.botAllowCategories != "" || c.botBlockCategories != "" || c.botCaptcha != "") {
 		return errors.New("-bot-* options require -bot-protection")
 	}
-	if c.botCaptcha == "" && (c.botCaptchaSiteKey != "" || c.botCaptchaSecretFile != "" || c.botCaptchaScore != 0) {
+	if c.botCaptcha == "" && (captchaFlags || c.botCaptchaSiteKey != "" || c.botCaptchaSecretFile != "" || c.botCaptchaScore != 0) {
 		return errors.New("-bot-captcha-* options require -bot-captcha")
 	}
 	if c.botCaptcha != "" && (c.botCaptchaSiteKey == "" || c.botCaptchaSecretFile == "") {

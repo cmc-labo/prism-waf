@@ -79,6 +79,7 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 - [Load balancing](docs/load-balancing.md)
 - [HTTPS](docs/https.md)
 - [Automatic certificates (ACME / Let's Encrypt)](docs/acme.md)
+- [Testing](docs/testing.md)
 - [Development](docs/development.md)
 
 ## License

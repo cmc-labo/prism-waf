@@ -93,6 +93,7 @@ var providers = map[string]provider{
 		widgetClass: "g-recaptcha",
 		cspScript:   "https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/",
 		cspFrame:    "https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/",
+		cspConnect:  "https://www.google.com/recaptcha/",
 	},
 	CaptchaRecaptchaV3: {
 		script:     "https://www.google.com/recaptcha/api.js?render=",

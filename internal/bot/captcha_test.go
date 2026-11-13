@@ -159,7 +159,7 @@ func TestCaptchaPage(t *testing.T) {
 	}{
 		{CaptchaTurnstile, `class="captcha cf-turnstile" data-sitekey="site-key"`, `"https://challenges.cloudflare.com/turnstile/v0/api.js"`, "frame-src https://challenges.cloudflare.com"},
 		{CaptchaHCaptcha, `class="captcha h-captcha"`, `"https://js.hcaptcha.com/1/api.js"`, "connect-src https://hcaptcha.com"},
-		{CaptchaRecaptcha, `class="captcha g-recaptcha"`, `"https://www.google.com/recaptcha/api.js"`, "https://www.gstatic.com/recaptcha/"},
+		{CaptchaRecaptcha, `class="captcha g-recaptcha"`, `"https://www.google.com/recaptcha/api.js"`, "connect-src https://www.google.com/recaptcha/"},
 		{CaptchaRecaptchaV3, `grecaptcha.execute("site-key"`, `"https://www.google.com/recaptcha/api.js?render=site-key"`, "connect-src https://www.google.com/recaptcha/"},
 	} {
 		g, _, _ := newCaptchaGuard(t, tc.provider, Config{})

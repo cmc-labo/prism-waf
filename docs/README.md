@@ -11,4 +11,5 @@
 | [Load balancing](load-balancing.md) | Several backends, balancing policies, failover, health checks |
 | [HTTPS](https.md) | TLS termination, SNI, HSTS, mutual TLS, HTTPS backends |
 | [Automatic certificates](acme.md) | ACME/Let's Encrypt: requirements, rate limits, staging, expiry notifications, systemd, troubleshooting |
+| [Testing](testing.md) | Unit and end-to-end tests, browser and live tests, test results |
 | [Development](development.md) | Tests, benchmarks, building, project layout |

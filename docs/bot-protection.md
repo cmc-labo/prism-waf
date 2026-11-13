@@ -75,6 +75,10 @@ headless browser ──GET /page──▶ score 60 ─▶ challenge page
 | `-bot-captcha-score` | `-bot-challenge-score` | Bot score from which the CAPTCHA is shown instead of the proof of work |
 | `-bot-captcha-min-score` | `0.5` | reCAPTCHA v3 score (0.0-1.0) from which a client passes |
 
+PrismWAF refuses to start if a `-bot-*` flag is given without
+`-bot-protection`, or a `-bot-captcha-*` flag without `-bot-captcha`, so
+that no option is silently ignored.
+
 Paths are written and matched like the paths of
 [rate limit rules](rate-limiting.md#path-rules): `/search` is one path,
 `/articles/*` is `/articles` and everything below it, and paths are
@@ -351,6 +355,9 @@ PrismWAF with the Turnstile test keys `1x00000000000000000000AA` (site) and
 challenged: change its `User-Agent` in the developer tools (e.g. to
 `curl/8.0`) or use a headless browser to see the CAPTCHA.
 
+The end-to-end tests do this automatically with headless Chromium; see
+[Testing](testing.md).
+
 ## Clearance cookie
 
 After solving a challenge, the client gets the cookie `prismwaf_clearance`
@@ -582,7 +589,7 @@ on all paths:
 - The CAPTCHA providers see the IP addresses and browser data of challenged
   visitors; mention them in your privacy policy. reCAPTCHA v3 was tested
   only with simulated provider responses, as Google offers no test keys for
-  it.
+  it (see [Testing](testing.md#not-covered)).
 - Clients without JavaScript or cookies cannot pass the challenge, which
   also affects some accessibility tools and very old browsers.
 - The clearance is bound to the client address: users whose address
