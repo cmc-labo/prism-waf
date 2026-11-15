@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -68,8 +69,8 @@ const (
 const (
 	webhookTimeout = 10 * time.Second
 	commandTimeout = 30 * time.Second
-	// queueSize is how many notifications wait to be sent before new ones
-	// are dropped.
+	// queueSize is how many notifications wait to be sent to a target
+	// before new ones are dropped.
 	queueSize = 100
 )
 
@@ -96,14 +97,16 @@ type Config struct {
 }
 
 // Notifier sends events. Notify queues them for Run, which sends them in
-// the background and retries failures.
+// the background and retries failures. Each target has its own queue, so
+// that a target that fails or hangs does not delay the others.
 type Notifier struct {
-	cfg    Config
-	logger *slog.Logger
-	client *http.Client
-	host   string
-	queue  chan Event
-	sleep  func(context.Context, time.Duration) error // for tests
+	cfg     Config
+	logger  *slog.Logger
+	client  *http.Client
+	host    string
+	targets []target
+	queues  []chan Event                               // one per target
+	sleep   func(context.Context, time.Duration) error // for tests
 }
 
 // New returns a Notifier.
@@ -129,7 +132,6 @@ func New(cfg Config) (*Notifier, error) {
 		cfg:    cfg,
 		logger: cfg.Logger,
 		client: cfg.HTTPClient,
-		queue:  make(chan Event, queueSize),
 		sleep:  sleep,
 	}
 	if n.logger == nil {
@@ -139,6 +141,15 @@ func New(cfg Config) (*Notifier, error) {
 		n.client = &http.Client{Timeout: webhookTimeout}
 	}
 	n.host, _ = os.Hostname()
+	if cfg.WebhookURL != "" {
+		n.targets = append(n.targets, target{"webhook", n.postWebhook})
+	}
+	if cfg.Command != "" {
+		n.targets = append(n.targets, target{"command", n.runCommand})
+	}
+	for range n.targets {
+		n.queues = append(n.queues, make(chan Event, queueSize))
+	}
 	return n, nil
 }
 
@@ -165,14 +176,16 @@ func redact(raw string) string {
 }
 
 // Notify queues an event to be sent by Run. Time and Host are filled in if
-// empty. It never blocks: if too many events are waiting, the event is
-// dropped and logged.
+// empty. It never blocks: if too many events are waiting for a target, the
+// event is dropped for that target and logged.
 func (n *Notifier) Notify(e Event) {
 	n.fill(&e)
-	select {
-	case n.queue <- e:
-	default:
-		n.logger.Error("notification dropped: too many notifications waiting", "event", e.Event, "domain", e.Domain)
+	for i, q := range n.queues {
+		select {
+		case q <- e:
+		default:
+			n.logger.Error("notification dropped: too many notifications waiting", "event", e.Event, "domain", e.Domain, "target", n.targets[i].name)
+		}
 	}
 }
 
@@ -185,41 +198,43 @@ func (n *Notifier) fill(e *Event) {
 	}
 }
 
-// Run sends queued events until ctx is canceled. Each target is tried up
-// to three times.
+// Run sends queued events until ctx is canceled, to each target in the
+// order they were queued. Each event is tried up to three times per
+// target.
 func (n *Notifier) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case e := <-n.queue:
-			n.deliver(ctx, e)
-		}
+	var wg sync.WaitGroup
+	for i, t := range n.targets {
+		wg.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case e := <-n.queues[i]:
+					n.deliver(ctx, t, e)
+				}
+			}
+		})
 	}
+	wg.Wait()
 }
 
-// deliver sends an event to every target, with retries, and logs the
-// outcome.
-func (n *Notifier) deliver(ctx context.Context, e Event) {
-	for _, t := range n.targets() {
-		var err error
-		for attempt := 0; ; attempt++ {
-			if err = t.send(ctx, e); err == nil {
-				n.logger.Info("notification sent", "event", e.Event, "domain", e.Domain, "target", t.name)
-				break
-			}
-			if attempt == len(retryDelays) || ctx.Err() != nil {
-				break
-			}
-			n.logger.Warn("notification failed; retrying", "event", e.Event, "target", t.name, "error", err, "retry_in", retryDelays[attempt])
-			if n.sleep(ctx, retryDelays[attempt]) != nil {
-				break
-			}
+// deliver sends an event to a target, with retries, and logs the outcome.
+func (n *Notifier) deliver(ctx context.Context, t target, e Event) {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = t.send(ctx, e); err == nil {
+			n.logger.Info("notification sent", "event", e.Event, "domain", e.Domain, "target", t.name)
+			return
 		}
-		if err != nil {
-			n.logger.Error("notification failed", "event", e.Event, "domain", e.Domain, "target", t.name, "error", err, "message", e.Message)
+		if attempt == len(retryDelays) || ctx.Err() != nil {
+			break
+		}
+		n.logger.Warn("notification failed; retrying", "event", e.Event, "target", t.name, "error", err, "retry_in", retryDelays[attempt])
+		if n.sleep(ctx, retryDelays[attempt]) != nil {
+			break
 		}
 	}
+	n.logger.Error("notification failed", "event", e.Event, "domain", e.Domain, "target", t.name, "error", err, "message", e.Message)
 }
 
 // Send sends an event to every target once, without retries, and returns
@@ -227,7 +242,7 @@ func (n *Notifier) deliver(ctx context.Context, e Event) {
 func (n *Notifier) Send(ctx context.Context, e Event) error {
 	n.fill(&e)
 	var errs []error
-	for _, t := range n.targets() {
+	for _, t := range n.targets {
 		if err := t.send(ctx, e); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", t.name, err))
 		}
@@ -238,17 +253,6 @@ func (n *Notifier) Send(ctx context.Context, e Event) error {
 type target struct {
 	name string
 	send func(context.Context, Event) error
-}
-
-func (n *Notifier) targets() []target {
-	var t []target
-	if n.cfg.WebhookURL != "" {
-		t = append(t, target{"webhook", n.postWebhook})
-	}
-	if n.cfg.Command != "" {
-		t = append(t, target{"command", n.runCommand})
-	}
-	return t
 }
 
 func (n *Notifier) postWebhook(ctx context.Context, e Event) error {

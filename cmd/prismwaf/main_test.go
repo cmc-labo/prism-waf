@@ -44,6 +44,7 @@ func TestConfigValidate(t *testing.T) {
 		{"ACME invalid webhook", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "hooks.example.com/x"}, true},
 		{"ACME invalid webhook format", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "https://hooks.example.com/x", acmeNotifyFormat: "teams"}, true},
 		{"notifications without ACME", config{acmeNotifyWebhook: "https://hooks.example.com/x"}, true},
+		{"ACME webhook format without webhook", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyFormat: "slack", setFlags: []string{"acme-notify-webhook-format"}}, true},
 
 		{"HSTS", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year}}), false},
 		{"HSTS preload", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year, IncludeSubdomains: true, Preload: true}}), false},

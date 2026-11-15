@@ -104,7 +104,7 @@ func TestWebhookRetries(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	n, logs := newTestNotifier(t, Config{WebhookURL: srv.URL})
-	n.deliver(context.Background(), testEvent())
+	n.deliver(context.Background(), n.targets[0], testEvent())
 	if len(h.received()) != 3 {
 		t.Errorf("%d attempts, want 3", len(h.received()))
 	}
@@ -116,7 +116,7 @@ func TestWebhookRetries(t *testing.T) {
 	// message, so it is not lost.
 	h.statuses = []int{401, 401, 401}
 	logs.Reset()
-	n.deliver(context.Background(), testEvent())
+	n.deliver(context.Background(), n.targets[0], testEvent())
 	if !strings.Contains(logs.String(), `level=ERROR msg="notification failed"`) ||
 		!strings.Contains(logs.String(), "401 Unauthorized: invalid_token") ||
 		!strings.Contains(logs.String(), "expires in 10 days") {
@@ -133,7 +133,7 @@ func TestWebhookErrorsHideTheURL(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "secret-token") {
 		t.Errorf("Send = %v", err)
 	}
-	n.deliver(context.Background(), testEvent())
+	n.deliver(context.Background(), n.targets[0], testEvent())
 	if strings.Contains(logs.String(), "secret-token") {
 		t.Errorf("log contains the URL:\n%s", logs)
 	}
@@ -203,6 +203,39 @@ func TestRun(t *testing.T) {
 	if b := h.received(); len(b) != 2 || json.Unmarshal(b[0], &got) != nil || got.Time.IsZero() || got.Host == "" {
 		t.Errorf("received %s", b)
 	}
+}
+
+// TestRunTargetsAreIndependent checks that a webhook that does not answer
+// does not delay the command.
+func TestRunTargetsAreIndependent(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	out := filepath.Join(t.TempDir(), "out")
+	n, _ := newTestNotifier(t, Config{WebhookURL: srv.URL, Command: "echo $PRISMWAF_DOMAIN >> " + out})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { n.Run(ctx); close(done) }()
+	for _, d := range []string{"a.example", "b.example"} {
+		e := testEvent()
+		e.Domain = d
+		n.Notify(e)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for b, _ := os.ReadFile(out); string(b) != "a.example\nb.example\n"; b, _ = os.ReadFile(out) {
+		if time.Now().After(deadline) {
+			t.Fatalf("command output %q while the webhook hangs", b)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
 }
 
 func TestNotifyDropsWhenFull(t *testing.T) {

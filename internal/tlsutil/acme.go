@@ -115,7 +115,9 @@ type certStatus struct {
 	retryAt   time.Time
 	lastErr   error
 	announced bool      // its details were logged
+	checked   bool      // its expiry was checked
 	warnedAt  time.Time // last expiry warning
+	expired   bool      // the last expiry warning was that it expired
 
 	alert      string    // the event of the current problem notified, if any
 	notifiedAt time.Time // when it was last notified
@@ -419,20 +421,31 @@ func renewalOverdue(leaf *x509.Certificate, now time.Time) bool {
 // renewed, and notifies when a certificate is fine again.
 func (a *ACMEManager) checkExpiry(domain string, leaf *x509.Certificate) {
 	now := a.now()
+	a.mu.Lock()
+	s := a.status(domain)
+	first := !s.checked
+	s.checked = true
+	a.mu.Unlock()
 	if !renewalOverdue(leaf, now) {
 		a.recovered(domain, leaf)
 		return
 	}
 	left := leaf.NotAfter.Sub(now)
+	if first && left > 0 {
+		// A certificate loaded from the cache after PrismWAF was stopped
+		// for a while: autocert has only just started renewing it, which
+		// usually succeeds within seconds. Wait for the next check.
+		return
+	}
 	a.mu.Lock()
-	s := a.status(domain)
 	interval := 24 * time.Hour
 	if left <= 0 {
 		interval = time.Hour
 	}
-	logIt := s.warnedAt.IsZero() || now.Sub(s.warnedAt) >= interval
+	// Expiry is logged at once, like it is notified.
+	logIt := s.warnedAt.IsZero() || now.Sub(s.warnedAt) >= interval || s.expired != (left <= 0)
 	if logIt {
-		s.warnedAt = now
+		s.warnedAt, s.expired = now, left <= 0
 	}
 	a.mu.Unlock()
 

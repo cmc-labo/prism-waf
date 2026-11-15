@@ -381,6 +381,11 @@ minute) and then once a day while it lasts. A worse problem, e.g.
 `certificate_recovered` closes the problem, so an alert can be resolved
 automatically.
 
+At startup, a cached certificate that should already have been renewed,
+e.g. because PrismWAF was stopped for some days, is renewed at once. It is
+reported as `certificate_expiring` only if it is still not renewed at the
+next check, a minute later.
+
 `certificate_expiring` is sent once renewal has been failing for **a day**.
 Renewal starts a third of the lifetime before expiry (at most 30 days) and
 is retried every 30 to 60 minutes, so a certificate that is still not
@@ -489,7 +494,9 @@ read:
 ```
 
 `-acme-notify-webhook` and `-acme-notify-command` can be used together;
-each notification is then sent to both.
+each notification is then sent to both, independently: a webhook that
+fails or does not answer does not delay the command, and the other way
+round. `-acme-notify-webhook-format` requires `-acme-notify-webhook`.
 
 ## Logs
 
@@ -505,13 +512,13 @@ PrismWAF writes ACME events to its operational log (standard error):
 | ERROR | `ACME certificate request failed` | A certificate could not be obtained. With the `error`, the `validation` errors of the attempt, a `hint`, the number of consecutive `failures` and when the next attempt is made (`retry_in`, `retry_at`) |
 | INFO | `ACME certificate available again` | A certificate was obtained after failures |
 | WARN | `ACME certificate not renewed yet` | Renewal has been failing for a day (see [When PrismWAF notifies](#when-prismwaf-notifies)). Logged daily |
-| ERROR | `ACME certificate expired` | The certificate in use has expired. Logged hourly |
+| ERROR | `ACME certificate expired` | The certificate in use has expired. Logged at once, then hourly |
 | ERROR | `cannot write ACME cache; …` | A certificate could not be stored, e.g. because the disk is full; it would be requested again after a restart |
 | WARN | `using the Let's Encrypt staging environment: …` | Staging is configured |
 | INFO | `notification sent` | A [notification](#expiry-notifications) was delivered. With `event`, `domain` and `target` |
 | WARN | `notification failed; retrying` | Delivery failed and is retried. With the `error` |
 | ERROR | `notification failed` | Delivery failed three times. With the `error` and the `message` that could not be delivered |
-| ERROR | `notification dropped: …` | More than 100 notifications were waiting to be sent |
+| ERROR | `notification dropped: …` | More than 100 notifications were waiting to be sent to the `target` |
 
 The library that implements ACME only reports that no challenge
 succeeded; the CA's reason is taken from its responses and logged as

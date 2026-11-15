@@ -13,10 +13,12 @@ PrismWAF has two kinds of tests:
 |---------|-----------|---------|
 | [Bot protection](bot-protection.md) | [`bot_test.go`, `captcha_test.go`, `browser_test.go`, `live_test.go`](#bot-protection) | [2026-11-13](#results) |
 | [OWASP Core Rule Set](crs.md) | [`crs_test.go`](#owasp-core-rule-set) | [2026-11-14](#results-1) |
+| [ACME expiry notifications](acme.md#expiry-notifications) | [`acme_test.go`, `acmeca_test.go`](#acme-expiry-notifications) | [2026-11-15](#results-2) |
 
 ```sh
 go test ./...                                      # unit tests
-go test -tags e2e ./e2e/                           # E2E tests, ~25s
+go test -tags e2e ./e2e/                           # E2E tests, ~4 minutes
+go test -tags e2e -short ./e2e/                    # without the tests that wait for timers, ~35s
 go test -tags e2e -run 'TestCRS' ./e2e/            # E2E tests of one feature
 PRISMWAF_E2E_LIVE=1 go test -tags e2e -v ./e2e/   # also with real DNS and CAPTCHA providers
 ```
@@ -27,14 +29,16 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [How the E2E tests work](#how-the-e2e-tests-work)
 - [Bot protection](#bot-protection)
 - [OWASP Core Rule Set](#owasp-core-rule-set)
+- [ACME expiry notifications](#acme-expiry-notifications)
 
 ## Requirements
 
 | Tests | Needs | Without it |
 |-------|-------|------------|
-| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`) | Go | — |
+| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`, `TestACME*`, `TestNotify*`) | Go, `sh` | — |
 | Browser tests (`TestBrowser*`) | Chromium or Chrome, Node.js 22 or later | Skipped |
 | Live tests (`TestLive*`) | `PRISMWAF_E2E_LIVE=1`, Internet access, a browser for `TestLiveCaptcha` | Skipped |
+| `TestLiveWebhook` | `PRISMWAF_E2E_WEBHOOK` (a webhook URL) and `PRISMWAF_E2E_WEBHOOK_FORMAT` | Skipped |
 
 The browser is found as `chromium`, `chromium-browser`, `google-chrome` or
 `google-chrome-stable` in `PATH`, or set with `PRISMWAF_E2E_CHROME`. The
@@ -329,3 +333,145 @@ tests, and the code was restored:
   outside.
 - Large bodies near the default `-max-body` of 128 KiB; the latency of
   bodies of this size is in [Performance](crs.md#performance).
+
+## ACME expiry notifications
+
+```sh
+go test -tags e2e -run 'TestACME|TestNotify' -v ./e2e/
+```
+
+The tests run prismwaf with `-acme-domains` against a fake ACME CA, and
+check the [expiry notifications](acme.md#expiry-notifications) that arrive
+at a real webhook endpoint (an HTTP server in the test) and from a real
+command (a shell script):
+
+```
+ fake ACME CA ◄─── ACME (RFC 8555) ───── prismwaf ── POST ──► webhook endpoint
+ (acmeca_test.go)                         │    ▲               (records the body
+      │                                   │    │                and headers)
+      └── validates TLS-ALPN-01 / HTTP-01 ─────┘
+                                          └── sh -c ──► command (records stdin
+                                                        and PRISMWAF_* variables)
+```
+
+- **The fake CA** implements the ACME protocol as prismwaf's ACME library
+  uses it: directory, nonces, account, orders, authorizations,
+  challenges, finalization and certificate download. It validates the
+  challenges for real, TLS-ALPN-01 with a handshake on `-listen` and
+  HTTP-01 with a request to `-http-redirect`, and issues certificates
+  from its own root. JWS signatures are not checked. A mode makes it fail:
+  validation fails as if it could not connect (`connection` problem), new
+  orders are rejected (`rejectedIdentifier`), or every request gets `503`.
+- **Certificates in the cache** are written by the test in the format of
+  the ACME library, with any validity period, as if prismwaf had obtained
+  them before. This is how a certificate close to expiry is set up without
+  waiting weeks.
+- **Timers are not shortened.** prismwaf checks certificates at startup
+  and then every minute, and retries notifications after 10 seconds and a
+  minute; the tests wait for them. These tests are skipped with `-short`
+  and run in parallel with each other, which adds about two minutes.
+
+### What is tested (`e2e/acme_test.go`)
+
+| Test | Checks |
+|------|--------|
+| `TestACMECertificate` | A certificate is obtained with TLS-ALPN-01, and with HTTP-01 when the CA offers only that; it is served with its chain and verifies against the CA, HTTPS requests reach the backend, other requests to `-http-redirect` get `308` to HTTPS. No notification and no warning is logged for a valid certificate. After a restart, the cached certificate is served without a new order |
+| `TestACMENotifyUnavailable` | The CA cannot validate two domains: each gets `certificate_unavailable` (`critical`) at the webhook (`json`) and from the command, with `failures` 1, `retry_at` 10 minutes later, the error, the message and `text`; the command gets the event on standard input (without `text`) and in `PRISMWAF_*` variables. The CA's reason is logged as `ACME validation failed` with a hint. Client handshakes fail and do not make prismwaf contact the CA again during the backoff; nothing is notified twice |
+| `TestACMENotifyCommandIsNotInjected` | The CA rejects the order with a detail containing `$(touch …)`, backticks and `;`. A command that uses `$PRISMWAF_ERROR` and `$PRISMWAF_MESSAGE` (also unquoted) gets the detail as text, and nothing in it is run. The `slack` webhook gets only `{"text": …}` |
+| `TestACMENotifyExpiring` | A cached certificate with 10 days left of 90 and a CA that cannot validate: renewal is attempted at once and fails, without a notification; at the next check, a minute later, `certificate_expiring` (`warning`) with the issuer, serial and `not_after` of the certificate, as `{"content": …}` to the `discord` webhook and to the command (`PRISMWAF_NOT_AFTER`). The old certificate keeps being served |
+| `TestACMERenewalAtStartup` | The same certificate and a CA that works: it is renewed at once, and nothing is notified or warned, also at the next check |
+| `TestACMENotifyExpired` | A certificate that expires 70 seconds after startup and is not renewed: `certificate_expiring` at the second check, `certificate_expired` (`critical`) a minute later, logged at once as `ACME certificate expired`. Clients then get the expired certificate |
+| `TestNotifyRetry` | The webhook answers `503`, then `502`: the failures are logged with the status and the response body, retried after 10 seconds and a minute, and the notification arrives with the third attempt, 70 seconds after the first |
+| `TestNotifyFailure` | The webhook and the command (exit status 3, a message on standard error) always fail: each is tried three times, and the failure is logged with the response or the output, and the message that was not delivered |
+| `TestNotifyTargetsAreIndependent` | The webhook does not answer: the command is still run at once, prismwaf keeps serving HTTPS for another domain, and stops at once on `SIGTERM` |
+| `TestNotifyTestFlag` | `-acme-notify-test` with each webhook format and a command, over HTTP and HTTPS (a webhook with a certificate from an unknown CA fails, and works once the CA is trusted with `SSL_CERT_FILE`). A `403`, a refused connection and a failing command each make prismwaf exit with an error that names the target and the reason |
+| `TestNotifySecretsAreNotLogged` | A webhook URL with a token in the path, a password and a key in the query: neither the test output, the startup log nor the failure logs contain them |
+| `TestNotifyInvalidFlags` | prismwaf refuses to start with notification flags without `-acme-domains`, `-acme-notify-test` without a target, a webhook URL that is not `http(s)://`, an unknown format, or `-acme-notify-webhook-format` without `-acme-notify-webhook`; the URL is not repeated in the error |
+| `TestLiveWebhook` | With `PRISMWAF_E2E_WEBHOOK`, sends a test notification to a real service, e.g. a Slack or Discord channel |
+
+`TestLiveWebhook` is not run by default, because it needs a webhook URL:
+
+```sh
+PRISMWAF_E2E_WEBHOOK=https://hooks.slack.com/services/… PRISMWAF_E2E_WEBHOOK_FORMAT=slack \
+  go test -tags e2e -run TestLiveWebhook -v ./e2e/
+```
+
+### Results
+
+Run on 2026-11-15 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestACMECertificate` | Pass | 2.2s |
+| `TestACMENotifyUnavailable` | Pass | 0.7s |
+| `TestACMENotifyCommandIsNotInjected` | Pass | 0.1s |
+| `TestACMENotifyExpiring` | Pass | 60s |
+| `TestACMERenewalAtStartup` | Pass | 65s |
+| `TestACMENotifyExpired` | Pass | 120s |
+| `TestNotifyRetry` | Pass | 70s |
+| `TestNotifyFailure` | Pass | 70s |
+| `TestNotifyTargetsAreIndependent` | Pass | 0.1s |
+| `TestNotifyTestFlag` | Pass | 0.1s |
+| `TestNotifySecretsAreNotLogged` | Pass | 0.1s |
+| `TestNotifyInvalidFlags` | Pass | 0.1s |
+| `TestLiveWebhook` | Not run (needs a webhook URL) | — |
+
+The fast tests also passed 5 times in a row with `-race`. Measured
+timings: a notification arrives within about 20 ms after the problem is
+detected; with a webhook that fails twice, 70 seconds after the first
+attempt; `certificate_expired` 60 seconds after `certificate_expiring`
+(one check).
+
+**Mutation check.** These changes to the code were each caught by the
+tests, and the code was restored:
+
+| Change | Failing tests |
+|--------|--------------:|
+| An overdue certificate reported at the first check again (the first bug below) | 2 |
+| Targets served one after another again (the second bug below) | 1 |
+| Expiry logged only an hour after the last warning again (the third bug below) | 1 |
+| `-acme-notify-webhook-format` accepted without a webhook again | 1 |
+| No `PRISMWAF_*` variables for the command | 6 |
+| The CA's error appended to the command line (shell injection) | 1 |
+| The webhook URL logged in full | 5 |
+| The URL left in webhook connection errors | 3 |
+| No retries | 2 |
+| A worse problem not notified at once | 1 |
+| The `slack` format sending the full event | 3 |
+
+The unit tests added with the fixes fail without them as well.
+
+**Problems found and fixed:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| A cached certificate that was overdue for renewal at startup, e.g. after PrismWAF was stopped for some days, was reported as `certificate_expiring` (and logged as `ACME certificate not renewed yet`) at once, although the renewal started at the same moment and succeeded a few milliseconds later. A false alarm, followed a minute later by `certificate_recovered` | `TestACMERenewalAtStartup` | The first check after startup leaves overdue certificates to the renewal; they are reported at the next check if still not renewed. Expired certificates are not affected |
+| Notifications were sent to the webhook and the command one after another. A webhook that did not answer delayed the command by up to about 100 seconds (three 10-second timeouts plus 70 seconds of retries) per notification, and the notifications behind it as well | `TestNotifyTargetsAreIndependent` | Each target has its own queue and worker |
+| A certificate that expired less than an hour after the last `ACME certificate not renewed yet` warning was not logged as `ACME certificate expired` until that hour had passed, although it was notified at once | `TestACMENotifyExpired` | Expiry is logged at once, then hourly |
+| `-acme-notify-webhook-format` without `-acme-notify-webhook` (e.g. with only a command) was silently ignored | `TestNotifyInvalidFlags` | It is now an error, like other options without the option they belong to |
+
+**Findings that need no change:**
+
+- For a failed validation, the notification's `error` is the ACME
+  library's generic `no viable challenge type found`; the CA's reason
+  (e.g. `Timeout during connect`) is only in the log (`ACME validation
+  failed`), which the message refers to. A rejected order, by contrast,
+  carries the CA's detail in `error`.
+- Text from the CA reaches a command only through the environment and
+  standard input, never the command line, so shell syntax in it is not
+  run, even when the command uses the variable unquoted.
+- On `SIGTERM`, a notification that is still being sent or retried is
+  abandoned and logged as `notification failed` (`context canceled`);
+  PrismWAF stops at once. Notifications are not kept across restarts, as
+  documented in [Limitations](acme.md#limitations).
+
+**Not covered:**
+
+- The daily repetition of a notification and `certificate_recovered`,
+  which need a day, or 10 to 60 minutes until the next attempt; the unit
+  tests cover them with a fixed clock.
+- The 30-second timeout of commands, and the limit of 100 waiting
+  notifications.
+- Rate limit responses of the CA, RSA certificates, and a real CA such as
+  Let's Encrypt's staging environment.
+- A real chat service, unless `TestLiveWebhook` is run with a URL.

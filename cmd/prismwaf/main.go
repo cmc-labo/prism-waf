@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -388,6 +389,9 @@ func (c config) validate() error {
 	}
 	if !c.acmeEnabled() && (c.acmeNotifyEnabled() || c.acmeNotifyTest) {
 		return errors.New("-acme-notify-* options require -acme-domains")
+	}
+	if c.acmeNotifyWebhook == "" && slices.Contains(c.setFlags, "acme-notify-webhook-format") {
+		return errors.New("-acme-notify-webhook-format requires -acme-notify-webhook")
 	}
 	if c.acmeNotifyTest && !c.acmeNotifyEnabled() {
 		return errors.New("-acme-notify-test requires -acme-notify-webhook or -acme-notify-command")

@@ -119,6 +119,7 @@ type waf struct {
 	URL      string
 	auditLog string
 	stderr   *syncBuffer
+	stop     func() // stops the process: SIGTERM, then SIGKILL after 5 seconds
 }
 
 type syncBuffer struct {
@@ -146,6 +147,8 @@ type wafOptions struct {
 	tls bool
 	// backend is the backend URL; empty starts a new backend.
 	backend string
+	// listen is the address to listen on; empty picks a free port.
+	listen string
 }
 
 // startBotWAF starts prismwaf with -bot-protection and the options.
@@ -163,7 +166,10 @@ func startWAF(t *testing.T, o wafOptions) *waf {
 		o.backend = startBackend(t).URL
 	}
 	dir := t.TempDir()
-	addr := freeAddr(t)
+	addr := o.listen
+	if addr == "" {
+		addr = freeAddr(t)
+	}
 	w := &waf{URL: "http://" + addr, auditLog: filepath.Join(dir, "audit.jsonl"), stderr: &syncBuffer{}}
 	args := []string{"-listen", addr, "-backend", o.backend, "-audit-log", w.auditLog}
 	if o.tls {
@@ -179,7 +185,7 @@ func startWAF(t *testing.T, o wafOptions) *waf {
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
-	t.Cleanup(func() {
+	w.stop = sync.OnceFunc(func() {
 		cmd.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-exited:
@@ -187,6 +193,9 @@ func startWAF(t *testing.T, o wafOptions) *waf {
 			cmd.Process.Kill()
 			<-exited
 		}
+	})
+	t.Cleanup(func() {
+		w.stop()
 		if t.Failed() {
 			t.Logf("prismwaf output:\n%s", w.stderr)
 		}
@@ -211,9 +220,17 @@ func startWAF(t *testing.T, o wafOptions) *waf {
 // runWAF runs prismwaf until it exits, for flags that are rejected.
 func runWAF(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return runWAFEnv(t, nil, args...)
+}
+
+// runWAFEnv is runWAF with more environment variables.
+func runWAFEnv(t *testing.T, env []string, args ...string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, binary, append([]string{"-listen", freeAddr(t)}, args...)...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, binary, append([]string{"-listen", freeAddr(t)}, args...)...)
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 

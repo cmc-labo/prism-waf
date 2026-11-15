@@ -531,13 +531,80 @@ func TestACMECheckExpiry(t *testing.T) {
 	if n := len(logs.records("ACME certificate expired")); n != 2 {
 		t.Errorf("%d expiry errors, want 2", n)
 	}
+	// Then logged every hour.
+	*now = now.Add(59 * time.Minute)
+	a.check()
+	if n := len(logs.records("ACME certificate expired")); n != 2 {
+		t.Errorf("%d expiry errors within an hour, want 2", n)
+	}
+	*now = now.Add(time.Minute)
+	a.check()
+	if n := len(logs.records("ACME certificate expired")); n != 4 {
+		t.Errorf("%d expiry errors after an hour, want 4", n)
+	}
 
 	// A fresh certificate is fine.
 	cert.Store(leafCert(t, "example.com", *now, now.Add(90*24*time.Hour)))
 	*now = now.Add(2 * time.Hour)
 	a.check()
-	if n := len(logs.records("ACME certificate expired")); n != 2 {
+	if n := len(logs.records("ACME certificate expired")); n != 4 {
 		t.Errorf("fresh certificate reported as expired")
+	}
+}
+
+// TestACMEOverdueAtStartup checks that a certificate that is overdue when
+// it is first checked, e.g. after PrismWAF was stopped for a while, is
+// given until the next check to be renewed.
+func TestACMEOverdueAtStartup(t *testing.T) {
+	var cert atomic.Pointer[tls.Certificate]
+	a, now, logs := fakeACME(t, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert.Load(), nil })
+	rec := &recorder{}
+	a.notifier = rec
+	issued := now.Add(-80 * 24 * time.Hour)
+	cert.Store(leafCert(t, "example.com", issued, issued.Add(90*24*time.Hour)))
+
+	a.check()
+	if got := rec.take(); got != nil || len(logs.records("ACME certificate not renewed yet")) != 0 {
+		t.Errorf("first check: notified %v", got)
+	}
+	// Renewed in the meantime.
+	cert.Store(leafCert(t, "example.com", *now, now.Add(90*24*time.Hour)))
+	*now = now.Add(time.Minute)
+	a.check()
+	if got := rec.take(); got != nil {
+		t.Errorf("after renewal: notified %v", got)
+	}
+
+	// Not renewed: reported at the second check.
+	a, now, _ = fakeACME(t, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return leafCert(t, "example.com", issued, issued.Add(90*24*time.Hour)), nil
+	})
+	a.notifier = rec
+	a.check()
+	if got := rec.take(); got != nil {
+		t.Errorf("first check: notified %v", got)
+	}
+	*now = now.Add(time.Minute)
+	a.check()
+	if got := strings.Join(rec.take(), ","); got != "certificate_expiring example.com,certificate_expiring www.example.com" {
+		t.Errorf("second check: %v", got)
+	}
+}
+
+// TestACMEExpiryIsLoggedAtOnce checks that a certificate that expires
+// shortly after it was reported as not renewed is logged as expired at
+// once.
+func TestACMEExpiryIsLoggedAtOnce(t *testing.T) {
+	a, now, logs := fakeACME(t, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return leafCert(t, "example.com", time.Unix(0, 0), time.Unix(0, 0).Add(90*24*time.Hour)), nil
+	})
+	*now = time.Unix(0, 0).Add(90*24*time.Hour - 30*time.Minute)
+	a.check()
+	a.check()
+	*now = now.Add(31 * time.Minute)
+	a.check()
+	if n := len(logs.records("ACME certificate expired")); n != 2 {
+		t.Errorf("%d expiry errors, want one per domain", n)
 	}
 }
 
