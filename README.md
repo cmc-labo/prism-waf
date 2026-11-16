@@ -17,6 +17,9 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   inspected on its own
 - **Rate limiting**: limit requests per client, overall and per path, e.g.
   5 login attempts per minute ([details](docs/rate-limiting.md))
+- **Geo filtering**: allow or block countries with a GeoIP database
+  (MaxMind GeoLite2, DB-IP, IPinfo), and pass the client's country to the
+  backend ([details](docs/geo-filtering.md))
 - **Bot protection**: score how likely each request comes from a bot and
   make HTTP libraries, crawlers and scrapers solve a proof-of-work
   challenge that browsers pass automatically, or a CAPTCHA (Turnstile,
@@ -74,6 +77,7 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 - [OWASP Core Rule Set](docs/crs.md): engine selection, paranoia level,
   anomaly threshold, rule exclusions and use cases
 - [Rate limiting](docs/rate-limiting.md)
+- [Geo filtering](docs/geo-filtering.md)
 - [Bot protection](docs/bot-protection.md)
 - [Modes and audit log](docs/audit-log.md)
 - [Load balancing](docs/load-balancing.md)
@@ -90,3 +94,7 @@ Binaries also contain third-party code under their own licenses, notably
 [OWASP Coraza](https://github.com/corazawaf/coraza) and the
 [OWASP Core Rule Set](https://github.com/coreruleset/coreruleset)
 (both Apache License 2.0).
+[maxminddb-golang](https://github.com/oschwald/maxminddb-golang), which
+reads GeoIP databases, is under the ISC License. GeoIP databases are not
+included; see [Geo filtering](docs/geo-filtering.md#country-databases)
+for their terms.

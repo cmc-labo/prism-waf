@@ -114,6 +114,8 @@ Rate limits are checked before a request is inspected for attacks, so a
 flood is rejected before PrismWAF spends time on its body. Requests that
 are then blocked as attacks still count: a scanner that sends attack
 payloads quickly is slowed down by the rate limit as well.
+Clients [blocked by their country](geo-filtering.md) are rejected before
+the rate limits and do not count.
 
 ### Memory
 

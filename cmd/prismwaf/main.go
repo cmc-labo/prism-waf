@@ -21,6 +21,7 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/geo"
 	"github.com/cmc-labo/prism-waf/internal/notify"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
@@ -51,6 +52,10 @@ func main() {
 	flag.Var(&cfg.rateLimitPaths, "rate-limit-path", `per-client limit for one path as "[METHOD ]PATH=N/WINDOW", e.g. "POST /login=5/1m" or "/api/*=100/1m"; repeatable`)
 	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited")
 	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once")
+	flag.StringVar(&cfg.geoDB, "geo-db", "", "MaxMind DB file to look up the country of clients in (GeoLite2 or GeoIP2 Country or City, DB-IP IP to Country, IPinfo Lite); reloaded when it changes")
+	flag.StringVar(&cfg.geoAllow, "geo-allow", "", `comma-separated ISO 3166-1 country codes to allow, e.g. "JP,US"; requests from other countries get 403 ("XX" is unknown)`)
+	flag.StringVar(&cfg.geoBlock, "geo-block", "", `comma-separated ISO 3166-1 country codes to block with 403, e.g. "CN,RU" ("XX" is unknown)`)
+	flag.StringVar(&cfg.geoExempt, "geo-exempt", "", "comma-separated IPs or CIDRs of clients that are never blocked by country")
 	flag.BoolVar(&cfg.botProtection, "bot-protection", false, "score how likely each request comes from a bot and make clients that look automated solve a proof-of-work challenge in JavaScript")
 	flag.IntVar(&cfg.botChallengeScore, "bot-challenge-score", bot.DefaultChallengeScore, "bot score (0-100) from which clients must solve the challenge")
 	flag.IntVar(&cfg.botBlockScore, "bot-block-score", 0, "bot score (0-100) from which requests are rejected with 403 without a challenge; 0 disables")
@@ -118,6 +123,10 @@ type config struct {
 	rateLimitPaths       stringList
 	rateLimitExempt      string
 	rateLimitMaxClients  int
+	geoDB                string
+	geoAllow             string
+	geoBlock             string
+	geoExempt            string
 	botProtection        bool
 	botChallengeScore    int
 	botBlockScore        int
@@ -220,6 +229,24 @@ func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
 		rules = append(rules, r)
 	}
 	return rules, nil
+}
+
+// geoConfig returns the configuration of the country filter, without the
+// database, which is opened by run.
+func (c config) geoConfig() (geo.Config, error) {
+	allow, err := geo.ParseCountries(c.geoAllow)
+	if err != nil {
+		return geo.Config{}, fmt.Errorf("invalid -geo-allow: %w", err)
+	}
+	block, err := geo.ParseCountries(c.geoBlock)
+	if err != nil {
+		return geo.Config{}, fmt.Errorf("invalid -geo-block: %w", err)
+	}
+	exempt, err := ratelimit.ParsePrefixes(c.geoExempt)
+	if err != nil {
+		return geo.Config{}, fmt.Errorf("invalid -geo-exempt: %w", err)
+	}
+	return geo.Config{Allow: allow, Block: block, Exempt: exempt}, nil
 }
 
 // botConfig returns the configuration of the bot guard, without the
@@ -347,6 +374,18 @@ func (c config) validate() error {
 	}
 	if c.rateLimitMaxClients < 0 {
 		return errors.New("-rate-limit-max-clients must not be negative")
+	}
+	if c.geoDB == "" && (c.geoAllow != "" || c.geoBlock != "" || c.geoExempt != "") {
+		return errors.New("-geo-allow, -geo-block and -geo-exempt require -geo-db")
+	}
+	if c.geoAllow != "" && c.geoBlock != "" {
+		return errors.New("-geo-allow and -geo-block are mutually exclusive")
+	}
+	if c.geoExempt != "" && c.geoAllow == "" && c.geoBlock == "" {
+		return errors.New("-geo-exempt requires -geo-allow or -geo-block")
+	}
+	if _, err := c.geoConfig(); err != nil {
+		return err
 	}
 	botFlags, captchaFlags := false, false
 	for _, name := range c.setFlags {
@@ -495,6 +534,19 @@ func run(cfg config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var geoFilter *geo.Filter
+	if cfg.geoDB != "" {
+		gc, err := cfg.geoConfig()
+		if err != nil {
+			return err
+		}
+		if gc.DB, err = geo.OpenDB(cfg.geoDB, logger); err != nil {
+			return err
+		}
+		if geoFilter, err = geo.New(gc); err != nil {
+			return err
+		}
+	}
 	var limiter *ratelimit.Limiter
 	if cfg.rateLimitEnabled() {
 		rules, err := cfg.rateLimitRules()
@@ -548,6 +600,7 @@ func run(cfg config, logger *slog.Logger) error {
 	var handler http.Handler = waf.Middleware(rp, waf.Config{
 		Inspector:      inspector,
 		CRS:            crsEngine,
+		Geo:            geoFilter,
 		RateLimiter:    limiter,
 		Bot:            guard,
 		Mode:           mode,
@@ -644,6 +697,9 @@ func run(cfg config, logger *slog.Logger) error {
 	if certs != nil {
 		go reloadOnSIGHUP(ctx, certs, logger)
 	}
+	if geoFilter != nil {
+		go geoFilter.DB().Run(ctx)
+	}
 	if cfg.healthPath != "" {
 		go rp.HealthCheck(ctx, cfg.healthPath, cfg.healthInterval, cfg.healthTimeout)
 	}
@@ -653,6 +709,21 @@ func run(cfg config, logger *slog.Logger) error {
 		scheme = "https"
 	}
 	logger.Info("prismwaf started", "listen", cfg.listen, "scheme", scheme, "backends", cfg.backendURLs(), "lb_policy", cfg.lbPolicy, "engine", cfg.engine, "mode", mode, "audit_log", cfg.auditLog)
+	if geoFilter != nil {
+		m := geoFilter.DB().Metadata()
+		built := m.BuildTime().UTC().Format(time.DateOnly)
+		logger.Info("GeoIP enabled", "db", cfg.geoDB, "type", m.DatabaseType, "built", built,
+			"allow", cfg.geoAllow, "block", cfg.geoBlock, "exempt", cfg.geoExempt)
+		if geoFilter.DB().Stale(time.Now()) {
+			logger.Warn("the GeoIP database is outdated", "built", built, "hint", "update it at least monthly")
+		}
+		if m.IPVersion == 4 {
+			logger.Warn("the GeoIP database has only IPv4 addresses; IPv6 clients are unknown (XX)")
+		}
+		if len(tp) == 0 {
+			logger.Info("countries are looked up for the TCP peer address; behind a load balancer or CDN, set -trusted-proxies, or the address of the proxy is looked up for every client")
+		}
+	}
 	if limiter != nil {
 		rules := make([]string, len(limiter.Rules()))
 		for i, r := range limiter.Rules() {

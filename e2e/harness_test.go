@@ -92,6 +92,7 @@ type backendHit struct {
 	Score    string `json:"score"`
 	Category string `json:"category"`
 	Verified string `json:"verified"`
+	Country  string `json:"country"`
 }
 
 // startBackend starts a backend that answers every request with a
@@ -108,6 +109,7 @@ func startBackend(t *testing.T) *httptest.Server {
 			Score:    r.Header.Get("X-Prismwaf-Bot-Score"),
 			Category: r.Header.Get("X-Prismwaf-Bot-Category"),
 			Verified: r.Header.Get("X-Prismwaf-Bot-Verified"),
+			Country:  strings.Join(r.Header.Values("X-Prismwaf-Country"), ","),
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -250,6 +252,7 @@ type auditEvent struct {
 	Reason   string `json:"reason"`
 	Action   string `json:"action"`
 	ClientIP string `json:"client_ip"`
+	Country  string `json:"country"`
 	Rule     *struct {
 		ID       string `json:"id"`
 		Category string `json:"category"`
@@ -277,6 +280,10 @@ type auditEvent struct {
 		Challenge string   `json:"challenge"`
 		Client    string   `json:"client"`
 	} `json:"bot"`
+	Geo *struct {
+		List   string `json:"list"`
+		Client string `json:"client"`
+	} `json:"geo"`
 }
 
 // crsRule is a CRS rule that matched, in an audit event.

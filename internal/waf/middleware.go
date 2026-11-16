@@ -13,6 +13,7 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/geo"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
@@ -65,6 +66,10 @@ type Config struct {
 	// CRS, if set, inspects requests that the built-in signatures let
 	// through with the OWASP Core Rule Set.
 	CRS *crs.Engine
+	// Geo, if set, looks up the country of each client first, passes it
+	// to the backend in geo.CountryHeader and in audit events, and blocks
+	// clients from countries that are not allowed.
+	Geo *geo.Filter
 	// RateLimiter, if set, limits the request rate of each client before
 	// requests are inspected.
 	RateLimiter *ratelimit.Limiter
@@ -87,10 +92,11 @@ type Config struct {
 
 // Middleware inspects each request before passing it to next. Requests that
 // match a signature or the CRS, requests whose body exceeds the inspection
-// limit, and requests over a rate limit are recorded in the audit log. In
-// ModeBlock they are then rejected with 403 Forbidden (or the status a CRS
-// rule asks for, such as 400 for an unparsable body), 413 Request Entity
-// Too Large and 429 Too Many Requests respectively; in ModeDetect they are
+// limit, requests over a rate limit and requests from countries that are not
+// allowed are recorded in the audit log. In ModeBlock they are then rejected
+// with 403 Forbidden (or the status a CRS rule asks for, such as 400 for an
+// unparsable body), 413 Request Entity Too Large, 429 Too Many Requests and
+// 403 Forbidden respectively; in ModeDetect they are
 // forwarded to next unchanged. Likewise, clients that look like bots are
 // challenged or blocked in ModeBlock and only logged in ModeDetect.
 func Middleware(next http.Handler, cfg Config) http.Handler {
@@ -100,7 +106,27 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 	}
 	detect := cfg.Mode == ModeDetect
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Rate limits come first: rejecting a flood is cheaper than
+		// Countries come first: blocked clients should not count towards
+		// rate limits or get challenges.
+		if cfg.Geo != nil {
+			d := cfg.Geo.Check(cfg.TrustedProxies.ClientIP(r))
+			// A client must not set the country itself.
+			r.Header.Del(geo.CountryHeader)
+			if d.Country != "" {
+				r.Header.Set(geo.CountryHeader, d.Country)
+			}
+			if !d.Allowed {
+				if d.First {
+					logGeoEvent(cfg, logger, r, d)
+				}
+				if !detect {
+					blockResponse(w, http.StatusForbidden, d.EventID)
+					return
+				}
+			}
+		}
+
+		// Rate limits come next: rejecting a flood is cheaper than
 		// inspecting it.
 		if cfg.RateLimiter != nil {
 			d := cfg.RateLimiter.Allow(r, cfg.TrustedProxies.ClientIP(r))
@@ -278,6 +304,14 @@ func logBotEvent(cfg Config, logger *slog.Logger, r *http.Request, d bot.Decisio
 	writeEvent(cfg, logger, e)
 }
 
+// logGeoEvent writes an audit event for the first blocked request of a
+// client in a minute.
+func logGeoEvent(cfg Config, logger *slog.Logger, r *http.Request, d geo.Decision) {
+	e := newEvent(cfg, r, d.EventID, "geo", nil)
+	e.Geo = &audit.Geo{List: d.List, Client: d.Client.String()}
+	writeEvent(cfg, logger, e)
+}
+
 // retryAfterSeconds rounds a wait up to whole seconds for Retry-After.
 func retryAfterSeconds(d time.Duration) int {
 	return max(1, int((d+time.Second-1)/time.Second))
@@ -322,7 +356,7 @@ func newEvent(cfg Config, r *http.Request, id, reason string, m *Match) *audit.E
 	if cfg.Mode == ModeDetect {
 		action = "detect"
 	}
-	return &audit.Event{
+	e := &audit.Event{
 		Time:       time.Now().UTC(),
 		ID:         id,
 		ClientIP:   cfg.TrustedProxies.ClientIP(r),
@@ -331,6 +365,11 @@ func newEvent(cfg Config, r *http.Request, id, reason string, m *Match) *audit.E
 		Reason:     reason,
 		Request:    requestSummary(r, m),
 	}
+	if cfg.Geo != nil {
+		// Set by Middleware, not by the client.
+		e.Country = r.Header.Get(geo.CountryHeader)
+	}
+	return e
 }
 
 func writeEvent(cfg Config, logger *slog.Logger, e *audit.Event) {

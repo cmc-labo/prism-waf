@@ -14,10 +14,11 @@ PrismWAF has two kinds of tests:
 | [Bot protection](bot-protection.md) | [`bot_test.go`, `captcha_test.go`, `browser_test.go`, `live_test.go`](#bot-protection) | [2026-11-13](#results) |
 | [OWASP Core Rule Set](crs.md) | [`crs_test.go`](#owasp-core-rule-set) | [2026-11-14](#results-1) |
 | [ACME expiry notifications](acme.md#expiry-notifications) | [`acme_test.go`, `acmeca_test.go`](#acme-expiry-notifications) | [2026-11-15](#results-2) |
+| [Geo filtering](geo-filtering.md) | [`geo_test.go`](#geo-filtering) | [2026-11-17](#results-3) |
 
 ```sh
 go test ./...                                      # unit tests
-go test -tags e2e ./e2e/                           # E2E tests, ~4 minutes
+go test -tags e2e ./e2e/                           # E2E tests, ~5 minutes
 go test -tags e2e -short ./e2e/                    # without the tests that wait for timers, ~35s
 go test -tags e2e -run 'TestCRS' ./e2e/            # E2E tests of one feature
 PRISMWAF_E2E_LIVE=1 go test -tags e2e -v ./e2e/   # also with real DNS and CAPTCHA providers
@@ -30,15 +31,17 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [Bot protection](#bot-protection)
 - [OWASP Core Rule Set](#owasp-core-rule-set)
 - [ACME expiry notifications](#acme-expiry-notifications)
+- [Geo filtering](#geo-filtering)
 
 ## Requirements
 
 | Tests | Needs | Without it |
 |-------|-------|------------|
-| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`, `TestACME*`, `TestNotify*`) | Go, `sh` | — |
+| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`, `TestACME*`, `TestNotify*`, `TestGeo*`) | Go, `sh` | — |
 | Browser tests (`TestBrowser*`) | Chromium or Chrome, Node.js 22 or later | Skipped |
 | Live tests (`TestLive*`) | `PRISMWAF_E2E_LIVE=1`, Internet access, a browser for `TestLiveCaptcha` | Skipped |
 | `TestLiveWebhook` | `PRISMWAF_E2E_WEBHOOK` (a webhook URL) and `PRISMWAF_E2E_WEBHOOK_FORMAT` | Skipped |
+| `TestGeoLiveDatabase` | `PRISMWAF_E2E_GEO_DB` (a real country database) | Skipped |
 
 The browser is found as `chromium`, `chromium-browser`, `google-chrome` or
 `google-chrome-stable` in `PATH`, or set with `PRISMWAF_E2E_CHROME`. The
@@ -472,3 +475,101 @@ The unit tests added with the fixes fail without them as well.
 - Rate limit responses of the CA, RSA certificates, and a real CA such as
   Let's Encrypt's staging environment.
 - A real chat service, unless `TestLiveWebhook` is run with a URL.
+
+## Geo filtering
+
+```sh
+go test -tags e2e -run 'TestGeo' -v ./e2e/
+```
+
+The tests write their own country databases in the MaxMind DB format with
+[`internal/geo/geotest`](../internal/geo/geotest), start prismwaf with
+`-geo-db` and `-trusted-proxies 127.0.0.1`, and send requests that name
+their client in `X-Forwarded-For`, from documentation addresses
+(`203.0.113.0/24`, `198.51.100.0/24`, `2001:db8::/32`) mapped to
+countries. Every request also claims `X-Prismwaf-Country: JP`, which
+prismwaf must replace. The databases hold records in the GeoLite2 format,
+GeoLite2 records with only a registered country, and IPinfo Lite records
+(`country_code`, with `country` as a name); prismwaf reads them with the
+same library as real databases, which also verifies them.
+
+### What is tested (`e2e/geo_test.go`)
+
+| Test | Checks |
+|------|--------|
+| `TestGeoAllow` | `-geo-allow jp,US,kr`: IPv4, IPv6 and IPv4-mapped clients from allowed countries reach the backend with their country in `X-Prismwaf-Country`, also from IPinfo's field; private, shared (`100.64.0.0/10`) and loopback addresses pass without a country. A country that is not allowed, a registered country only (`AU`) and an address that is not in the database (`XX`) get `403` with an event ID; the audit event has `reason` `geo`, the client, `country` and `geo.list`/`geo.client`. Further requests of a client, and of another address in the same IPv6 `/64`, get the same event ID and are logged only once |
+| `TestGeoBlock` | `-geo-block CN,xx` with `-geo-exempt` for an IPv4 and an IPv6 network: other countries pass, blocked countries and `XX` get `403`, exempt clients pass and the backend still gets their country |
+| `TestGeoDetectMode` | With `-mode detect`, a blocked country is forwarded with its country and logged with `action` `detect` |
+| `TestGeoLookupOnly` | `-geo-db` alone blocks nothing, logs nothing and passes the country, `XX` for unknown |
+| `TestGeoWithoutTrustedProxies` | Without `-trusted-proxies`, `X-Forwarded-For` is ignored: the loopback peer passes, and a reminder is logged at startup |
+| `TestGeoComesFirst` | With `-rate-limit 2/1m`, a blocked country gets `403` from the country check for every request, also with an attack payload, and is never rate limited; a signature event and a rate limit event of another client carry its `country` |
+| `TestGeoReload` | The database file is replaced by renaming, as `geoipupdate` does. A broken file is logged once as `cannot reload the GeoIP database; keeping the one in use` and the old database is kept; a valid file is loaded at the next check, within a minute, and the new country decides. Skipped with `-short` |
+| `TestGeoStartup` | prismwaf refuses to start with a missing file, a CSV file, an ASN database, `UK` (with a hint to `GB`), a country name, `-geo-allow` with `-geo-block`, the options without `-geo-db`, `-geo-exempt` without a list, or an invalid exemption. An outdated database and an IPv4-only database are used with a warning; IPv6 clients are then `XX` |
+| `TestGeoLiveDatabase` | With `PRISMWAF_E2E_GEO_DB`, a real database: `8.8.8.8` is `US`, a documentation address is `XX` |
+
+`TestGeoLiveDatabase` needs a database file, e.g. from DB-IP:
+
+```sh
+curl -fsSL https://download.db-ip.com/free/dbip-country-lite-2026-11.mmdb.gz | gunzip > /tmp/country.mmdb
+PRISMWAF_E2E_GEO_DB=/tmp/country.mmdb go test -tags e2e -run TestGeoLiveDatabase -v ./e2e/
+```
+
+The unit tests in `internal/geo` cover country codes, the lookup fields,
+invalid files (empty, text, truncated, corrupt, ASN), the age warning,
+reloading, every kind of private address, exemptions and the
+once-a-minute audit events with a fixed clock.
+
+### Results
+
+Run on 2026-11-17 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestGeoAllow` | Pass | 0.2s |
+| `TestGeoBlock` | Pass | 0.0s |
+| `TestGeoDetectMode` | Pass | 0.0s |
+| `TestGeoLookupOnly` | Pass | 0.0s |
+| `TestGeoWithoutTrustedProxies` | Pass | 0.0s |
+| `TestGeoComesFirst` | Pass | 0.2s |
+| `TestGeoReload` | Pass | 120s |
+| `TestGeoStartup` | Pass | 0.1s |
+| `TestGeoLiveDatabase` | Pass with DB-IP IP to Country Lite 2026-11 | 0.1s |
+
+With the real DB-IP database (8.5 MB), prismwaf loaded and verified it in
+about 70 ms, it used about 8 MB of memory, and a check took about 0.4 µs.
+A reload took effect 60 seconds after the file was replaced (one check).
+
+**Mutation check.** These changes to the code were each caught by the
+tests, and the code was restored:
+
+| Change | Failing E2E tests | Failing unit tests |
+|--------|--------------:|------:|
+| The client's `X-Prismwaf-Country` kept | 3 | 1 |
+| Private addresses looked up (and blocked as `XX`) | 2 | 2 |
+| `-geo-exempt` ignored | 1 | 1 |
+| No `registered_country` fallback | 2 | 2 |
+| No IPinfo `country_code` | 1 | 1 |
+| Unknown addresses without `XX` | 4 | 2 |
+| Every blocked request logged | 2 | 2 |
+| IPv6 clients counted per address instead of `/64` | 3 | 2 |
+| Blocking in detection mode | 1 | 1 |
+| No `country` in other audit events | 5 | 2 |
+| Rate limits checked before the country | 1 | 3 |
+| No check that the database has countries | 1 | 1 |
+| Database not verified (truncated and corrupt files accepted) | 0 | 1 |
+| Legacy codes such as `UK` accepted | 1 | 2 |
+| Database never reloaded | 1 | 0 |
+| A broken file replacing the database in use | 1 | 1 |
+
+**Problems found and fixed during development:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| IPinfo Lite records have `country` as a name, not as a map with `iso_code`. Decoding a whole record failed on them, so every IPinfo address was unknown (`XX`) | Unit test `TestCountry` | Each field is read on its own, and a field of another type is skipped |
+
+**Not covered:**
+
+- Real MaxMind (GeoLite2, GeoIP2) and IPinfo files, which need an account;
+  their record formats are covered by the test databases.
+- `geoipupdate` itself, and a file replaced in place (not renamed) while
+  prismwaf reads it; the unit tests cover truncated files.

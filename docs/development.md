@@ -21,6 +21,7 @@ internal/normalize/  decoding and canonicalization of request data
 internal/waf/        signatures, request inspection, JSON/XML body parsing
 internal/crs/        OWASP CRS v4 with the Coraza engine
 internal/ratelimit/  request rate limits per client and path
+internal/geo/        country lookup in MaxMind DB files, allow and block lists (geotest/: test databases)
 internal/notify/     notifications to administrators (webhooks, commands)
 internal/bot/        bot score, categories, DNS verification of bots, proof-of-work and CAPTCHA challenges
 e2e/                 end-to-end tests of the binary (build tag e2e)

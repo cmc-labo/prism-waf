@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
+	"github.com/cmc-labo/prism-waf/internal/geo"
+	"github.com/cmc-labo/prism-waf/internal/geo/geotest"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
@@ -512,5 +515,133 @@ func solvePoW(token string) string {
 		if bits.LeadingZeros32(uint32(h[0])<<24|uint32(h[1])<<16|uint32(h[2])<<8|uint32(h[3])) >= d {
 			return strconv.Itoa(n)
 		}
+	}
+}
+
+func geoFilter(t *testing.T, cfg geo.Config) *geo.Filter {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "country.mmdb")
+	db := geotest.DB{Networks: map[string]any{
+		"8.8.8.0/24":      "US",
+		"203.0.113.0/24":  "JP",
+		"198.51.100.0/24": "CN",
+		"2001:db8:2::/48": "CN",
+	}}
+	if err := db.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if cfg.DB, err = geo.OpenDB(path, nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := geo.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func TestGeo(t *testing.T) {
+	for _, mode := range []Mode{ModeBlock, ModeDetect} {
+		t.Run(string(mode), func(t *testing.T) {
+			tp, _ := ParseTrustedProxies("10.0.0.0/8")
+			var buf bytes.Buffer
+			var countries []string
+			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				countries = append(countries, strings.Join(r.Header.Values(geo.CountryHeader), ","))
+			}), Config{
+				Inspector:      mustInspector(t, 0),
+				Geo:            geoFilter(t, geo.Config{Allow: []string{"JP", "US"}}),
+				Mode:           mode,
+				Audit:          audit.New(&buf),
+				TrustedProxies: tp,
+			})
+			get := func(client string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest("GET", "/", nil)
+				r.RemoteAddr = "10.0.0.5:4321"
+				r.Header.Set("X-Forwarded-For", client)
+				// Clients cannot choose their country.
+				r.Header.Set(geo.CountryHeader, "JP")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, r)
+				return rec
+			}
+			for _, client := range []string{"203.0.113.7", "8.8.8.8", "192.168.1.10"} {
+				if rec := get(client); rec.Code != http.StatusOK {
+					t.Errorf("%s: status %d", client, rec.Code)
+				}
+			}
+			blocked := []*httptest.ResponseRecorder{get("198.51.100.7"), get("198.51.100.7"), get("2001:db8:2::1"), get("9.9.9.9")}
+
+			events := decodeEvents(t, &buf)
+			if len(events) != 3 {
+				t.Fatalf("got %d events, want one per client", len(events))
+			}
+			action := map[Mode]string{ModeBlock: "block", ModeDetect: "detect"}[mode]
+			for i, want := range []struct{ client, country, key string }{
+				{"198.51.100.7", "CN", "198.51.100.7/32"},
+				{"2001:db8:2::1", "CN", "2001:db8:2::/64"},
+				{"9.9.9.9", "XX", "9.9.9.9/32"},
+			} {
+				e := events[i]
+				if e.Reason != "geo" || e.Action != action || e.ClientIP != want.client || e.Country != want.country ||
+					e.Geo == nil || e.Geo.List != "allow" || e.Geo.Client != want.key {
+					t.Errorf("event %d = %+v, geo %+v", i, e, e.Geo)
+				}
+			}
+
+			if mode == ModeDetect {
+				if got := strings.Join(countries, " "); got != "JP US  CN CN CN XX" {
+					t.Errorf("countries passed on: %q", got)
+				}
+				return
+			}
+			if got := strings.Join(countries, " "); got != "JP US " {
+				t.Errorf("countries passed on: %q", got)
+			}
+			for i, rec := range blocked {
+				if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "Event ID: ") {
+					t.Errorf("blocked %d: status %d, body %q", i, rec.Code, rec.Body)
+				}
+			}
+			if !strings.Contains(blocked[1].Body.String(), events[0].ID) {
+				t.Errorf("the second request has another event ID: %q", blocked[1].Body)
+			}
+		})
+	}
+}
+
+func TestGeoBeforeRateLimit(t *testing.T) {
+	limit, window, _ := ratelimit.ParseRate("1/1m")
+	limiter, _ := ratelimit.New(ratelimit.Config{Rules: []ratelimit.Rule{{Limit: limit, Window: window}}})
+	tp, _ := ParseTrustedProxies("10.0.0.0/8")
+	cfg := Config{Geo: geoFilter(t, geo.Config{Block: []string{"CN"}}), RateLimiter: limiter, TrustedProxies: tp}
+	get := func(client, target string) (*httptest.ResponseRecorder, []audit.Event) {
+		r := httptest.NewRequest("GET", target, nil)
+		r.RemoteAddr = "10.0.0.5:4321"
+		r.Header.Set("X-Forwarded-For", client)
+		return serveWithAudit(t, cfg, r)
+	}
+	// Blocked countries do not use up the allowance of their address.
+	for range 3 {
+		if rec, events := get("198.51.100.7", "/"); rec.Code != http.StatusForbidden || len(events) > 1 || len(events) == 1 && events[0].Reason != "geo" {
+			t.Fatalf("status %d, events %+v", rec.Code, events)
+		}
+	}
+	// Other events carry the country.
+	get("203.0.113.7", "/")
+	rec, events := get("203.0.113.7", "/")
+	if rec.Code != http.StatusTooManyRequests || len(events) != 1 || events[0].Country != "JP" {
+		t.Errorf("status %d, events %+v", rec.Code, events)
+	}
+	rec, events = get("8.8.8.8", "/items?id=1+UNION+SELECT+password+FROM+users")
+	if rec.Code != http.StatusForbidden || len(events) != 1 || events[0].Reason != "signature" || events[0].Country != "US" {
+		t.Errorf("status %d, events %+v", rec.Code, events)
+	}
+	// Without a database, a client's header is not taken as its country.
+	r := httptest.NewRequest("GET", "/items?id=1+UNION+SELECT+password+FROM+users", nil)
+	r.Header.Set(geo.CountryHeader, "JP")
+	if _, events := serveWithAudit(t, Config{}, r); len(events) != 1 || events[0].Country != "" {
+		t.Errorf("events %+v", events)
 	}
 }

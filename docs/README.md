@@ -6,10 +6,11 @@
 | [Signature detection](detection.md) | The built-in signatures, normalization of encoded payloads, JSON and XML bodies, the body size limit |
 | [OWASP Core Rule Set](crs.md) | `-engine`, paranoia level, anomaly threshold, rule exclusions, tested use cases, performance |
 | [Rate limiting](rate-limiting.md) | Limits per client and per path, bursts, IPv6, proxies, exemptions, tuning in detection mode |
+| [Geo filtering](geo-filtering.md) | Allowing or blocking countries, GeoIP databases and their updates, the country header for the backend, rollout in detection mode |
 | [Bot protection](bot-protection.md) | Bot score, categories, verified search engines, proof-of-work and CAPTCHA challenges, clearance cookies, rollout in detection mode |
 | [Modes and audit log](audit-log.md) | Block and detection mode, the audit event format, client IP behind proxies |
 | [Load balancing](load-balancing.md) | Several backends, balancing policies, failover, health checks |
 | [HTTPS](https.md) | TLS termination, SNI, HSTS, mutual TLS, HTTPS backends |
 | [Automatic certificates](acme.md) | ACME/Let's Encrypt: requirements, rate limits, staging, expiry notifications, systemd, troubleshooting |
-| [Testing](testing.md) | Unit and end-to-end tests of bot protection, the CRS and ACME expiry notifications (with a fake ACME CA), browser and live tests, test results |
+| [Testing](testing.md) | Unit and end-to-end tests of bot protection, the CRS, ACME expiry notifications (with a fake ACME CA) and geo filtering, browser and live tests, test results |
 | [Development](development.md) | Tests, benchmarks, building, project layout |

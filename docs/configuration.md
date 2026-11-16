@@ -68,6 +68,18 @@ See [Audit log](audit-log.md#audit-log) and
 A client is an IP address, or a `/64` network for IPv6. See
 [Rate limiting](rate-limiting.md).
 
+## Geo filtering
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-geo-db` | (none) | MaxMind DB file to look up the country of clients in (GeoLite2/GeoIP2 Country or City, DB-IP, IPinfo Lite); reloaded when it changes |
+| `-geo-allow` | (none) | Comma-separated ISO 3166-1 country codes to allow, e.g. `JP,US`; other countries get `403` |
+| `-geo-block` | (none) | Comma-separated country codes to block with `403`, e.g. `CN,RU` |
+| `-geo-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never blocked by country |
+
+`XX` is the code for public addresses that the database has no country
+for. Private addresses always pass. See [Geo filtering](geo-filtering.md).
+
 ## Bot protection
 
 | Flag | Default | Description |
@@ -130,6 +142,7 @@ See [HTTPS](https.md) and [Automatic certificates](acme.md).
 | `SIGHUP` | Reload the TLS certificates from `-tls-cert`/`-tls-key` without dropping connections. Only handled with `-tls-cert`; otherwise it terminates the process |
 | `SIGINT`, `SIGTERM` | Shut down gracefully: stop accepting connections and wait up to 10 seconds for requests in progress |
 
+The `-geo-db` file is checked every minute and reloaded when it changes.
 Rule files (`-crs-rules-before`, `-crs-rules-after`) and other settings are
 read only at startup.
 

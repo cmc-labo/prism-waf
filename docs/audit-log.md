@@ -65,7 +65,8 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `id` | Event ID. In block mode it is also returned in the `403`/`413`/`429` response body and on the challenge page, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
 | `action` | `block`, `challenge` (a [bot challenge](bot-protection.md) was served), or `detect` in detection mode. |
-| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit` or `bot`. |
+| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit`, `bot` or `geo`. |
+| `country` | With `-geo-db`: the client's country, e.g. `JP`, or `XX` if unknown. Absent for private addresses. See [Geo filtering](geo-filtering.md). |
 | `rule` | The signature that matched. For the CRS, the most severe matched rule, e.g. `{"id": "942100", "category": "sqli"}`, or the rule that rejected the request on its own (e.g. 200002). |
 | `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
 | `match.data` | The text the signature matched, after normalization. |
@@ -74,6 +75,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `crs` | CRS details: `anomaly_score`, `deciding_rule` (usually 949110, "anomaly score exceeded") and `rules`, every matched rule with its `id`, `message`, `severity`, `variable` and matched `value`. |
 | `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
 | `bot` | Why the client looks like a [bot](bot-protection.md#responses-and-audit-events): `score`, `signals`, `category`, `name` and `verified` of a known bot, `challenge` (`pow` or `captcha`) and `client`. Logged for the first challenged or blocked request of a client, then at most once a minute. |
+| `geo` | Why the client was [blocked by its country](geo-filtering.md#responses-and-audit-events): `list` (`allow` or `block`) and `client`. Logged for the first blocked request of a client, then at most once a minute. |
 | `request.headers` | Request headers. `Authorization`, `Cookie` and other credential headers are `[REDACTED]`, unless the attack was found in that header. |
 
 The response to the client only contains the event ID; rule details are not

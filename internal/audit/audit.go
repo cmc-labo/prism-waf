@@ -26,12 +26,16 @@ type Event struct {
 	ClientIP string `json:"client_ip"`
 	// RemoteAddr is the address of the TCP peer.
 	RemoteAddr string `json:"remote_addr"`
+	// Country is the client's ISO 3166-1 country code, "XX" if unknown,
+	// when a GeoIP database is configured. It is absent for private
+	// addresses.
+	Country string `json:"country,omitempty"`
 	// Action is what PrismWAF did: "block" (rejected), "challenge" (asked
 	// to prove it is a browser) or "detect" (only logged and forwarded, in
 	// detection mode).
 	Action string `json:"action"`
 	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS),
-	// "body_too_large", "rate_limit" or "bot".
+	// "body_too_large", "rate_limit", "bot" or "geo".
 	Reason string `json:"reason"`
 	Rule   *Rule  `json:"rule,omitempty"`
 	Match  *Match `json:"match,omitempty"`
@@ -40,8 +44,22 @@ type Event struct {
 	// RateLimit holds the details of an exceeded rate limit.
 	RateLimit *RateLimit `json:"rate_limit,omitempty"`
 	// Bot holds the details of a client that looks like a bot.
-	Bot     *Bot    `json:"bot,omitempty"`
+	Bot *Bot `json:"bot,omitempty"`
+	// Geo holds the details of a client blocked by its country.
+	Geo     *Geo    `json:"geo,omitempty"`
 	Request Request `json:"request"`
+}
+
+// Geo describes a client blocked by its country. Only the first blocked
+// request of a client in a minute is logged; the following ones share its
+// event ID.
+type Geo struct {
+	// List is "allow" if the country is not in the allowed countries, or
+	// "block" if it is in the blocked countries.
+	List string `json:"list"`
+	// Client is the address the event is counted for: the client IP, or
+	// its /64 network for IPv6.
+	Client string `json:"client"`
 }
 
 // Bot describes why a client was considered a bot. Only the first

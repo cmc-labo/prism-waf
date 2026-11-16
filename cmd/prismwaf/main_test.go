@@ -71,6 +71,17 @@ func TestConfigValidate(t *testing.T) {
 		{"rate limit exemption without limits", config{rateLimitExempt: "10.0.0.0/8"}, true},
 		{"negative max clients", config{rateLimit: "300/1m", rateLimitMaxClients: -1}, true},
 
+		{"geo lookup only", config{geoDB: "country.mmdb"}, false},
+		{"geo allow", config{geoDB: "country.mmdb", geoAllow: "jp, US,XX", geoExempt: "198.51.100.0/24"}, false},
+		{"geo block", config{geoDB: "country.mmdb", geoBlock: "CN,RU"}, false},
+		{"geo allow without database", config{geoAllow: "JP"}, true},
+		{"geo exempt without database", config{geoExempt: "10.0.0.0/8"}, true},
+		{"geo allow and block", config{geoDB: "country.mmdb", geoAllow: "JP", geoBlock: "CN"}, true},
+		{"geo exempt without countries", config{geoDB: "country.mmdb", geoExempt: "10.0.0.0/8"}, true},
+		{"invalid geo country", config{geoDB: "country.mmdb", geoBlock: "UK"}, true},
+		{"invalid geo allowed country", config{geoDB: "country.mmdb", geoAllow: "Japan"}, true},
+		{"invalid geo exemption", config{geoDB: "country.mmdb", geoBlock: "CN", geoExempt: "office"}, true},
+
 		{"bot protection", config{botProtection: true, botChallengeScore: 50, botDifficulty: 18, botClearanceTTL: time.Hour}, false},
 		{"bot protection with paths", config{botProtection: true, botPaths: stringList{"/articles/*"}, botExemptPaths: stringList{"/api/*"}, botExempt: "10.0.0.0/8", botBlockScore: 90}, false},
 		{"bot options without bot protection", config{botExemptPaths: stringList{"/api/*"}}, true},
