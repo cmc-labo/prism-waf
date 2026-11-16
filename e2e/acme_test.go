@@ -448,8 +448,12 @@ func TestACMENotifyUnavailable(t *testing.T) {
 	for i, domain := range []string{"a.example", "b.example"} {
 		for _, n := range []notification{got[i], gotCmd[i]} {
 			checkEvent(t, n, "certificate_unavailable", "critical")
-			if n.Domain != domain || n.Failures != 1 || n.Error == "" || n.NotAfter != nil {
+			if n.Domain != domain || n.Failures != 1 || n.NotAfter != nil {
 				t.Errorf("%s: %+v", domain, n)
+			}
+			// The CA's reason, not only autocert's generic error.
+			if !strings.Contains(n.Error, "no viable challenge type found; validation: tls-alpn-01: urn:ietf:params:acme:error:connection: "+domain+": Timeout during connect") {
+				t.Errorf("%s: error %q", domain, n.Error)
 			}
 			// The next attempt is 10 minutes after the failure.
 			if n.RetryAt == nil || n.RetryAt.Sub(start) < 10*time.Minute-time.Second || n.RetryAt.Sub(start) > 10*time.Minute+5*time.Second {

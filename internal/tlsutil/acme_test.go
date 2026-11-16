@@ -765,8 +765,10 @@ func TestACMENotifiesExpiry(t *testing.T) {
 func TestACMENotifiesMissingCertificates(t *testing.T) {
 	var failing atomic.Bool
 	failing.Store(true)
+	var a *ACMEManager
 	a, now, _ := fakeACME(t, func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if failing.Load() && hello.ServerName == "www.example.com" {
+			a.recordValidation("www.example.com", "tls-alpn-01", problem{Type: "urn:ietf:params:acme:error:connection", Detail: "Timeout during connect"})
 			return nil, errors.New("acme/autocert: no viable challenge type found")
 		}
 		return leafCert(t, hello.ServerName, time.Now(), time.Now().Add(90*24*time.Hour)), nil
@@ -780,7 +782,7 @@ func TestACMENotifiesMissingCertificates(t *testing.T) {
 		t.Fatalf("events: %v", got)
 	}
 	if e := got[0]; e.Severity != notify.SeverityCritical || e.Failures != 1 || e.RetryAt == nil ||
-		!e.RetryAt.Equal(now.Add(acmeMinBackoff)) || !strings.Contains(e.Error, "no viable challenge") {
+		!e.RetryAt.Equal(now.Add(acmeMinBackoff)) || !strings.HasSuffix(e.Error, "no viable challenge type found; validation: tls-alpn-01: urn:ietf:params:acme:error:connection: Timeout during connect") {
 		t.Errorf("event = %+v", e)
 	}
 	// Further failures and checks during the retry delay are not notified

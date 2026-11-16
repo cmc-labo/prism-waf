@@ -110,14 +110,15 @@ type ACMEManager struct {
 
 // certStatus tracks the failures and log state of one certificate.
 type certStatus struct {
-	failures  int
-	failedAt  time.Time
-	retryAt   time.Time
-	lastErr   error
-	announced bool      // its details were logged
-	checked   bool      // its expiry was checked
-	warnedAt  time.Time // last expiry warning
-	expired   bool      // the last expiry warning was that it expired
+	failures   int
+	failedAt   time.Time
+	retryAt    time.Time
+	lastErr    error
+	validation string    // the CA's reasons for the last failure, if any
+	announced  bool      // its details were logged
+	checked    bool      // its expiry was checked
+	warnedAt   time.Time // last expiry warning
+	expired    bool      // the last expiry warning was that it expired
 
 	alert      string    // the event of the current problem notified, if any
 	notifiedAt time.Time // when it was last notified
@@ -306,6 +307,7 @@ func (a *ACMEManager) failed(key, domain string, start time.Time, err error) {
 		}
 	}
 	delete(a.validations, domain)
+	s.validation = strings.Join(details, "; ")
 	if rateLimited {
 		problemType = ae.ProblemType
 	} else if ae != nil && problemType == "" {
@@ -313,8 +315,8 @@ func (a *ACMEManager) failed(key, domain string, start time.Time, err error) {
 	}
 
 	args := []any{"domain", domain, "certificate", key, "error", err}
-	if len(details) > 0 {
-		args = append(args, "validation", strings.Join(details, "; "))
+	if s.validation != "" {
+		args = append(args, "validation", s.validation)
 	}
 	if hint := acmeHint(problemType, err); hint != "" {
 		args = append(args, "hint", hint)
@@ -480,16 +482,21 @@ func (a *ACMEManager) checkExpiry(domain string, leaf *x509.Certificate) {
 func (a *ACMEManager) unavailable(domain string, err error) {
 	a.mu.Lock()
 	s := a.status(domain)
-	failures, retryAt := s.failures, s.retryAt.UTC().Truncate(time.Second)
+	failures, retryAt, validation := s.failures, s.retryAt.UTC().Truncate(time.Second), s.validation
 	a.mu.Unlock()
 	if failures == 0 {
 		return // not a failed request
+	}
+	// autocert only reports that no challenge succeeded; add the CA's reasons.
+	msg := err.Error()
+	if validation != "" {
+		msg += "; validation: " + validation
 	}
 	a.raise(domain, notify.Event{
 		Event:    eventUnavailable,
 		Severity: notify.SeverityCritical,
 		Domain:   domain,
-		Error:    err.Error(),
+		Error:    msg,
 		Failures: failures,
 		RetryAt:  &retryAt,
 		Message: fmt.Sprintf("There is no certificate for %s: %s; HTTPS connections to it fail. Next attempt at %s. See the ACME errors in the PrismWAF log.",

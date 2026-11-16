@@ -444,7 +444,7 @@ The `json` format:
 | `text` | `message` with host and severity, as sent to chat services |
 | `domain` | The domain of the certificate |
 | `issuer`, `serial`, `not_after` | The certificate, for `certificate_expiring`, `certificate_expired` and `certificate_recovered` |
-| `error`, `failures`, `retry_at` | For `certificate_unavailable`: the last error, the number of failed requests in a row and the next attempt |
+| `error`, `failures`, `retry_at` | For `certificate_unavailable`: the last error, the number of failed requests in a row and the next attempt. When the CA could not validate the domain, `error` ends with `; validation:` and the CA's reasons, as in the `validation` field of the log |
 
 A response other than `2xx` counts as a failure. Each notification is
 tried three times (immediately, after 10 seconds and after another

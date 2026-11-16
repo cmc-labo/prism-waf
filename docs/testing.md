@@ -376,7 +376,7 @@ command (a shell script):
 | Test | Checks |
 |------|--------|
 | `TestACMECertificate` | A certificate is obtained with TLS-ALPN-01, and with HTTP-01 when the CA offers only that; it is served with its chain and verifies against the CA, HTTPS requests reach the backend, other requests to `-http-redirect` get `308` to HTTPS. No notification and no warning is logged for a valid certificate. After a restart, the cached certificate is served without a new order |
-| `TestACMENotifyUnavailable` | The CA cannot validate two domains: each gets `certificate_unavailable` (`critical`) at the webhook (`json`) and from the command, with `failures` 1, `retry_at` 10 minutes later, the error, the message and `text`; the command gets the event on standard input (without `text`) and in `PRISMWAF_*` variables. The CA's reason is logged as `ACME validation failed` with a hint. Client handshakes fail and do not make prismwaf contact the CA again during the backoff; nothing is notified twice |
+| `TestACMENotifyUnavailable` | The CA cannot validate two domains: each gets `certificate_unavailable` (`critical`) at the webhook (`json`) and from the command, with `failures` 1, `retry_at` 10 minutes later, the error with the CA's reason (`Timeout during connect`), the message and `text`; the command gets the event on standard input (without `text`) and in `PRISMWAF_*` variables. The CA's reason is logged as `ACME validation failed` with a hint. Client handshakes fail and do not make prismwaf contact the CA again during the backoff; nothing is notified twice |
 | `TestACMENotifyCommandIsNotInjected` | The CA rejects the order with a detail containing `$(touch …)`, backticks and `;`. A command that uses `$PRISMWAF_ERROR` and `$PRISMWAF_MESSAGE` (also unquoted) gets the detail as text, and nothing in it is run. The `slack` webhook gets only `{"text": …}` |
 | `TestACMENotifyExpiring` | A cached certificate with 10 days left of 90 and a CA that cannot validate: renewal is attempted at once and fails, without a notification; at the next check, a minute later, `certificate_expiring` (`warning`) with the issuer, serial and `not_after` of the certificate, as `{"content": …}` to the `discord` webhook and to the command (`PRISMWAF_NOT_AFTER`). The old certificate keeps being served |
 | `TestACMERenewalAtStartup` | The same certificate and a CA that works: it is renewed at once, and nothing is notified or warned, also at the next check |
@@ -438,6 +438,7 @@ tests, and the code was restored:
 | No retries | 2 |
 | A worse problem not notified at once | 1 |
 | The `slack` format sending the full event | 3 |
+| The CA's reason left out of the notification's `error` | 1 |
 
 The unit tests added with the fixes fail without them as well.
 
@@ -449,14 +450,10 @@ The unit tests added with the fixes fail without them as well.
 | Notifications were sent to the webhook and the command one after another. A webhook that did not answer delayed the command by up to about 100 seconds (three 10-second timeouts plus 70 seconds of retries) per notification, and the notifications behind it as well | `TestNotifyTargetsAreIndependent` | Each target has its own queue and worker |
 | A certificate that expired less than an hour after the last `ACME certificate not renewed yet` warning was not logged as `ACME certificate expired` until that hour had passed, although it was notified at once | `TestACMENotifyExpired` | Expiry is logged at once, then hourly |
 | `-acme-notify-webhook-format` without `-acme-notify-webhook` (e.g. with only a command) was silently ignored | `TestNotifyInvalidFlags` | It is now an error, like other options without the option they belong to |
+| When the CA could not validate a domain, the notification's `error` was only the ACME library's generic `no viable challenge type found`; the CA's reason (e.g. `Timeout during connect`) was only in the log | `TestACMENotifyUnavailable` | `error` ends with `; validation:` and the CA's reasons |
 
 **Findings that need no change:**
 
-- For a failed validation, the notification's `error` is the ACME
-  library's generic `no viable challenge type found`; the CA's reason
-  (e.g. `Timeout during connect`) is only in the log (`ACME validation
-  failed`), which the message refers to. A rejected order, by contrast,
-  carries the CA's detail in `error`.
 - Text from the CA reaches a command only through the environment and
   standard input, never the command line, so shell syntax in it is not
   run, even when the command uses the variable unquoted.
