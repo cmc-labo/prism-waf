@@ -15,6 +15,7 @@ PrismWAF has two kinds of tests:
 | [OWASP Core Rule Set](crs.md) | [`crs_test.go`](#owasp-core-rule-set) | [2026-11-14](#results-1) |
 | [ACME expiry notifications](acme.md#expiry-notifications) | [`acme_test.go`, `acmeca_test.go`](#acme-expiry-notifications) | [2026-11-15](#results-2) |
 | [Geo filtering](geo-filtering.md) | [`geo_test.go`](#geo-filtering) | [2026-11-17](#results-3) |
+| [API protection](api-protection.md) | [`api_test.go`, `grpc_test.go`](#api-protection) | [2026-11-18](#results-4) |
 
 ```sh
 go test ./...                                      # unit tests
@@ -32,12 +33,13 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [OWASP Core Rule Set](#owasp-core-rule-set)
 - [ACME expiry notifications](#acme-expiry-notifications)
 - [Geo filtering](#geo-filtering)
+- [API protection](#api-protection)
 
 ## Requirements
 
 | Tests | Needs | Without it |
 |-------|-------|------------|
-| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`, `TestACME*`, `TestNotify*`, `TestGeo*`) | Go, `sh` | — |
+| HTTP tests (`TestBot*`, `TestCaptcha*`, `TestCRS*`, `TestACME*`, `TestNotify*`, `TestGeo*`, `TestGraphQL*`, `TestOpenAPI*`, `TestGRPC*`) | Go, `sh` | — |
 | Browser tests (`TestBrowser*`) | Chromium or Chrome, Node.js 22 or later | Skipped |
 | Live tests (`TestLive*`) | `PRISMWAF_E2E_LIVE=1`, Internet access, a browser for `TestLiveCaptcha` | Skipped |
 | `TestLiveWebhook` | `PRISMWAF_E2E_WEBHOOK` (a webhook URL) and `PRISMWAF_E2E_WEBHOOK_FORMAT` | Skipped |
@@ -573,3 +575,147 @@ tests, and the code was restored:
   their record formats are covered by the test databases.
 - `geoipupdate` itself, and a file replaced in place (not renamed) while
   prismwaf reads it; the unit tests cover truncated files.
+
+## API protection
+
+```sh
+go test -tags e2e -run 'TestGRPC|TestGraphQL|TestOpenAPI' -v ./e2e/
+```
+
+The gRPC tests run a real gRPC server and client
+([grpc-go](https://github.com/grpc/grpc-go), test dependency only) with a
+service that has every kind of call: unary, server streaming, client
+streaming and bidirectional, in which the server answers each message at
+once and the client waits for the answer before it sends the next one. The
+service is described by a descriptor set that the test builds, as `protoc`
+would. The server records every message it receives, so the tests check
+that rejected messages never reach it. The gRPC-Web test uses an HTTP/1.1
+backend that speaks gRPC-Web.
+
+### What is tested (`e2e/grpc_test.go`, `e2e/api_test.go`)
+
+| Test | Checks |
+|------|--------|
+| `TestGRPCUnary` | Over h2c on both sides: a clean call passes with its metadata; an attack in a field, a nested message and a repeated field gets `PermissionDenied` with the event ID, and the audit event has `match.location` `grpc` and the field (`[0].1`, `[0].2.1`, `[0].3`); an attack in the metadata is found in the header |
+| `TestGRPCStreaming` | Server streaming; bidirectional streaming message by message, where an attack after the response has started ends the call with `PermissionDenied` in the trailers; client streaming with an attack in the third message. No attack reaches the backend, and blocked calls are not logged as backend errors |
+| `TestGRPCDescriptor` | `-grpc-descriptor`: fields named in matches (`[0].filter.name`, `[0].tags[1]`), an unknown method and a message with a wrong wire type rejected (`unknown_method`, `invalid_message`), health checks allowed |
+| `TestGRPCReflection` | Server reflection blocked by default, allowed with `-grpc-reflection` |
+| `TestGRPCCompression` | gzip-compressed calls inspected; a compressed message of 100 KB of spaces (a "zip bomb" of about 130 bytes) and an uncompressed message over `-max-body` get `ResourceExhausted` |
+| `TestGRPCModes` | Detection mode forwards and logs; a rate limit gives `ResourceExhausted`; a bot challenge gives `PermissionDenied` |
+| `TestGRPCEngines` | Over HTTPS (HTTP/2 with TLS) with `-engine both`: a clean call passes the CRS, an attack in a message and a Shellshock payload in the metadata are blocked; `-engine crs` alone lets clean calls through |
+| `TestGRPCWeb` | gRPC-Web, binary and Base64 (`grpc-web-text`), over HTTP/1.1: clean calls pass; an attack gets `grpc-status` 7 with the event ID |
+| `TestGraphQL` | Limits of depth, aliases (alias batching of `login`) and batches, introspection and syntax errors give a GraphQL error with the event ID and `api` details; `GET`, `application/graphql` and persisted queries pass; an attack in an argument is found as `user(name)`, also in a `GET`; other paths are not affected |
+| `TestGraphQLSchema` | `-graphql-schema`: unknown fields, missing arguments and unknown mutations rejected (`schema`); introspection allowed with `-graphql-introspection`; `application/graphql` passes the CRS |
+| `TestGraphQLStartup` | Options without `-graphql-path`, an invalid path, a zero limit and an invalid schema are rejected at startup |
+| `TestOpenAPI` | An OpenAPI 3.1 document with a base path: valid requests and the web site outside the API pass; an unknown path, a method, path and query parameters, missing credentials, an extra property (mass assignment), a negative price and a path variant are rejected with the operation in the event; detection mode only logs |
+| `TestOpenAPIStartup` | Swagger 2.0, an invalid document and a missing file are rejected at startup |
+
+The unit tests in `internal/openapi`, `internal/graphql` and
+`internal/grpc` cover each check with more cases: OpenAPI 3.0 and 3.1
+features, the router (conflicting parameter names, literal segments,
+`HEAD`, CORS preflight), unsupported features and wrong examples; GraphQL
+request forms, fragment cycles, a fragment bomb of 2^41 fields and the
+deepest query that fits in the body limit; gRPC streams read in chunks of
+every size, held-back bytes, decompression limits, `grpc-web-text` with
+padding inside the stream, and protobuf decoding with and without a
+schema, including a payload hidden in fields that decode as a message.
+
+### Results
+
+Run on 2026-11-18 on Linux (aarch64, 2 vCPUs) with Go 1.25.0 and grpc-go
+1.84.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestGRPCUnary` | Pass | 0.05s |
+| `TestGRPCStreaming` | Pass | 0.03s |
+| `TestGRPCDescriptor` | Pass | 0.03s |
+| `TestGRPCReflection` | Pass | 0.05s |
+| `TestGRPCCompression` | Pass | 0.03s |
+| `TestGRPCModes` | Pass | 0.08s |
+| `TestGRPCEngines` | Pass | 0.18s |
+| `TestGRPCWeb` | Pass | 0.02s |
+| `TestGraphQL` | Pass | 0.04s |
+| `TestGraphQLSchema` | Pass | 0.19s |
+| `TestGraphQLStartup` | Pass | 0.12s |
+| `TestOpenAPI` | Pass | 0.11s |
+| `TestOpenAPIStartup` | Pass | 0.10s |
+
+The tests also passed three times with a prismwaf binary built with the
+race detector (`GOFLAGS=-race GORACE=halt_on_error=1`).
+
+**Before API protection**, the same gRPC tests failed against the
+previous version: calls over h2c failed to connect, calls over TLS got
+`502` because the backend was called over HTTP/1.1, bidirectional calls
+hung until their deadline, blocked gRPC-Web calls got a text `403` that
+clients cannot read, and an attack in a `grpc-web-text` call reached the
+backend.
+
+**Real documents.** Loaded and checked with requests, outside the E2E
+tests:
+
+| Document | Result |
+|----------|--------|
+| GitHub REST API, OpenAPI 3.0.3 and 3.1.0 (1281 operations, 11 MB) | Loaded in about 1 s, 60 MB; valid and invalid requests told apart; `GET` checks about 6 µs |
+| Stripe API, OpenAPI 3.0.0 (612 operations, 6.6 MB) | Loaded in about 2 s, 33 MB; valid requests pass, an invalid `limit` and missing credentials are rejected |
+| OpenAPI examples (Petstore 3.0, webhook 3.1) | Loaded; checks as expected |
+| GitHub GraphQL schema (1879 types) | Loaded in 21 ms; real queries pass, an unknown field, a missing argument and a deep query are rejected, 6-15 µs per check |
+| SWAPI GraphQL schema | Loaded; a misspelled field is rejected |
+| Descriptor set from `protoc` 3.12 with imports (`Timestamp`, `Empty`), maps and `oneof` | Loaded; fields named in matches. Without `--include_imports`, a clear error |
+
+**Mutation check.** Each of these changes was caught by the tests, and
+the code was restored:
+
+| Change | Failing E2E tests | Failing unit tests |
+|--------|------------------:|-------------------:|
+| Bytes of a message passed on before it is inspected | 1 | 2 |
+| No limit on decompression | 0 | 1 |
+| Unsupported compression passed through | 0 | 1 |
+| `grpc-web-text` not decoded | 1 | 1 |
+| A field that decodes as a message not inspected as a string | 0 | 1 |
+| Wrong wire types accepted with a schema | 1 | 1 |
+| Unknown fields not inspected | 0 | 1 |
+| A message that is not protobuf not inspected | 0 | 1 |
+| gRPC handling for methods other than `POST` | 0 | 2 |
+| Reflection allowed by default | 1 | 2 |
+| Health checks rejected with a schema | 1 | 1 |
+| Rate limits mapped to `PermissionDenied` | 1 | 1 |
+| No h2c to backends | 7 | 0 |
+| No h2c listener | 7 | 0 |
+| Aborted response not recovered | 1 | 0 |
+| Status not sent in trailers after the response started | 1 | 0 |
+| Blocked stream ended with an error the proxy logs | 1 | 0 |
+| Bot challenge page sent to gRPC clients | 1 | 0 |
+| CRS without the gRPC content types | 1 | 0 |
+| GraphQL fragments counted once | 0 | 2 |
+| Only the URL query of a GraphQL `POST` checked | 0 | 1 |
+| Fields with an alias equal to their name counted as aliases | 1 | 1 |
+| `__type` allowed | 0 | 1 |
+| GraphQL arguments not inspected | 1 | 1 |
+| No GraphQL error response | 2 | 1 |
+| Case variants of the base path not checked | 0 | 1 |
+| Semicolons in the query accepted | 0 | 1 |
+| Unsupported OpenAPI features rejected | 0 | 1 |
+| Credentials not checked | 1 | 2 |
+| `HEAD` not checked against `GET` | 0 | 1 |
+| Parameters before literal segments | 0 | 1 |
+| Conflicting parameter names rejected | 0 | 1 |
+| Wrong examples rejected | 0 | 1 |
+
+**Problems found and fixed during development:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| GitHub's OpenAPI documents were rejected at startup, for wrong examples and for paths that differ only in parameter names | Loading the real documents | Examples and defaults are not checked; a router of PrismWAF's own accepts such paths and picks the one with the request's method |
+| Every request to Stripe's API was rejected, because the validator does not support some of its parameter and body styles; and with the first error only, the other parameters were not checked | Real document | All errors are collected, and those about unsupported features are skipped |
+| Parameters after a `;` in the query string were dropped by the parser, so they were not validated | Unit test | Query strings that do not parse are rejected |
+| Go's protobuf decoder keeps a field with the wrong wire type as an unknown field instead of failing | `TestGRPCDescriptor` | Unknown fields with a number of the type are rejected |
+| A nested message was matched as a whole, so the event named the message instead of the field | `TestGRPCUnary` | Fields are inspected before the whole value |
+
+**Not covered:**
+
+- Other gRPC implementations than grpc-go (e.g. Java, .NET), Envoy as a
+  gRPC-Web backend, and `grpcurl`.
+- Real GraphQL servers; the test backend accepts every request.
+- OpenAPI documents with `$ref`s across many files, beyond the unit test.
+

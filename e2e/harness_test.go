@@ -284,6 +284,14 @@ type auditEvent struct {
 		List   string `json:"list"`
 		Client string `json:"client"`
 	} `json:"geo"`
+	API *struct {
+		Protocol  string `json:"protocol"`
+		Violation string `json:"violation"`
+		Operation string `json:"operation"`
+		Limit     int    `json:"limit"`
+		Value     int    `json:"value"`
+		Message   string `json:"message"`
+	} `json:"api"`
 }
 
 // crsRule is a CRS rule that matched, in an audit event.

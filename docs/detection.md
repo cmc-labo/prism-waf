@@ -88,6 +88,19 @@ XML bodies are also checked for XML external entity (XXE) attacks: external
 entities and DTDs (`<!ENTITY x SYSTEM "…">`), entity expansion ("billion
 laughs") and XInclude. These signatures apply to all other locations too.
 
+## GraphQL and gRPC
+
+On [GraphQL endpoints](api-protection.md#graphql), each string argument of
+a query is inspected on its own, like a JSON value, so that a payload at
+the end of an argument is found although the query goes on after it
+(`match.location` `graphql`, `match.field` e.g. `user(name)`).
+
+[gRPC calls](api-protection.md#grpc) are inspected message by message
+while they stream: each string of a protobuf message, decoded with its
+type from a descriptor set or guessed without one (`match.location`
+`grpc`, `match.field` e.g. `[0].filter.name`). gRPC messages are not
+subject to the body limit as a whole; `-max-body` applies to each message.
+
 ## Body size
 
 Request bodies are buffered in memory for inspection. Bodies larger than

@@ -32,6 +32,10 @@ const (
 	LocationQuery  Location = "query"
 	LocationHeader Location = "header"
 	LocationBody   Location = "body"
+	// LocationGraphQL is a string argument of a GraphQL query.
+	LocationGraphQL Location = "graphql"
+	// LocationGRPC is a string in a gRPC message.
+	LocationGRPC Location = "grpc"
 )
 
 // Match describes a signature hit.
@@ -40,7 +44,9 @@ type Match struct {
 	Location  Location
 	// Field is the header name for LocationHeader, the path of the value
 	// for a parsed JSON or XML body (e.g. "$.user.name" or
-	// "/order/item/@id"), and empty otherwise.
+	// "/order/item/@id"), the argument for LocationGraphQL (e.g.
+	// "user(name)"), the message and field for LocationGRPC (e.g.
+	// "[0].user.name"), and empty otherwise.
 	Field string
 	// Base64 reports whether the match was found in Base64-decoded data.
 	Base64 bool
@@ -137,18 +143,8 @@ func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
 		_, err := in.readBody(r)
 		return nil, err
 	}
-	if m := in.match(LocationPath, "", r.URL.EscapedPath(), normalize.Options{}); m != nil {
+	if m := in.InspectHead(r); m != nil {
 		return m, nil
-	}
-	if m := in.match(LocationQuery, "", r.URL.RawQuery, normalize.Options{PlusAsSpace: true}); m != nil {
-		return m, nil
-	}
-	for name, values := range r.Header {
-		for _, v := range values {
-			if m := in.match(LocationHeader, name, v, normalize.Options{PlusAsSpace: true}); m != nil {
-				return m, nil
-			}
-		}
 	}
 
 	body, err := in.readBody(r)
@@ -159,6 +155,31 @@ func (in *Inspector) Inspect(r *http.Request) (*Match, error) {
 		return in.inspectBody(r.Header.Get("Content-Type"), body), nil
 	}
 	return nil, nil
+}
+
+// InspectHead checks the path, query string and headers of r, in that
+// order, and returns the first match, or nil.
+func (in *Inspector) InspectHead(r *http.Request) *Match {
+	if m := in.match(LocationPath, "", r.URL.EscapedPath(), normalize.Options{}); m != nil {
+		return m
+	}
+	if m := in.match(LocationQuery, "", r.URL.RawQuery, normalize.Options{PlusAsSpace: true}); m != nil {
+		return m
+	}
+	for name, values := range r.Header {
+		for _, v := range values {
+			if m := in.match(LocationHeader, name, v, normalize.Options{PlusAsSpace: true}); m != nil {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+// InspectValue checks a single decoded value, such as a GraphQL argument
+// or a string in a gRPC message.
+func (in *Inspector) InspectValue(loc Location, field, value string) *Match {
+	return in.match(loc, field, value, normalize.Options{})
 }
 
 // inspectBody checks a request body. JSON and XML bodies are parsed and
@@ -236,7 +257,7 @@ type candidate struct {
 // match checks raw against every signature, trying each form returned by
 // candidates.
 func (in *Inspector) match(loc Location, field, raw string, opts normalize.Options) *Match {
-	if raw == "" {
+	if raw == "" || len(in.signatures) == 0 {
 		return nil
 	}
 	cands := candidates(raw, opts)

@@ -17,6 +17,11 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   inspected on its own
 - **Rate limiting**: limit requests per client, overall and per path, e.g.
   5 login attempts per minute ([details](docs/rate-limiting.md))
+- **API protection**: validate REST requests against the API's OpenAPI
+  3.0/3.1 document; limit the depth, fields, aliases and batches of
+  GraphQL queries and block introspection; inspect gRPC and gRPC-Web calls
+  message by message while they stream, with optional protobuf schema
+  validation ([details](docs/api-protection.md))
 - **Geo filtering**: allow or block countries with a GeoIP database
   (MaxMind GeoLite2, DB-IP, IPinfo), and pass the client's country to the
   backend ([details](docs/geo-filtering.md))
@@ -78,6 +83,8 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
   anomaly threshold, rule exclusions and use cases
 - [Rate limiting](docs/rate-limiting.md)
 - [Geo filtering](docs/geo-filtering.md)
+- [API protection](docs/api-protection.md): OpenAPI validation, GraphQL
+  limits, gRPC inspection
 - [Bot protection](docs/bot-protection.md)
 - [Modes and audit log](docs/audit-log.md)
 - [Load balancing](docs/load-balancing.md)
@@ -97,4 +104,8 @@ Binaries also contain third-party code under their own licenses, notably
 [maxminddb-golang](https://github.com/oschwald/maxminddb-golang), which
 reads GeoIP databases, is under the ISC License. GeoIP databases are not
 included; see [Geo filtering](docs/geo-filtering.md#country-databases)
-for their terms.
+for their terms. API protection uses
+[kin-openapi](https://github.com/getkin/kin-openapi) and
+[gqlparser](https://github.com/vektah/gqlparser) (MIT License) and
+[Protocol Buffers for Go](https://github.com/protocolbuffers/protobuf-go)
+(BSD 3-Clause License).

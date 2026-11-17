@@ -12,7 +12,9 @@ go run ./cmd/prismwaf -listen :443 \
 ```
 
 - TLS 1.2 or later is required; Go's default cipher suites are used.
-- HTTP/2 is negotiated automatically.
+- HTTP/2 is negotiated automatically. Without TLS, PrismWAF also accepts
+  HTTP/2 from clients that start with it (h2c), as gRPC clients do; see
+  [API protection](api-protection.md#grpc).
 - `-http-redirect` starts a plain HTTP listener that answers every request
   with `308 Permanent Redirect` to the same URL over HTTPS. It does not
   proxy anything.

@@ -1,6 +1,7 @@
 package waf
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,9 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/geo"
+	"github.com/cmc-labo/prism-waf/internal/graphql"
+	"github.com/cmc-labo/prism-waf/internal/grpc"
+	"github.com/cmc-labo/prism-waf/internal/openapi"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
@@ -66,6 +70,16 @@ type Config struct {
 	// CRS, if set, inspects requests that the built-in signatures let
 	// through with the OWASP Core Rule Set.
 	CRS *crs.Engine
+	// OpenAPI, if set, rejects requests under the base paths of an
+	// OpenAPI document that do not match it.
+	OpenAPI *openapi.Validator
+	// GraphQL, if set, parses the queries of requests to GraphQL
+	// endpoints, rejects those over its limits and inspects their
+	// arguments.
+	GraphQL *graphql.Guard
+	// GRPC checks the methods of gRPC calls. Nil blocks the server
+	// reflection service and allows every other method.
+	GRPC *grpc.Guard
 	// Geo, if set, looks up the country of each client first, passes it
 	// to the backend in geo.CountryHeader and in audit events, and blocks
 	// clients from countries that are not allowed.
@@ -92,20 +106,30 @@ type Config struct {
 
 // Middleware inspects each request before passing it to next. Requests that
 // match a signature or the CRS, requests whose body exceeds the inspection
-// limit, requests over a rate limit and requests from countries that are not
-// allowed are recorded in the audit log. In ModeBlock they are then rejected
-// with 403 Forbidden (or the status a CRS rule asks for, such as 400 for an
-// unparsable body), 413 Request Entity Too Large, 429 Too Many Requests and
-// 403 Forbidden respectively; in ModeDetect they are
-// forwarded to next unchanged. Likewise, clients that look like bots are
-// challenged or blocked in ModeBlock and only logged in ModeDetect.
+// limit, requests over a rate limit, requests from countries that are not
+// allowed and API requests that API protection rejects are recorded in the
+// audit log. In ModeBlock they are then rejected with 403 Forbidden (or the
+// status a CRS rule asks for, such as 400 for an unparsable body), 413
+// Request Entity Too Large, 429 Too Many Requests, 403 Forbidden and 403
+// Forbidden respectively; in ModeDetect they are forwarded to next
+// unchanged. Likewise, clients that look like bots are challenged or
+// blocked in ModeBlock and only logged in ModeDetect.
+//
+// gRPC and gRPC-Web calls are inspected message by message while they are
+// forwarded (see serveGRPC), and rejected calls get a gRPC status.
 func Middleware(next http.Handler, cfg Config) http.Handler {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.GRPC == nil {
+		cfg.GRPC = grpc.New(grpc.Config{})
+	}
 	detect := cfg.Mode == ModeDetect
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protocol, codec := grpc.ProtocolOf(r)
+		block := func(code int, eventID string) { blockResponse(w, r, cfg, protocol, code, eventID) }
+
 		// Countries come first: blocked clients should not count towards
 		// rate limits or get challenges.
 		if cfg.Geo != nil {
@@ -120,7 +144,7 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 					logGeoEvent(cfg, logger, r, d)
 				}
 				if !detect {
-					blockResponse(w, http.StatusForbidden, d.EventID)
+					block(http.StatusForbidden, d.EventID)
 					return
 				}
 			}
@@ -136,7 +160,7 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 				}
 				if !detect {
 					w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(d.RetryAfter)))
-					blockResponse(w, http.StatusTooManyRequests, d.EventID)
+					block(http.StatusTooManyRequests, d.EventID)
 					return
 				}
 			}
@@ -153,12 +177,13 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 				logBotEvent(cfg, logger, r, d)
 			}
 			if !detect {
-				switch d.Action {
-				case bot.Challenge:
+				switch {
+				case d.Action == bot.Challenge && protocol == grpc.None:
 					cfg.Bot.ServeChallenge(w, r, d)
 					return
-				case bot.Block:
-					blockResponse(w, http.StatusForbidden, d.EventID)
+				case d.Action == bot.Challenge, d.Action == bot.Block:
+					// A gRPC client cannot run a challenge.
+					block(http.StatusForbidden, d.EventID)
 					return
 				}
 			}
@@ -169,12 +194,19 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 			r.Header.Set(bot.VerifiedHeader, strconv.FormatBool(d.Verified))
 		}
 
+		if protocol != grpc.None {
+			serveGRPC(w, r, next, cfg, logger, protocol, codec)
+			return
+		}
+
 		m, err := cfg.Inspector.Inspect(r)
+		bodyRead := true
 		switch {
 		case errors.Is(err, ErrBodyTooLarge):
+			bodyRead = false
 			id := logEvent(cfg, logger, r, "body_too_large", nil)
 			if !detect {
-				blockResponse(w, http.StatusRequestEntityTooLarge, id)
+				block(http.StatusRequestEntityTooLarge, id)
 				return
 			}
 		case err != nil:
@@ -184,42 +216,120 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 		case m != nil:
 			id := logEvent(cfg, logger, r, "signature", m)
 			if !detect {
-				blockResponse(w, http.StatusForbidden, id)
+				block(http.StatusForbidden, id)
 				return
 			}
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		if cfg.CRS != nil {
-			id := audit.NewID()
-			res, err := cfg.CRS.Inspect(r, bufferedBody(r), cfg.TrustedProxies.ClientIP(r), id)
-			switch {
-			case err != nil:
-				// Fail closed: an attack must not pass because of an
-				// engine error.
-				logger.Error("CRS inspection failed", "remote_addr", r.RemoteAddr, "error", err)
-				if !detect {
-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					return
-				}
-			case res != nil:
-				logCRSEvent(cfg, logger, r, id, res)
-				if !detect {
-					blockResponse(w, res.Status, id)
-					return
-				}
+		// API protection needs the body, which was not read if it was too
+		// large (in ModeDetect).
+		if bodyRead {
+			if id := checkAPI(cfg, logger, r); id != "" && !detect {
+				block(http.StatusForbidden, id)
+				return
 			}
+		}
+
+		if cfg.CRS != nil && !inspectCRS(cfg, logger, r, bufferedBody(r), block) {
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+// inspectCRS inspects a request with the CRS and reports whether it may
+// be forwarded; otherwise it has been answered.
+func inspectCRS(cfg Config, logger *slog.Logger, r *http.Request, body []byte, block func(int, string)) bool {
+	detect := cfg.Mode == ModeDetect
+	id := audit.NewID()
+	res, err := cfg.CRS.Inspect(r, body, cfg.TrustedProxies.ClientIP(r), id)
+	switch {
+	case err != nil:
+		// Fail closed: an attack must not pass because of an engine
+		// error.
+		logger.Error("CRS inspection failed", "remote_addr", r.RemoteAddr, "event_id", id, "error", err)
+		if !detect {
+			block(http.StatusInternalServerError, id)
+			return false
+		}
+	case res != nil:
+		logCRSEvent(cfg, logger, r, id, res)
+		if !detect {
+			block(res.Status, id)
+			return false
+		}
+	}
+	return true
+}
+
+// checkAPI applies GraphQL protection and the OpenAPI document to a
+// request whose body has been read. It returns the ID of the audit event
+// of a rejected request, or "".
+func checkAPI(cfg Config, logger *slog.Logger, r *http.Request) string {
+	if cfg.GraphQL == nil && cfg.OpenAPI == nil {
+		return ""
+	}
+	body := bufferedBody(r)
+	if cfg.GraphQL != nil && cfg.GraphQL.Handles(r.URL.Path) {
+		v, values := cfg.GraphQL.Check(r, body)
+		if v != nil {
+			return logAPIEvent(cfg, logger, r, &audit.API{
+				Protocol: "graphql", Violation: v.Kind, Operation: v.Operation,
+				Limit: v.Limit, Value: v.Value, Message: v.Message,
+			})
+		}
+		// Each argument on its own, like the values of a JSON body.
+		for _, val := range values {
+			if m := cfg.Inspector.InspectValue(LocationGraphQL, val.Path, val.Value); m != nil {
+				return logEvent(cfg, logger, r, "signature", m)
+			}
+		}
+	}
+	if cfg.OpenAPI != nil {
+		if v := cfg.OpenAPI.Check(r, body); v != nil {
+			return logAPIEvent(cfg, logger, r, &audit.API{
+				Protocol: "openapi", Violation: v.Kind, Operation: v.Operation, Message: v.Message,
+			})
+		}
+	}
+	return ""
+}
+
 // blockResponse writes an error response that includes the event ID, so a
 // user who is blocked by mistake can report it. Rule details are not
-// disclosed to the client.
-func blockResponse(w http.ResponseWriter, code int, eventID string) {
-	http.Error(w, http.StatusText(code)+"\nEvent ID: "+eventID, code)
+// disclosed to the client. gRPC calls get a gRPC status, and requests to
+// GraphQL endpoints a GraphQL error, so that their clients can show it.
+func blockResponse(w http.ResponseWriter, r *http.Request, cfg Config, protocol grpc.Protocol, code int, eventID string) {
+	switch {
+	case protocol != grpc.None:
+		grpc.WriteError(w, protocol, grpc.StatusFromHTTP(code), http.StatusText(code)+"; event ID: "+eventID)
+	case cfg.GraphQL != nil && cfg.GraphQL.Handles(r.URL.Path):
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(graphqlResponse{Errors: []graphqlError{{
+			Message:    http.StatusText(code) + "; event ID: " + eventID,
+			Extensions: graphqlExtensions{Code: strings.ToUpper(strings.ReplaceAll(http.StatusText(code), " ", "_")), EventID: eventID},
+		}}})
+	default:
+		http.Error(w, http.StatusText(code)+"\nEvent ID: "+eventID, code)
+	}
+}
+
+type graphqlResponse struct {
+	Errors []graphqlError `json:"errors"`
+}
+
+type graphqlError struct {
+	Message    string            `json:"message"`
+	Extensions graphqlExtensions `json:"extensions"`
+}
+
+type graphqlExtensions struct {
+	Code    string `json:"code"`
+	EventID string `json:"eventId"`
 }
 
 // bufferedBody returns the request body that the Inspector buffered, or
@@ -302,6 +412,16 @@ func logBotEvent(cfg Config, logger *slog.Logger, r *http.Request, d bot.Decisio
 		}
 	}
 	writeEvent(cfg, logger, e)
+}
+
+// logAPIEvent writes an audit event for a request that API protection
+// rejected and returns its ID.
+func logAPIEvent(cfg Config, logger *slog.Logger, r *http.Request, a *audit.API) string {
+	e := newEvent(cfg, r, audit.NewID(), "api", nil)
+	a.Message, _ = audit.Truncate(a.Message, maxLoggedData)
+	e.API = a
+	writeEvent(cfg, logger, e)
+	return e.ID
 }
 
 // logGeoEvent writes an audit event for the first blocked request of a

@@ -288,15 +288,23 @@ SecAction "id:1000,phase:1,pass,nolog,\
 
 ### Accept other content types
 
-Bodies with a content type that is not in the CRS's list, such as
-`text/plain`, match rule 920420 (critical). Set the full list, adding the
-types you need:
+Bodies with a content type that is not in the allowed list match rule
+920420 (critical). PrismWAF allows the CRS's default types plus those of
+GraphQL (`application/graphql`) and gRPC (`application/grpc`,
+`application/grpc-web`, `application/grpc-web-text` and their `+proto`
+and `+json` forms), whose requests it parses itself (see
+[API protection](api-protection.md)). For other types, such as
+`text/plain`, set the full list, adding the types you need:
 
 ```apache
 # before.conf
 SecAction "id:1001,phase:1,pass,nolog,\
-    setvar:'tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |multipart/related| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/cloudevents+json| |application/cloudevents-batch+json| |text/plain|'"
+    setvar:'tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/graphql| |application/grpc| |application/grpc+proto| |text/plain|'"
 ```
+
+Keep the GraphQL and gRPC types in your list if you use them. For gRPC
+calls, the CRS sees the path and the metadata (headers); the messages are
+binary and are inspected by the built-in signatures.
 
 ### Accept HTML in one field of one endpoint
 

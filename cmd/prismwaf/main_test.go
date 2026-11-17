@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/bot"
+	"github.com/cmc-labo/prism-waf/internal/graphql"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
 )
 
@@ -107,6 +108,15 @@ func TestConfigValidate(t *testing.T) {
 		{"bot CAPTCHA score below challenge score", config{botProtection: true, botCaptcha: "turnstile", botCaptchaSiteKey: "k", botCaptchaSecretFile: "s", botCaptchaScore: 30}, true},
 		{"bot CAPTCHA without bot protection", config{botCaptcha: "turnstile", botCaptchaSiteKey: "k", botCaptchaSecretFile: "s"}, true},
 
+		{"GraphQL", gql(config{graphqlPaths: stringList{"/graphql", "/api/*"}, graphqlSchema: stringList{"s.graphql"}, graphqlIntrospection: true}), false},
+		{"GraphQL options without path", config{graphqlIntrospection: true}, true},
+		{"GraphQL limit without path", gql(config{setFlags: []string{"graphql-max-depth"}}), true},
+		{"GraphQL schema without path", config{graphqlSchema: stringList{"s.graphql"}}, true},
+		{"relative GraphQL path", gql(config{graphqlPaths: stringList{"graphql"}}), true},
+		{"GraphQL path with method", gql(config{graphqlPaths: stringList{"POST /graphql"}}), true},
+		{"zero GraphQL depth", config{graphqlPaths: stringList{"/graphql"}, graphqlMaxAliases: 1, graphqlMaxFields: 1, graphqlMaxBatch: 1}, true},
+		{"negative GraphQL batch", config{graphqlPaths: stringList{"/graphql"}, graphqlMaxDepth: 1, graphqlMaxAliases: 1, graphqlMaxFields: 1, graphqlMaxBatch: -1}, true},
+
 		{"least-conn", config{lbPolicy: "least-conn"}, false},
 		{"invalid lb policy", config{lbPolicy: "random"}, true},
 		{"negative fail timeout", config{failTimeout: -time.Second}, true},
@@ -162,4 +172,13 @@ func TestBackendURLs(t *testing.T) {
 	if got := c.backendURLs(); !slices.Equal(got, []string{"http://a:1", "http://b:2", "http://c:3"}) {
 		t.Errorf("backendURLs = %q", got)
 	}
+}
+
+// gql sets the GraphQL limits to their defaults, as the flags do.
+func gql(c config) config {
+	c.graphqlMaxDepth = graphql.DefaultMaxDepth
+	c.graphqlMaxAliases = graphql.DefaultMaxAliases
+	c.graphqlMaxFields = graphql.DefaultMaxFields
+	c.graphqlMaxBatch = graphql.DefaultMaxBatch
+	return c
 }

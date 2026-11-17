@@ -579,6 +579,10 @@ on all paths:
   browser (Puppeteer, Playwright with a normal `User-Agent`) solves the
   challenge. Bot protection makes scraping more expensive; it does not make
   it impossible.
+- gRPC clients (not gRPC-Web) cannot run the challenge; a gRPC call that
+  would be challenged gets the gRPC status `PermissionDenied` instead.
+  Exempt the paths of gRPC services with `-bot-exempt-path`, e.g.
+  `"/shop.v1.Orders/*"`, or the clients with `-bot-exempt`.
 - Requests are scored one by one. Behavior across requests, mouse
   movements, TLS fingerprints (JA3/JA4) and IP reputation are not used.
 - Only bots that document reverse DNS verification are verified (see

@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -113,6 +115,7 @@ func New(cfg Config) (*Proxy, error) {
 	if cfg.Transport == nil {
 		cfg.Transport = http.DefaultTransport
 	}
+	transport := grpcTransport(cfg.Transport)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -129,7 +132,7 @@ func New(cfg Config) (*Proxy, error) {
 		p.backends = append(p.backends, &backend{
 			url: u,
 			rp: &httputil.ReverseProxy{
-				Transport: cfg.Transport,
+				Transport: transport,
 				Rewrite: func(r *httputil.ProxyRequest) {
 					r.SetURL(u)
 					r.SetXForwarded()
@@ -158,10 +161,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b := p.backends[i]
 
 		a := &attempt{}
-		b.active.Add(1)
-		b.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), attemptKey{}, a)))
-		b.active.Add(-1)
+		b.serve(w, r.WithContext(context.WithValue(r.Context(), attemptKey{}, a)))
 		if a.err == nil {
+			return
+		}
+		if r.Context().Err() != nil {
+			// The client went away, or the request was aborted on purpose,
+			// e.g. a gRPC stream that the WAF blocked: not the backend's
+			// fault, and nobody to answer.
 			return
 		}
 		if !isConnectError(a.err) {
@@ -177,6 +184,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p.logger.Error("all backends failed", "method", r.Method, "path", r.URL.Path)
 	http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+}
+
+// serve forwards a request to the backend. The ReverseProxy panics with
+// http.ErrAbortHandler when the response cannot be copied to the end.
+func (b *backend) serve(w http.ResponseWriter, r *http.Request) {
+	b.active.Add(1)
+	defer b.active.Add(-1)
+	b.rp.ServeHTTP(w, r)
 }
 
 func (p *Proxy) fail(w http.ResponseWriter, r *http.Request, b *backend, err error) {
@@ -245,6 +260,39 @@ func rewindBody(r *http.Request) bool {
 	}
 	r.Body = body
 	return true
+}
+
+// grpcTransport returns a transport that sends gRPC calls to http://
+// backends over HTTP/2 without TLS (h2c), as gRPC requires HTTP/2, and
+// other requests through base. Over https://, HTTP/2 is negotiated with
+// TLS.
+func grpcTransport(base http.RoundTripper) http.RoundTripper {
+	t, ok := base.(*http.Transport)
+	if !ok {
+		return base
+	}
+	h2c := t.Clone()
+	h2c.Protocols = new(http.Protocols)
+	h2c.Protocols.SetUnencryptedHTTP2(true)
+	return &splitTransport{base: base, h2c: h2c}
+}
+
+type splitTransport struct {
+	base, h2c http.RoundTripper
+}
+
+func (t *splitTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Scheme == "http" && isGRPC(r.Header.Get("Content-Type")) {
+		return t.h2c.RoundTrip(r)
+	}
+	return t.base.RoundTrip(r)
+}
+
+// isGRPC reports whether a content type is gRPC's, which needs HTTP/2,
+// e.g. "application/grpc+proto"; gRPC-Web also works over HTTP/1.1.
+func isGRPC(contentType string) bool {
+	mt, _, _ := mime.ParseMediaType(contentType)
+	return mt == "application/grpc" || strings.HasPrefix(mt, "application/grpc+")
 }
 
 // HealthCheck sends GET requests for path to every backend, immediately and

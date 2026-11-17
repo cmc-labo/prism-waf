@@ -35,7 +35,8 @@ type Event struct {
 	// detection mode).
 	Action string `json:"action"`
 	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS),
-	// "body_too_large", "rate_limit", "bot" or "geo".
+	// "body_too_large", "rate_limit", "bot", "geo" or "api" (API
+	// protection).
 	Reason string `json:"reason"`
 	Rule   *Rule  `json:"rule,omitempty"`
 	Match  *Match `json:"match,omitempty"`
@@ -46,8 +47,28 @@ type Event struct {
 	// Bot holds the details of a client that looks like a bot.
 	Bot *Bot `json:"bot,omitempty"`
 	// Geo holds the details of a client blocked by its country.
-	Geo     *Geo    `json:"geo,omitempty"`
+	Geo *Geo `json:"geo,omitempty"`
+	// API holds the details of a request that API protection rejected.
+	API     *API    `json:"api,omitempty"`
 	Request Request `json:"request"`
+}
+
+// API describes an API request that does not match the API's description
+// or exceeds a limit.
+type API struct {
+	// Protocol is "openapi", "graphql" or "grpc".
+	Protocol string `json:"protocol"`
+	// Violation is the kind of problem, e.g. "unknown_path", "depth" or
+	// "unknown_method".
+	Violation string `json:"violation"`
+	// Operation is the operation of the request, if known: e.g.
+	// "GET /users/{id}", "query GetUser" or "/shop.Orders/Get".
+	Operation string `json:"operation,omitempty"`
+	// Limit and Value are the exceeded limit and the request's value.
+	Limit int `json:"limit,omitempty"`
+	Value int `json:"value,omitempty"`
+	// Message describes the problem.
+	Message string `json:"message,omitempty"`
 }
 
 // Geo describes a client blocked by its country. Only the first blocked

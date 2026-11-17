@@ -62,13 +62,13 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 
 | Field | Description |
 |-------|-------------|
-| `id` | Event ID. In block mode it is also returned in the `403`/`413`/`429` response body and on the challenge page, so users can report false positives. |
+| `id` | Event ID. In block mode it is also returned in the `403`/`413`/`429` response body (in a GraphQL error on GraphQL endpoints, in `grpc-message` for gRPC calls) and on the challenge page, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
 | `action` | `block`, `challenge` (a [bot challenge](bot-protection.md) was served), or `detect` in detection mode. |
-| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit`, `bot` or `geo`. |
+| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit`, `bot`, `geo` or `api`. |
 | `country` | With `-geo-db`: the client's country, e.g. `JP`, or `XX` if unknown. Absent for private addresses. See [Geo filtering](geo-filtering.md). |
 | `rule` | The signature that matched. For the CRS, the most severe matched rule, e.g. `{"id": "942100", "category": "sqli"}`, or the rule that rejected the request on its own (e.g. 200002). |
-| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name) or `body` (with the path of the value for JSON and XML bodies). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
+| `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name), `body` (with the path of the value for JSON and XML bodies), `graphql` (with the argument, e.g. `user(name)`) or `grpc` (with the message and field, e.g. `[0].filter.name`). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
 | `match.data` | The text the signature matched, after normalization. |
 | `match.value` | The raw value that was inspected, i.e. the payload as sent. Truncated to 4 KiB (`value_truncated`, `value_length`). |
 | `match.base64` | `true` if the match was in Base64-decoded data. |
@@ -76,6 +76,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
 | `bot` | Why the client looks like a [bot](bot-protection.md#responses-and-audit-events): `score`, `signals`, `category`, `name` and `verified` of a known bot, `challenge` (`pow` or `captcha`) and `client`. Logged for the first challenged or blocked request of a client, then at most once a minute. |
 | `geo` | Why the client was [blocked by its country](geo-filtering.md#responses-and-audit-events): `list` (`allow` or `block`) and `client`. Logged for the first blocked request of a client, then at most once a minute. |
+| `api` | Why [API protection](api-protection.md#audit-events) rejected the request: `protocol` (`openapi`, `graphql`, `grpc`), `violation`, `operation`, `limit` and `value` of a GraphQL limit, and `message`. |
 | `request.headers` | Request headers. `Authorization`, `Cookie` and other credential headers are `[REDACTED]`, unless the attack was found in that header. |
 
 The response to the client only contains the event ID; rule details are not

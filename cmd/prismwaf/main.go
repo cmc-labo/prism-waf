@@ -22,7 +22,10 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
 	"github.com/cmc-labo/prism-waf/internal/geo"
+	"github.com/cmc-labo/prism-waf/internal/graphql"
+	"github.com/cmc-labo/prism-waf/internal/grpc"
 	"github.com/cmc-labo/prism-waf/internal/notify"
+	"github.com/cmc-labo/prism-waf/internal/openapi"
 	"github.com/cmc-labo/prism-waf/internal/proxy"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 	"github.com/cmc-labo/prism-waf/internal/tlsutil"
@@ -56,6 +59,16 @@ func main() {
 	flag.StringVar(&cfg.geoAllow, "geo-allow", "", `comma-separated ISO 3166-1 country codes to allow, e.g. "JP,US"; requests from other countries get 403 ("XX" is unknown)`)
 	flag.StringVar(&cfg.geoBlock, "geo-block", "", `comma-separated ISO 3166-1 country codes to block with 403, e.g. "CN,RU" ("XX" is unknown)`)
 	flag.StringVar(&cfg.geoExempt, "geo-exempt", "", "comma-separated IPs or CIDRs of clients that are never blocked by country")
+	flag.StringVar(&cfg.openAPI, "openapi", "", "OpenAPI 3.0 or 3.1 document (YAML or JSON); requests under the paths of its servers that do not match it get 403")
+	flag.Var(&cfg.graphqlPaths, "graphql-path", `GraphQL endpoint to protect, e.g. "/graphql"; repeatable, "*" at the end for a prefix`)
+	flag.Var(&cfg.graphqlSchema, "graphql-schema", "GraphQL schema file (SDL); queries that are not valid for it get 403; repeatable")
+	flag.IntVar(&cfg.graphqlMaxDepth, "graphql-max-depth", graphql.DefaultMaxDepth, "maximum nesting of fields in a GraphQL query")
+	flag.IntVar(&cfg.graphqlMaxAliases, "graphql-max-aliases", graphql.DefaultMaxAliases, "maximum aliased fields per GraphQL request")
+	flag.IntVar(&cfg.graphqlMaxFields, "graphql-max-fields", graphql.DefaultMaxFields, "maximum fields per GraphQL request, counting each use of a fragment")
+	flag.IntVar(&cfg.graphqlMaxBatch, "graphql-max-batch", graphql.DefaultMaxBatch, "maximum operations in a batched GraphQL request")
+	flag.BoolVar(&cfg.graphqlIntrospection, "graphql-introspection", false, "allow GraphQL introspection queries (__schema, __type)")
+	flag.Var(&cfg.grpcDescriptors, "grpc-descriptor", "protobuf descriptor set (protoc --include_imports --descriptor_set_out); gRPC calls of other methods and messages that do not match get 403; repeatable")
+	flag.BoolVar(&cfg.grpcReflection, "grpc-reflection", false, "allow calls of the gRPC server reflection service")
 	flag.BoolVar(&cfg.botProtection, "bot-protection", false, "score how likely each request comes from a bot and make clients that look automated solve a proof-of-work challenge in JavaScript")
 	flag.IntVar(&cfg.botChallengeScore, "bot-challenge-score", bot.DefaultChallengeScore, "bot score (0-100) from which clients must solve the challenge")
 	flag.IntVar(&cfg.botBlockScore, "bot-block-score", 0, "bot score (0-100) from which requests are rejected with 403 without a challenge; 0 disables")
@@ -127,6 +140,16 @@ type config struct {
 	geoAllow             string
 	geoBlock             string
 	geoExempt            string
+	openAPI              string
+	graphqlPaths         stringList
+	graphqlSchema        stringList
+	graphqlMaxDepth      int
+	graphqlMaxAliases    int
+	graphqlMaxFields     int
+	graphqlMaxBatch      int
+	graphqlIntrospection bool
+	grpcDescriptors      stringList
+	grpcReflection       bool
 	botProtection        bool
 	botChallengeScore    int
 	botBlockScore        int
@@ -247,6 +270,19 @@ func (c config) geoConfig() (geo.Config, error) {
 		return geo.Config{}, fmt.Errorf("invalid -geo-exempt: %w", err)
 	}
 	return geo.Config{Allow: allow, Block: block, Exempt: exempt}, nil
+}
+
+// graphqlConfig returns the configuration of GraphQL protection, without
+// the schema, which is loaded by run.
+func (c config) graphqlConfig() graphql.Config {
+	return graphql.Config{
+		Paths:         c.graphqlPaths,
+		MaxDepth:      c.graphqlMaxDepth,
+		MaxAliases:    c.graphqlMaxAliases,
+		MaxFields:     c.graphqlMaxFields,
+		MaxBatch:      c.graphqlMaxBatch,
+		Introspection: c.graphqlIntrospection,
+	}
 }
 
 // botConfig returns the configuration of the bot guard, without the
@@ -386,6 +422,26 @@ func (c config) validate() error {
 	}
 	if _, err := c.geoConfig(); err != nil {
 		return err
+	}
+	graphqlFlags := false
+	for _, name := range c.setFlags {
+		graphqlFlags = graphqlFlags || strings.HasPrefix(name, "graphql-") && name != "graphql-path"
+	}
+	if len(c.graphqlPaths) == 0 && (graphqlFlags || len(c.graphqlSchema) > 0 || c.graphqlIntrospection) {
+		return errors.New("-graphql-* options require -graphql-path")
+	}
+	if len(c.graphqlPaths) > 0 {
+		for _, l := range []struct {
+			name  string
+			value int
+		}{{"depth", c.graphqlMaxDepth}, {"aliases", c.graphqlMaxAliases}, {"fields", c.graphqlMaxFields}, {"batch", c.graphqlMaxBatch}} {
+			if l.value < 1 {
+				return fmt.Errorf("-graphql-max-%s must be at least 1", l.name)
+			}
+		}
+		if _, err := graphql.New(c.graphqlConfig()); err != nil {
+			return fmt.Errorf("invalid -graphql-path: %w", err)
+		}
 	}
 	botFlags, captchaFlags := false, false
 	for _, name := range c.setFlags {
@@ -547,6 +603,30 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
+	var apiSpec *openapi.Validator
+	if cfg.openAPI != "" {
+		if apiSpec, err = openapi.Load(cfg.openAPI); err != nil {
+			return err
+		}
+	}
+	var graphqlGuard *graphql.Guard
+	if len(cfg.graphqlPaths) > 0 {
+		gc := cfg.graphqlConfig()
+		if len(cfg.graphqlSchema) > 0 {
+			if gc.Schema, err = graphql.LoadSchema(cfg.graphqlSchema); err != nil {
+				return err
+			}
+		}
+		if graphqlGuard, err = graphql.New(gc); err != nil {
+			return err
+		}
+	}
+	grpcConfig := grpc.Config{Reflection: cfg.grpcReflection}
+	if len(cfg.grpcDescriptors) > 0 {
+		if grpcConfig.Schema, err = grpc.LoadSchema(cfg.grpcDescriptors); err != nil {
+			return err
+		}
+	}
 	var limiter *ratelimit.Limiter
 	if cfg.rateLimitEnabled() {
 		rules, err := cfg.rateLimitRules()
@@ -601,6 +681,9 @@ func run(cfg config, logger *slog.Logger) error {
 		Inspector:      inspector,
 		CRS:            crsEngine,
 		Geo:            geoFilter,
+		OpenAPI:        apiSpec,
+		GraphQL:        graphqlGuard,
+		GRPC:           grpc.New(grpcConfig),
 		RateLimiter:    limiter,
 		Bot:            guard,
 		Mode:           mode,
@@ -619,6 +702,9 @@ func run(cfg config, logger *slog.Logger) error {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          httpErrorLog,
+		// HTTP/2 also without TLS (h2c with prior knowledge), as gRPC
+		// clients use on internal networks.
+		Protocols: serverProtocols(),
 	}
 	servers := []*http.Server{srv}
 
@@ -723,6 +809,19 @@ func run(cfg config, logger *slog.Logger) error {
 		if len(tp) == 0 {
 			logger.Info("countries are looked up for the TCP peer address; behind a load balancer or CDN, set -trusted-proxies, or the address of the proxy is looked up for every client")
 		}
+	}
+	if apiSpec != nil {
+		logger.Info("OpenAPI validation enabled", "document", cfg.openAPI, "version", apiSpec.Version(),
+			"operations", apiSpec.Operations(), "paths", apiSpec.BasePaths())
+	}
+	if graphqlGuard != nil {
+		gc := graphqlGuard.Config()
+		logger.Info("GraphQL protection enabled", "paths", cfg.graphqlPaths, "schema", cfg.graphqlSchema,
+			"max_depth", gc.MaxDepth, "max_aliases", gc.MaxAliases, "max_fields", gc.MaxFields, "max_batch", gc.MaxBatch,
+			"introspection", gc.Introspection)
+	}
+	if grpcConfig.Schema != nil {
+		logger.Info("gRPC schema validation enabled", "descriptors", cfg.grpcDescriptors, "services", grpcConfig.Schema.Services())
 	}
 	if limiter != nil {
 		rules := make([]string, len(limiter.Rules()))
@@ -831,6 +930,16 @@ func run(cfg config, logger *slog.Logger) error {
 		}
 	}
 	return runErr
+}
+
+// serverProtocols returns the protocols of the listeners: HTTP/1.1, and
+// HTTP/2 with TLS and without (h2c).
+func serverProtocols() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetHTTP1(true)
+	p.SetHTTP2(true)
+	p.SetUnencryptedHTTP2(true)
+	return p
 }
 
 // sendTestNotification sends a test notification to check the

@@ -80,6 +80,26 @@ A client is an IP address, or a `/64` network for IPv6. See
 `XX` is the code for public addresses that the database has no country
 for. Private addresses always pass. See [Geo filtering](geo-filtering.md).
 
+## API protection
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-openapi` | (none) | OpenAPI 3.0 or 3.1 document (YAML or JSON); requests under the paths of its servers that do not match it get `403` |
+| `-graphql-path` | (none) | GraphQL endpoint to protect, e.g. `/graphql`; repeatable, `*` at the end for a prefix |
+| `-graphql-schema` | (none) | GraphQL schema file (SDL); queries that are not valid for it get `403`; repeatable |
+| `-graphql-max-depth` | `15` | Maximum nesting of fields in a query |
+| `-graphql-max-aliases` | `20` | Maximum aliased fields per request |
+| `-graphql-max-fields` | `1000` | Maximum fields per request, counting each use of a fragment |
+| `-graphql-max-batch` | `10` | Maximum operations in a batched request |
+| `-graphql-introspection` | `false` | Allow introspection queries (`__schema`, `__type`) |
+| `-grpc-descriptor` | (none) | Protobuf descriptor set (`protoc --include_imports --descriptor_set_out`); calls of other methods and messages that do not match get `PermissionDenied`; repeatable |
+| `-grpc-reflection` | `false` | Allow calls of the gRPC server reflection service |
+
+gRPC and gRPC-Web calls are always inspected message by message, with or
+without `-grpc-descriptor`; `-max-body` applies to each message. PrismWAF
+accepts HTTP/2 without TLS (h2c) and sends gRPC calls to `http://`
+backends over h2c. See [API protection](api-protection.md).
+
 ## Bot protection
 
 | Flag | Default | Description |
@@ -143,7 +163,8 @@ See [HTTPS](https.md) and [Automatic certificates](acme.md).
 | `SIGINT`, `SIGTERM` | Shut down gracefully: stop accepting connections and wait up to 10 seconds for requests in progress |
 
 The `-geo-db` file is checked every minute and reloaded when it changes.
-Rule files (`-crs-rules-before`, `-crs-rules-after`) and other settings are
+Rule files (`-crs-rules-before`, `-crs-rules-after`), API descriptions
+(`-openapi`, `-graphql-schema`, `-grpc-descriptor`) and other settings are
 read only at startup.
 
 ## Examples

@@ -34,6 +34,18 @@ const (
 	DefaultMaxArgs          = 1000
 )
 
+// ContentTypesRuleID is the rule that sets the allowed request content
+// types.
+const ContentTypesRuleID = 9500002
+
+// allowedContentTypes are the request content types that CRS rule 920420
+// allows.
+const allowedContentTypes = "|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json|" +
+	" |application/graphql|" +
+	" |application/grpc| |application/grpc+proto| |application/grpc+json|" +
+	" |application/grpc-web| |application/grpc-web+proto| |application/grpc-web+json|" +
+	" |application/grpc-web-text| |application/grpc-web-text+proto|"
+
 // TooManyArgsRuleID is the rule that rejects requests with more than
 // Config.MaxArgs arguments.
 const TooManyArgsRuleID = 9500001
@@ -121,6 +133,11 @@ func buildDirectives(cfg Config) (string, error) {
 	b.WriteString("SecResponseBodyAccess Off\n")
 	b.WriteString("SecAuditEngine Off\n")
 	b.WriteString("Include @crs-setup.conf.example\n")
+	// CRS's default content types, plus those of GraphQL and gRPC, whose
+	// requests PrismWAF parses itself. Rules in RulesBefore can still set
+	// tx.allowed_request_content_type, as they come later.
+	fmt.Fprintf(&b, `SecAction "id:%d,phase:1,pass,t:none,nolog,setvar:'tx.allowed_request_content_type=%s'"`+"\n",
+		ContentTypesRuleID, allowedContentTypes)
 	fmt.Fprintf(&b, `SecAction "id:900000,phase:1,pass,t:none,nolog,setvar:tx.blocking_paranoia_level=%d"`+"\n", cfg.ParanoiaLevel)
 	fmt.Fprintf(&b, `SecAction "id:900110,phase:1,pass,t:none,nolog,setvar:tx.inbound_anomaly_score_threshold=%d"`+"\n", cfg.InboundThreshold)
 	// Coraza stops adding arguments at SecArgumentsLimit and the rules never
