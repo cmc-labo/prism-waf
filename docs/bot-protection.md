@@ -24,8 +24,9 @@ site, while visitors with a browser do not notice anything.
 
 ## How it works
 
-For each request, after [rate limiting](rate-limiting.md) and before
-inspection for attacks:
+For each request, after [rate limiting](rate-limiting.md) and
+[business flow protection](business-logic.md) and before inspection for
+attacks:
 
 1. The request is scored and categorized (see [Bot score](#bot-score) and
    [Categories](#categories)). If its `User-Agent` names a bot that can
@@ -527,7 +528,9 @@ Requests with a score of 60 or more (no `User-Agent`, HTTP libraries and
 tools, or browser `User-Agents` without browser headers) get a plain `403`
 without a challenge; crawlers (50) are still challenged. Combine with
 [rate limiting](rate-limiting.md) to slow down clients that solve the
-challenge but then send too many requests.
+challenge but then send too many requests, and with an
+[enumeration limit](business-logic.md#enumeration-limits) to stop them from
+walking through all records by ID.
 
 ### Behind a load balancer or CDN
 

@@ -115,7 +115,8 @@ flood is rejected before PrismWAF spends time on its body. Requests that
 are then blocked as attacks still count: a scanner that sends attack
 payloads quickly is slowed down by the rate limit as well.
 Clients [blocked by their country](geo-filtering.md) are rejected before
-the rate limits and do not count.
+the rate limits and do not count. [Failure and enumeration
+limits](business-logic.md) are checked after the rate limits.
 
 ### Memory
 
@@ -214,6 +215,11 @@ Only form submissions are limited; loading the login page with `GET` is
 not. Add a rule for every endpoint that checks a secret: login, password
 reset, two-factor codes, API token exchange. The limit is per client, so
 it does not lock out a user's account when someone else attacks it.
+
+A [failure limit](business-logic.md#failure-limits) such as
+`-failure-limit "POST /login=5/15m"` is stricter for attackers and does
+not limit users who log in successfully, if the application answers wrong
+passwords with `401` or `403`.
 
 Distributed attacks from many addresses (botnets, residential proxies) stay
 below a per-client limit. Rate limiting reduces their speed per address,

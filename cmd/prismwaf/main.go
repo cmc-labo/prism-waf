@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cmc-labo/prism-waf/internal/abuse"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
@@ -53,8 +54,10 @@ func main() {
 	flag.StringVar(&cfg.trustedProxies, "trusted-proxies", "", "comma-separated IPs or CIDRs of proxies whose X-Forwarded-For is trusted")
 	flag.StringVar(&cfg.rateLimit, "rate-limit", "", `maximum requests per client (IP address, /64 for IPv6) as N/WINDOW, e.g. "300/1m"; excess requests get 429`)
 	flag.Var(&cfg.rateLimitPaths, "rate-limit-path", `per-client limit for one path as "[METHOD ]PATH=N/WINDOW", e.g. "POST /login=5/1m" or "/api/*=100/1m"; repeatable`)
-	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited")
-	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once")
+	flag.Var(&cfg.failureLimits, "failure-limit", `per-client limit on failed attempts as "[METHOD ]PATH=N/WINDOW[ STATUS,...]", e.g. "POST /login=5/15m" (failures are 401 and 403 by default) or "POST /redeem=10/1h 4xx"; further requests get 429; repeatable`)
+	flag.Var(&cfg.enumerationLimits, "enumeration-limit", `per-client limit on distinct IDs as "[METHOD ]PATH=N/WINDOW" with {name} segments, e.g. "GET /api/orders/{id}=100/1h"; requests for further IDs get 429; repeatable`)
+	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited (nor failure or enumeration limited)")
+	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once (also per -failure-limit and for all -enumeration-limit rules)")
 	flag.StringVar(&cfg.geoDB, "geo-db", "", "MaxMind DB file to look up the country of clients in (GeoLite2 or GeoIP2 Country or City, DB-IP IP to Country, IPinfo Lite); reloaded when it changes")
 	flag.StringVar(&cfg.geoAllow, "geo-allow", "", `comma-separated ISO 3166-1 country codes to allow, e.g. "JP,US"; requests from other countries get 403 ("XX" is unknown)`)
 	flag.StringVar(&cfg.geoBlock, "geo-block", "", `comma-separated ISO 3166-1 country codes to block with 403, e.g. "CN,RU" ("XX" is unknown)`)
@@ -135,6 +138,8 @@ type config struct {
 	rateLimit            string
 	rateLimitPaths       stringList
 	rateLimitExempt      string
+	failureLimits        stringList
+	enumerationLimits    stringList
 	rateLimitMaxClients  int
 	geoDB                string
 	geoAllow             string
@@ -252,6 +257,28 @@ func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
 		rules = append(rules, r)
 	}
 	return rules, nil
+}
+
+func (c config) abuseEnabled() bool { return len(c.failureLimits) > 0 || len(c.enumerationLimits) > 0 }
+
+// abuseConfig parses -failure-limit and -enumeration-limit.
+func (c config) abuseConfig() (abuse.Config, error) {
+	var ac abuse.Config
+	for _, v := range c.failureLimits {
+		r, err := abuse.ParseFailureRule(v)
+		if err != nil {
+			return ac, fmt.Errorf("invalid -failure-limit: %w", err)
+		}
+		ac.Failures = append(ac.Failures, r)
+	}
+	for _, v := range c.enumerationLimits {
+		r, err := abuse.ParseEnumerationRule(v)
+		if err != nil {
+			return ac, fmt.Errorf("invalid -enumeration-limit: %w", err)
+		}
+		ac.Enumerations = append(ac.Enumerations, r)
+	}
+	return ac, nil
 }
 
 // geoConfig returns the configuration of the country filter, without the
@@ -399,10 +426,13 @@ func (c config) validate() error {
 			return errors.New("-health-check-interval and -health-check-timeout must be positive")
 		}
 	}
-	if !c.rateLimitEnabled() && c.rateLimitExempt != "" {
-		return errors.New("-rate-limit-exempt requires -rate-limit or -rate-limit-path")
+	if !c.rateLimitEnabled() && !c.abuseEnabled() && c.rateLimitExempt != "" {
+		return errors.New("-rate-limit-exempt requires -rate-limit, -rate-limit-path, -failure-limit or -enumeration-limit")
 	}
 	if _, err := c.rateLimitRules(); err != nil {
+		return err
+	}
+	if _, err := c.abuseConfig(); err != nil {
 		return err
 	}
 	if _, err := ratelimit.ParsePrefixes(c.rateLimitExempt); err != nil {
@@ -647,6 +677,20 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
+	var abuseGuard *abuse.Guard
+	if cfg.abuseEnabled() {
+		ac, err := cfg.abuseConfig()
+		if err != nil {
+			return err
+		}
+		if ac.Exempt, err = ratelimit.ParsePrefixes(cfg.rateLimitExempt); err != nil {
+			return err
+		}
+		ac.MaxClients, ac.Logger = cfg.rateLimitMaxClients, logger
+		if abuseGuard, err = abuse.New(ac); err != nil {
+			return err
+		}
+	}
 	var guard *bot.Guard
 	if cfg.botProtection {
 		bc, err := cfg.botConfig()
@@ -685,6 +729,7 @@ func run(cfg config, logger *slog.Logger) error {
 		GraphQL:        graphqlGuard,
 		GRPC:           grpc.New(grpcConfig),
 		RateLimiter:    limiter,
+		Abuse:          abuseGuard,
 		Bot:            guard,
 		Mode:           mode,
 		Audit:          auditLogger,
@@ -831,6 +876,21 @@ func run(cfg config, logger *slog.Logger) error {
 		logger.Info("rate limiting enabled", "rules", rules, "exempt", cfg.rateLimitExempt)
 		if len(tp) == 0 {
 			logger.Info("rate limits count requests per TCP peer; behind a load balancer or CDN, set -trusted-proxies or all clients share one limit")
+		}
+	}
+	if abuseGuard != nil {
+		// The rules as they are applied, with the default statuses.
+		ac, _ := cfg.abuseConfig()
+		var failures, enumerations []string
+		for _, r := range ac.Failures {
+			failures = append(failures, r.String())
+		}
+		for _, r := range ac.Enumerations {
+			enumerations = append(enumerations, r.String())
+		}
+		logger.Info("business flow protection enabled", "failure_limits", failures, "enumeration_limits", enumerations, "exempt", cfg.rateLimitExempt)
+		if len(tp) == 0 {
+			logger.Info("failure and enumeration limits count requests per TCP peer; behind a load balancer or CDN, set -trusted-proxies or all clients share one limit")
 		}
 	}
 	if guard != nil {

@@ -68,6 +68,16 @@ See [Audit log](audit-log.md#audit-log) and
 A client is an IP address, or a `/64` network for IPv6. See
 [Rate limiting](rate-limiting.md).
 
+## Business flow protection
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-failure-limit` | (none) | Limit on failed attempts per client, as `[METHOD ]PATH=N/WINDOW[ STATUS,...]`, e.g. `POST /login=5/15m` (failures are `401` and `403` by default) or `POST /api/redeem=10/1h 4xx`; further requests to the flow get `429`; repeatable |
+| `-enumeration-limit` | (none) | Limit on distinct IDs per client, as `[METHOD ]PATH=N/WINDOW` with `{name}` segments, e.g. `GET /api/orders/{id}=100/1h`; requests for further IDs get `429`; repeatable |
+
+`-rate-limit-exempt` and `-rate-limit-max-clients` apply to them too. See
+[Business flow protection](business-logic.md).
+
 ## Geo filtering
 
 | Flag | Default | Description |

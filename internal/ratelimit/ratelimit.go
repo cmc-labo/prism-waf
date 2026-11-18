@@ -157,6 +157,11 @@ func formatWindow(d time.Duration) string {
 	return s
 }
 
+// Matches reports whether the rule applies to a request.
+func (r Rule) Matches(req *http.Request) bool {
+	return r.matches(req.Method, CleanPath(req.URL.Path))
+}
+
 func (r Rule) matches(method, cleanPath string) bool {
 	if r.Method != "" && r.Method != method {
 		return false
@@ -323,6 +328,41 @@ type Decision struct {
 // Allow counts a request from the client with the given IP address and
 // reports whether it is within the limits.
 func (l *Limiter) Allow(r *http.Request, clientIP string) Decision {
+	return l.decide(r, clientIP, true)
+}
+
+// Check reports whether a request is within the limits like Allow, but
+// does not count it. Together with Count it limits events that are only
+// known once a request has been answered, such as failed logins: Check
+// before forwarding a request, Count when its response is a failure.
+func (l *Limiter) Check(r *http.Request, clientIP string) Decision {
+	return l.decide(r, clientIP, false)
+}
+
+// Count counts a request for every rule that it matches, whether or not it
+// is within the limits. A client never owes more than one Window, so that
+// requests that were already being answered when it reached a limit do not
+// extend it.
+func (l *Limiter) Count(r *http.Request, clientIP string) {
+	var buf [8]int
+	key, idx := l.match(r, clientIP, buf[:0])
+	if len(idx) == 0 {
+		return
+	}
+	now := l.now().UnixNano()
+	sh := l.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	c := l.client(sh, key, now, true)
+	for _, i := range idx {
+		rule, st := l.rules[i], &c.rules[i]
+		st.tat = min(max(st.tat, now)+rule.interval(), now+int64(rule.Window))
+	}
+}
+
+// match returns the client key of a request and the indexes of the rules
+// that it matches, none for exempt clients, appended to idx.
+func (l *Limiter) match(r *http.Request, clientIP string, idx []int) (netip.Prefix, []int) {
 	addr, err := netip.ParseAddr(clientIP)
 	if err != nil {
 		// Not an IP address, e.g. a Unix socket: all such clients share
@@ -332,36 +372,53 @@ func (l *Limiter) Allow(r *http.Request, clientIP string) Decision {
 	addr = addr.Unmap()
 	for _, p := range l.exempt {
 		if p.Contains(addr) {
-			return Decision{Allowed: true}
+			return netip.Prefix{}, nil
 		}
 	}
-	var matched [8]int
-	idx := matched[:0]
 	cleanPath := CleanPath(r.URL.Path)
 	for i, rule := range l.rules {
 		if rule.matches(r.Method, cleanPath) {
 			idx = append(idx, i)
 		}
 	}
-	if len(idx) == 0 {
-		return Decision{Allowed: true}
-	}
-	key := clientKey(addr)
-	now := l.now().UnixNano()
+	return clientKey(addr), idx
+}
 
-	sh := &l.shards[maphash.Comparable(l.seed, key)%numShards]
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+func (l *Limiter) shard(key netip.Prefix) *shard {
+	return &l.shards[maphash.Comparable(l.seed, key)%numShards]
+}
+
+// client returns the state of a client, adding it if create is set, or
+// nil. The shard must be locked.
+func (l *Limiter) client(sh *shard, key netip.Prefix, now int64, create bool) *client {
 	if now-sh.lastSweep >= int64(sweepInterval) {
 		l.sweep(sh, now)
 	}
 	c := sh.clients[key]
-	if c == nil {
+	if c == nil && create {
 		if len(sh.clients) >= sh.max {
 			l.makeRoom(sh, now)
 		}
 		c = &client{rules: make([]ruleState, len(l.rules))}
 		sh.clients[key] = c
+	}
+	return c
+}
+
+func (l *Limiter) decide(r *http.Request, clientIP string, count bool) Decision {
+	var buf [8]int
+	key, idx := l.match(r, clientIP, buf[:0])
+	if len(idx) == 0 {
+		return Decision{Allowed: true}
+	}
+	now := l.now().UnixNano()
+	sh := l.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	// A client without state has its full allowance.
+	c := l.client(sh, key, now, count)
+	if c == nil {
+		return Decision{Allowed: true}
 	}
 
 	// Check every rule before counting the request for any of them, so a
@@ -378,7 +435,9 @@ func (l *Limiter) Allow(r *http.Request, clientIP string) Decision {
 	if denied < 0 {
 		for _, i := range idx {
 			st := &c.rules[i]
-			st.tat = max(st.tat, now) + l.rules[i].interval()
+			if count {
+				st.tat = max(st.tat, now) + l.rules[i].interval()
+			}
 			st.eventID = ""
 		}
 		return Decision{Allowed: true}

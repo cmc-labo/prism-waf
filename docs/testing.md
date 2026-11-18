@@ -16,6 +16,7 @@ PrismWAF has two kinds of tests:
 | [ACME expiry notifications](acme.md#expiry-notifications) | [`acme_test.go`, `acmeca_test.go`](#acme-expiry-notifications) | [2026-11-15](#results-2) |
 | [Geo filtering](geo-filtering.md) | [`geo_test.go`](#geo-filtering) | [2026-11-17](#results-3) |
 | [API protection](api-protection.md) | [`api_test.go`, `grpc_test.go`](#api-protection) | [2026-11-18](#results-4) |
+| [Business flow protection](business-logic.md) | [`abuse_test.go`](#business-flow-protection) | [2026-11-19](#results-5) |
 
 ```sh
 go test ./...                                      # unit tests
@@ -34,6 +35,7 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [ACME expiry notifications](#acme-expiry-notifications)
 - [Geo filtering](#geo-filtering)
 - [API protection](#api-protection)
+- [Business flow protection](#business-flow-protection)
 
 ## Requirements
 
@@ -719,3 +721,86 @@ the code was restored:
 - Real GraphQL servers; the test backend accepts every request.
 - OpenAPI documents with `$ref`s across many files, beyond the unit test.
 
+## Business flow protection
+
+```sh
+go test -tags e2e -run 'TestFailureLimit|TestEnumerationLimit|TestBusinessFlow' -v ./e2e/
+```
+
+The tests run prismwaf in front of a small shop: a login form that
+answers wrong passwords with `401`, orders by numeric ID (`404` for
+others), a streaming endpoint and a protocol upgrade. prismwaf trusts
+`127.0.0.1` as a proxy, so each request names its client in
+`X-Forwarded-For`.
+
+### What is tested (`e2e/abuse_test.go`)
+
+| Test | Checks |
+|------|--------|
+| `TestFailureLimit` | A user who logs in 10 times is not limited; an attacker gets 5 wrong guesses, then `429` with `Retry-After: 180` and the event ID, also with the right password, which does not reach the backend; variants of the path (`/LOGIN`, `/login/`, `//login`, `/x/../login`, `;jsessionid`) share the event; other paths and clients are not affected; one `failure_limit` event with the rule, the client and `retry_after`; the startup log shows the default statuses |
+| `TestFailureLimitStatuses` | A rule with `4xx` on `POST /api/orders/*`: `200` is not counted, `404` is; after two failures `429` with `Retry-After: 1`; a second later one more attempt is allowed, then the client is limited again |
+| `TestEnumerationLimit` | Three orders requested again and again pass; the fourth distinct order gets `429` with `Retry-After: 3600`, also spelled `/API/Orders/…`, percent-encoded, with dot segments or `;` parameters; orders already seen stay available; an IPv6 `/64` counts as one client, another `/64` does not |
+| `TestBusinessFlowModes` | Detection mode forwards every request and logs one `failure_limit` and one `enumeration` event; `-rate-limit-exempt` clients are never limited |
+| `TestFailureLimitStreaming` | Under a failure limit, a server-sent event arrives before the response ends, and a protocol upgrade (`101`) works in both directions |
+| `TestBusinessFlowStartup` | A rule without a window, an invalid status, a template without a parameter and a partial parameter segment are rejected at startup |
+
+The unit tests in `internal/abuse` cover the syntax of the rules,
+statuses and ranges, the windows of enumeration limits with a fixed clock,
+IPv6, exemptions and the maximum number of clients, and those in
+`internal/ratelimit` the counting of failures (`Check` and `Count`).
+`internal/waf` tests that attacks blocked by PrismWAF are not counted, detection mode and a `401`
+after `103 Early Hints`.
+
+### Results
+
+Run on 2026-11-19 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestFailureLimit` | Pass | 0.03s |
+| `TestFailureLimitStatuses` | Pass | 1.15s |
+| `TestEnumerationLimit` | Pass | 0.04s |
+| `TestBusinessFlowModes` | Pass | 0.07s |
+| `TestFailureLimitStreaming` | Pass | 0.02s |
+| `TestBusinessFlowStartup` | Pass | 0.04s |
+
+The whole E2E suite passed in 297 s, and these tests also passed three
+times with a prismwaf binary built with the race detector. The previous
+version rejects `-failure-limit` and `-enumeration-limit` as unknown flags.
+
+**Mutation check.** Each of these changes was caught by the tests, and
+the code was restored:
+
+| Change | Caught by |
+|--------|-----------|
+| Every response counted as a failure | Unit, E2E |
+| Status ranges without an upper bound | Unit |
+| Only `401` as the default failure | Unit, E2E |
+| No cap on failures counted while the client was limited | Unit |
+| Checking a request counts it as a failure | Unit, E2E |
+| Checking a request tracks a client without failures | Unit |
+| Exempt clients counted | Unit, E2E |
+| IDs already seen rejected | Unit, E2E |
+| Paths not cleaned for enumeration | Unit, E2E |
+| Enumeration windows that never end (before the clients are swept) | Unit |
+| Exempt clients limited by enumeration | Unit |
+| IPv6 clients counted by address instead of `/64` | E2E |
+| Every rejected request logged | Unit, E2E |
+| Method of an enumeration rule ignored | Unit |
+| No maximum number of clients for enumeration | Unit |
+| Responses not recorded | Unit, E2E |
+| Responses of PrismWAF itself, e.g. blocked attacks, counted as failures | Unit, E2E |
+| No `Unwrap` on the response writer (no upgrades) | E2E |
+| Detection mode rejects | Unit, E2E |
+| No audit event | Unit, E2E |
+| `403` instead of `429` | Unit, E2E |
+| `1xx` responses taken as the status | Unit |
+| `-rate-limit-exempt` not passed on | E2E |
+| Invalid statuses accepted | Unit |
+| Templates without a parameter accepted | Unit, E2E |
+
+**Not covered:**
+
+- Real login forms and APIs; the test backend is a stand-in.
+- Several prismwaf instances behind a load balancer, which count
+  separately.

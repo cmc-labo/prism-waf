@@ -71,6 +71,11 @@ func TestConfigValidate(t *testing.T) {
 		{"invalid rate limit exemption", config{rateLimit: "300/1m", rateLimitExempt: "office"}, true},
 		{"rate limit exemption without limits", config{rateLimitExempt: "10.0.0.0/8"}, true},
 		{"negative max clients", config{rateLimit: "300/1m", rateLimitMaxClients: -1}, true},
+		{"failure limit", config{failureLimits: stringList{"POST /login=5/15m", "POST /redeem=10/1h 4xx"}}, false},
+		{"enumeration limit", config{enumerationLimits: stringList{"GET /api/orders/{id}=100/1h"}}, false},
+		{"exemption with failure limit only", config{failureLimits: stringList{"POST /login=5/15m"}, rateLimitExempt: "10.0.0.0/8"}, false},
+		{"invalid failure limit", config{failureLimits: stringList{"POST /login=5/15m 99"}}, true},
+		{"invalid enumeration limit", config{enumerationLimits: stringList{"GET /api/orders=100/1h"}}, true},
 
 		{"geo lookup only", config{geoDB: "country.mmdb"}, false},
 		{"geo allow", config{geoDB: "country.mmdb", geoAllow: "jp, US,XX", geoExempt: "198.51.100.0/24"}, false},

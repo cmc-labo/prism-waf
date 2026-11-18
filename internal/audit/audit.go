@@ -35,14 +35,16 @@ type Event struct {
 	// detection mode).
 	Action string `json:"action"`
 	// Reason is why: "signature" (built-in signatures), "crs" (OWASP CRS),
-	// "body_too_large", "rate_limit", "bot", "geo" or "api" (API
-	// protection).
+	// "body_too_large", "rate_limit", "failure_limit" (too many failed
+	// attempts), "enumeration" (too many distinct IDs), "bot", "geo" or
+	// "api" (API protection).
 	Reason string `json:"reason"`
 	Rule   *Rule  `json:"rule,omitempty"`
 	Match  *Match `json:"match,omitempty"`
 	// CRS holds the details of an OWASP CRS detection.
 	CRS *CRS `json:"crs,omitempty"`
-	// RateLimit holds the details of an exceeded rate limit.
+	// RateLimit holds the details of an exceeded rate limit, failure limit
+	// or enumeration limit.
 	RateLimit *RateLimit `json:"rate_limit,omitempty"`
 	// Bot holds the details of a client that looks like a bot.
 	Bot *Bot `json:"bot,omitempty"`
@@ -107,11 +109,13 @@ type Bot struct {
 	Client string `json:"client"`
 }
 
-// RateLimit describes an exceeded rate limit. Only the first rejected
-// request of an excess is logged; the following ones share its event ID.
+// RateLimit describes an exceeded rate limit, failure limit or enumeration
+// limit. Only the first rejected request of an excess is logged; the
+// following ones share its event ID.
 type RateLimit struct {
 	// Rule is the exceeded rule, e.g. "POST /login=5/1m", or just the
-	// rate for the limit on all requests, e.g. "300/1m".
+	// rate for the limit on all requests, e.g. "300/1m". Failure rules
+	// include the failure statuses, e.g. "POST /login=5/15m 401,403".
 	Rule string `json:"rule"`
 	// Client is the address the requests were counted for: the client IP,
 	// or its /64 network for IPv6.

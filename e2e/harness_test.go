@@ -280,6 +280,11 @@ type auditEvent struct {
 		Challenge string   `json:"challenge"`
 		Client    string   `json:"client"`
 	} `json:"bot"`
+	RateLimit *struct {
+		Rule       string `json:"rule"`
+		Client     string `json:"client"`
+		RetryAfter int    `json:"retry_after"`
+	} `json:"rate_limit"`
 	Geo *struct {
 		List   string `json:"list"`
 		Client string `json:"client"`

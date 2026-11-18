@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cmc-labo/prism-waf/internal/abuse"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
@@ -87,6 +88,10 @@ type Config struct {
 	// RateLimiter, if set, limits the request rate of each client before
 	// requests are inspected.
 	RateLimiter *ratelimit.Limiter
+	// Abuse, if set, limits the failed attempts of each client at business
+	// flows such as logins and the distinct IDs it requests, after rate
+	// limiting. It does not apply to gRPC calls.
+	Abuse *abuse.Guard
 	// Bot, if set, scores how likely each request comes from a bot,
 	// passes the score to the backend in bot.ScoreHeader and challenges
 	// or blocks clients that look automated, after rate limiting and
@@ -108,10 +113,11 @@ type Config struct {
 // match a signature or the CRS, requests whose body exceeds the inspection
 // limit, requests over a rate limit, requests from countries that are not
 // allowed and API requests that API protection rejects are recorded in the
-// audit log. In ModeBlock they are then rejected with 403 Forbidden (or the
-// status a CRS rule asks for, such as 400 for an unparsable body), 413
-// Request Entity Too Large, 429 Too Many Requests, 403 Forbidden and 403
-// Forbidden respectively; in ModeDetect they are forwarded to next
+// audit log, as are clients over a failure or enumeration limit. In
+// ModeBlock they are then rejected with 403 Forbidden (or the status a CRS
+// rule asks for, such as 400 for an unparsable body), 413 Request Entity
+// Too Large, 429 Too Many Requests, 403 Forbidden, 403 Forbidden and 429
+// Too Many Requests respectively; in ModeDetect they are forwarded to next
 // unchanged. Likewise, clients that look like bots are challenged or
 // blocked in ModeBlock and only logged in ModeDetect.
 //
@@ -128,6 +134,9 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 	detect := cfg.Mode == ModeDetect
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		protocol, codec := grpc.ProtocolOf(r)
+		// forward passes the request on to next, through a recorder of
+		// failures if needed.
+		forward := next
 		block := func(code int, eventID string) { blockResponse(w, r, cfg, protocol, code, eventID) }
 
 		// Countries come first: blocked clients should not count towards
@@ -166,6 +175,26 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 			}
 		}
 
+		// Then the business flows: a client that guesses passwords or
+		// enumerates IDs should not get a challenge that lets it go on.
+		if cfg.Abuse != nil && protocol == grpc.None {
+			clientIP := cfg.TrustedProxies.ClientIP(r)
+			d := cfg.Abuse.Check(r, clientIP)
+			if !d.Allowed {
+				if d.First {
+					logAbuseEvent(cfg, logger, r, d)
+				}
+				if !detect {
+					w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(d.RetryAfter)))
+					block(http.StatusTooManyRequests, d.EventID)
+					return
+				}
+			}
+			if cfg.Abuse.CountsFailures(r) {
+				forward = recordFailures(next, cfg.Abuse, clientIP)
+			}
+		}
+
 		if cfg.Bot != nil {
 			clientIP, secure := cfg.TrustedProxies.ClientIP(r), cfg.TrustedProxies.IsHTTPS(r)
 			if r.URL.Path == bot.VerifyPath {
@@ -195,7 +224,7 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 		}
 
 		if protocol != grpc.None {
-			serveGRPC(w, r, next, cfg, logger, protocol, codec)
+			serveGRPC(w, r, forward, cfg, logger, protocol, codec)
 			return
 		}
 
@@ -219,7 +248,7 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 				block(http.StatusForbidden, id)
 				return
 			}
-			next.ServeHTTP(w, r)
+			forward.ServeHTTP(w, r)
 			return
 		}
 
@@ -235,9 +264,53 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 		if cfg.CRS != nil && !inspectCRS(cfg, logger, r, bufferedBody(r), block) {
 			return
 		}
-		next.ServeHTTP(w, r)
+		forward.ServeHTTP(w, r)
 	})
 }
+
+// recordFailures returns a handler that passes requests to next and
+// records the status of each response with the guard.
+func recordFailures(next http.Handler, g *abuse.Guard, clientIP string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		// Without a status, e.g. because the client went away, the
+		// attempt has no result.
+		if sw.status != 0 {
+			g.Record(r, clientIP, sw.status)
+		}
+	})
+}
+
+// statusWriter records the status of a response.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 && code >= 200 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// Unwrap lets http.ResponseController reach the connection.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // inspectCRS inspects a request with the CRS and reports whether it may
 // be forwarded; otherwise it has been answered.
@@ -384,6 +457,18 @@ func logRateLimitEvent(cfg Config, logger *slog.Logger, r *http.Request, d ratel
 	e := newEvent(cfg, r, d.EventID, "rate_limit", nil)
 	e.RateLimit = &audit.RateLimit{
 		Rule:       d.Rule.String(),
+		Client:     d.Client.String(),
+		RetryAfter: retryAfterSeconds(d.RetryAfter),
+	}
+	writeEvent(cfg, logger, e)
+}
+
+// logAbuseEvent writes an audit event for the first rejected request of a
+// client over a failure or enumeration limit.
+func logAbuseEvent(cfg Config, logger *slog.Logger, r *http.Request, d abuse.Decision) {
+	e := newEvent(cfg, r, d.EventID, d.Reason, nil)
+	e.RateLimit = &audit.RateLimit{
+		Rule:       d.Rule,
 		Client:     d.Client.String(),
 		RetryAfter: retryAfterSeconds(d.RetryAfter),
 	}

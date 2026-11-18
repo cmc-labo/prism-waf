@@ -388,3 +388,52 @@ func BenchmarkAllow(b *testing.B) {
 		}
 	})
 }
+
+func TestCheckCount(t *testing.T) {
+	l, now := testLimiter(t, Config{Exempt: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}, "POST /login=3/1m")
+	req := httptest.NewRequest("POST", "/login", nil)
+	ip := "192.0.2.1"
+	// Checking does not count.
+	for range 10 {
+		if d := l.Check(req, ip); !d.Allowed {
+			t.Fatal("rejected before any request was counted")
+		}
+	}
+	if l.Len() != 0 {
+		t.Errorf("Check added %d clients", l.Len())
+	}
+	for range 3 {
+		l.Count(req, ip)
+	}
+	d := l.Check(req, ip)
+	if d.Allowed || !d.First || d.RetryAfter != 20*time.Second {
+		t.Fatalf("after 3 counted requests: %+v", d)
+	}
+	if d2 := l.Check(req, ip); d2.Allowed || d2.First || d2.EventID != d.EventID {
+		t.Errorf("second check: %+v", d2)
+	}
+	// Requests that were in flight do not extend the excess: the
+	// client owes at most one window.
+	for range 100 {
+		l.Count(req, ip)
+	}
+	if d := l.Check(req, ip); d.RetryAfter != 20*time.Second {
+		t.Errorf("RetryAfter after more counts = %v, want 20s", d.RetryAfter)
+	}
+	*now = now.Add(time.Minute)
+	if d := l.Check(req, ip); !d.Allowed {
+		t.Errorf("rejected a window later: %+v", d)
+	}
+	// The client was forgotten when its allowance refilled. Other paths
+	// and exempt clients are not counted.
+	l.Count(httptest.NewRequest("POST", "/other", nil), "192.0.2.9")
+	for range 10 {
+		l.Count(req, "10.1.2.3")
+	}
+	if d := l.Check(req, "10.1.2.3"); !d.Allowed {
+		t.Error("exempt client rejected")
+	}
+	if l.Len() != 0 {
+		t.Errorf("Len = %d, want 0", l.Len())
+	}
+}
