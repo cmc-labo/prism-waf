@@ -22,6 +22,7 @@ internal/waf/        signatures, request inspection, JSON/XML body parsing
 internal/crs/        OWASP CRS v4 with the Coraza engine
 internal/ratelimit/  request rate limits per client and path
 internal/abuse/      failure and enumeration limits of business flows
+internal/ddos/       connection limits, timeouts of slow clients, requests in progress, bans
 internal/openapi/    validation of requests against OpenAPI documents
 internal/graphql/    GraphQL query limits, introspection, schema validation
 internal/grpc/       gRPC message streams, protobuf decoding, gRPC status responses

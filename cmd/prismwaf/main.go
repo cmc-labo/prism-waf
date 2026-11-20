@@ -22,6 +22,7 @@ import (
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/ddos"
 	"github.com/cmc-labo/prism-waf/internal/geo"
 	"github.com/cmc-labo/prism-waf/internal/graphql"
 	"github.com/cmc-labo/prism-waf/internal/grpc"
@@ -58,6 +59,15 @@ func main() {
 	flag.Var(&cfg.enumerationLimits, "enumeration-limit", `per-client limit on distinct IDs as "[METHOD ]PATH=N/WINDOW" with {name} segments, e.g. "GET /api/orders/{id}=100/1h"; requests for further IDs get 429; repeatable`)
 	flag.StringVar(&cfg.rateLimitExempt, "rate-limit-exempt", "", "comma-separated IPs or CIDRs of clients that are never rate limited (nor failure or enumeration limited)")
 	flag.IntVar(&cfg.rateLimitMaxClients, "rate-limit-max-clients", ratelimit.DefaultMaxClients, "maximum number of clients whose request rate is tracked at once (also per -failure-limit and for all -enumeration-limit rules)")
+	flag.DurationVar(&cfg.readHeaderTimeout, "read-header-timeout", 10*time.Second, "time a client has to send the request line and headers, and a new connection its first bytes; 0 disables")
+	flag.DurationVar(&cfg.bodyTimeout, "body-timeout", ddos.DefaultBodyTimeout, "time a client has to start sending a request body, extended by -body-min-rate; slower requests get 408; 0 disables")
+	flag.Int64Var(&cfg.bodyMinRate, "body-min-rate", ddos.DefaultBodyMinRate, "minimum rate in bytes per second at which clients must send request bodies after -body-timeout")
+	flag.IntVar(&cfg.maxConns, "max-conns", 0, "maximum open client connections; more are closed when accepted; 0 means no limit")
+	flag.IntVar(&cfg.maxConnsPerIP, "max-conns-per-ip", 0, "maximum open connections per client IP (/64 for IPv6), except -trusted-proxies; 0 means no limit")
+	flag.IntVar(&cfg.maxRequests, "max-requests", 0, "maximum requests in progress; more get 503; 0 means no limit")
+	flag.IntVar(&cfg.maxClientRequests, "max-client-requests", 0, "maximum requests in progress per client; more get 429; 0 means no limit")
+	flag.StringVar(&cfg.ban, "ban", "", `ban clients whose requests are rejected N times per WINDOW, e.g. "100/1m": all their requests get 403 and their connections are closed for -ban-duration`)
+	flag.DurationVar(&cfg.banDuration, "ban-duration", 10*time.Minute, "how long a client is banned by -ban")
 	flag.StringVar(&cfg.geoDB, "geo-db", "", "MaxMind DB file to look up the country of clients in (GeoLite2 or GeoIP2 Country or City, DB-IP IP to Country, IPinfo Lite); reloaded when it changes")
 	flag.StringVar(&cfg.geoAllow, "geo-allow", "", `comma-separated ISO 3166-1 country codes to allow, e.g. "JP,US"; requests from other countries get 403 ("XX" is unknown)`)
 	flag.StringVar(&cfg.geoBlock, "geo-block", "", `comma-separated ISO 3166-1 country codes to block with 403, e.g. "CN,RU" ("XX" is unknown)`)
@@ -141,6 +151,15 @@ type config struct {
 	failureLimits        stringList
 	enumerationLimits    stringList
 	rateLimitMaxClients  int
+	readHeaderTimeout    time.Duration
+	bodyTimeout          time.Duration
+	bodyMinRate          int64
+	maxConns             int
+	maxConnsPerIP        int
+	maxRequests          int
+	maxClientRequests    int
+	ban                  string
+	banDuration          time.Duration
 	geoDB                string
 	geoAllow             string
 	geoBlock             string
@@ -257,6 +276,30 @@ func (c config) rateLimitRules() ([]ratelimit.Rule, error) {
 		rules = append(rules, r)
 	}
 	return rules, nil
+}
+
+// validateDoS checks the options against denial of service.
+func (c config) validateDoS() error {
+	if c.readHeaderTimeout < 0 || c.bodyTimeout < 0 {
+		return errors.New("-read-header-timeout and -body-timeout must not be negative")
+	}
+	if c.bodyMinRate < 0 {
+		return errors.New("-body-min-rate must not be negative")
+	}
+	if c.maxConns < 0 || c.maxConnsPerIP < 0 || c.maxRequests < 0 || c.maxClientRequests < 0 {
+		return errors.New("-max-conns, -max-conns-per-ip, -max-requests and -max-client-requests must not be negative")
+	}
+	if c.ban != "" {
+		if _, _, err := ratelimit.ParseRate(c.ban); err != nil {
+			return fmt.Errorf("invalid -ban: %w", err)
+		}
+		if c.banDuration <= 0 {
+			return errors.New("-ban-duration must be positive")
+		}
+	} else if slices.Contains(c.setFlags, "ban-duration") {
+		return errors.New("-ban-duration requires -ban")
+	}
+	return nil
 }
 
 func (c config) abuseEnabled() bool { return len(c.failureLimits) > 0 || len(c.enumerationLimits) > 0 }
@@ -401,6 +444,9 @@ func (c config) notifier(logger *slog.Logger) (*notify.Notifier, error) {
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
 
 func (c config) validate() error {
+	if err := c.validateDoS(); err != nil {
+		return err
+	}
 	switch c.engine {
 	case "", engineBuiltin, engineCRS, engineBoth:
 	default:
@@ -426,8 +472,8 @@ func (c config) validate() error {
 			return errors.New("-health-check-interval and -health-check-timeout must be positive")
 		}
 	}
-	if !c.rateLimitEnabled() && !c.abuseEnabled() && c.rateLimitExempt != "" {
-		return errors.New("-rate-limit-exempt requires -rate-limit, -rate-limit-path, -failure-limit or -enumeration-limit")
+	if !c.rateLimitEnabled() && !c.abuseEnabled() && c.ban == "" && c.maxConnsPerIP == 0 && c.maxClientRequests == 0 && c.rateLimitExempt != "" {
+		return errors.New("-rate-limit-exempt requires -rate-limit, -rate-limit-path, -failure-limit, -enumeration-limit, -ban, -max-conns-per-ip or -max-client-requests")
 	}
 	if _, err := c.rateLimitRules(); err != nil {
 		return err
@@ -691,6 +737,28 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
+	dosExempt, err := ratelimit.ParsePrefixes(cfg.rateLimitExempt)
+	if err != nil {
+		return err
+	}
+	var bans *ddos.Bans
+	if cfg.ban != "" {
+		limit, window, _ := ratelimit.ParseRate(cfg.ban)
+		if bans, err = ddos.NewBans(ddos.BanConfig{
+			Limit: limit, Window: window, Duration: cfg.banDuration,
+			Exempt: dosExempt, MaxClients: cfg.rateLimitMaxClients, Logger: logger,
+		}); err != nil {
+			return err
+		}
+	}
+	var concurrency *ddos.Concurrency
+	if cfg.maxRequests > 0 || cfg.maxClientRequests > 0 {
+		if concurrency, err = ddos.NewConcurrency(ddos.ConcurrencyConfig{
+			Max: cfg.maxRequests, MaxPerClient: cfg.maxClientRequests, Exempt: dosExempt,
+		}); err != nil {
+			return err
+		}
+	}
 	var guard *bot.Guard
 	if cfg.botProtection {
 		bc, err := cfg.botConfig()
@@ -730,6 +798,9 @@ func run(cfg config, logger *slog.Logger) error {
 		GRPC:           grpc.New(grpcConfig),
 		RateLimiter:    limiter,
 		Abuse:          abuseGuard,
+		Bans:           bans,
+		Concurrency:    concurrency,
+		BodyTimeout:    ddos.BodyTimeout{Timeout: cfg.bodyTimeout, MinRate: cfg.bodyMinRate},
 		Bot:            guard,
 		Mode:           mode,
 		Audit:          auditLogger,
@@ -743,7 +814,7 @@ func run(cfg config, logger *slog.Logger) error {
 	srv := &http.Server{
 		Addr:              cfg.listen,
 		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: cfg.readHeaderTimeout,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          httpErrorLog,
@@ -815,7 +886,7 @@ func run(cfg config, logger *slog.Logger) error {
 			servers = append(servers, &http.Server{
 				Addr:              cfg.httpRedirect,
 				Handler:           redirect,
-				ReadHeaderTimeout: 10 * time.Second,
+				ReadHeaderTimeout: cfg.readHeaderTimeout,
 				IdleTimeout:       120 * time.Second,
 				MaxHeaderBytes:    maxHeaderBytes,
 				ErrorLog:          httpErrorLog,
@@ -893,6 +964,10 @@ func run(cfg config, logger *slog.Logger) error {
 			logger.Info("failure and enumeration limits count requests per TCP peer; behind a load balancer or CDN, set -trusted-proxies or all clients share one limit")
 		}
 	}
+	logger.Info("denial of service protection", "read_header_timeout", cfg.readHeaderTimeout,
+		"body_timeout", cfg.bodyTimeout, "body_min_rate", cfg.bodyMinRate,
+		"max_conns", cfg.maxConns, "max_conns_per_ip", cfg.maxConnsPerIP,
+		"max_requests", cfg.maxRequests, "max_client_requests", cfg.maxClientRequests, "ban", banRule(bans))
 	if guard != nil {
 		blockScore := "disabled"
 		if guard.BlockScore() > 0 {
@@ -952,7 +1027,15 @@ func run(cfg config, logger *slog.Logger) error {
 			}
 			return err
 		}
-		listeners[i] = ln
+		listeners[i] = ddos.NewListener(ln, ddos.ListenerConfig{
+			FirstByteTimeout:  cfg.readHeaderTimeout,
+			MaxConns:          cfg.maxConns,
+			MaxConnsPerClient: cfg.maxConnsPerIP,
+			// A proxy's connections carry many clients.
+			Exempt: append(slices.Clone(tp), dosExempt...),
+			Bans:   bans,
+			Logger: logger,
+		})
 	}
 	errCh := make(chan error, len(servers))
 	for i, s := range servers {
@@ -990,6 +1073,14 @@ func run(cfg config, logger *slog.Logger) error {
 		}
 	}
 	return runErr
+}
+
+// banRule returns the rule of bans for the log, or "disabled".
+func banRule(b *ddos.Bans) string {
+	if b == nil {
+		return "disabled"
+	}
+	return b.Rule()
 }
 
 // serverProtocols returns the protocols of the listeners: HTTP/1.1, and

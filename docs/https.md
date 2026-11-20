@@ -24,6 +24,9 @@ go run ./cmd/prismwaf -listen :443 \
   If the new files cannot be loaded, the current certificate stays in use
   and an error is logged.
 - The backend receives `X-Forwarded-Proto: https`.
+- The TLS handshake must finish within `-read-header-timeout`, and
+  connections over the [connection limits](ddos.md#connection-limits) are
+  closed before it.
 
 For local testing, create a self-signed certificate:
 

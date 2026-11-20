@@ -68,6 +68,23 @@ See [Audit log](audit-log.md#audit-log) and
 A client is an IP address, or a `/64` network for IPv6. See
 [Rate limiting](rate-limiting.md).
 
+## Denial of service protection
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-read-header-timeout` | `10s` | Time a new connection has to send its first bytes and a client its request line and headers; also the TLS handshake timeout |
+| `-body-timeout` | `20s` | Time a client has to start sending a request body, extended by `-body-min-rate`; slower requests get `408`. `0` disables |
+| `-body-min-rate` | `500` | Minimum rate of request bodies in bytes per second |
+| `-max-conns` | `0` (no limit) | Maximum open client connections |
+| `-max-conns-per-ip` | `0` (no limit) | Maximum open connections per client address, except trusted proxies |
+| `-max-requests` | `0` (no limit) | Maximum requests in progress; more get `503` |
+| `-max-client-requests` | `0` (no limit) | Maximum requests in progress per client; more get `429` |
+| `-ban` | (none) | Ban clients whose requests are rejected `N` times per `WINDOW`, e.g. `100/1m`; their requests get `403` and their connections are closed |
+| `-ban-duration` | `10m` | How long a client is banned |
+
+`-rate-limit-exempt` and `-rate-limit-max-clients` apply to them too. See
+[Denial of service protection](ddos.md).
+
 ## Business flow protection
 
 | Flag | Default | Description |
@@ -164,6 +181,8 @@ See [HTTPS](https.md) and [Automatic certificates](acme.md).
 | Limit | Value | Response |
 |-------|-------|----------|
 | Request line and headers | 64 KiB | `431 Request Header Fields Too Large` |
+| Idle keep-alive connections | 120 s | Connection closed |
+| HTTP/2 streams per connection | 250 | Further streams refused by HTTP/2 |
 
 ## Signals
 

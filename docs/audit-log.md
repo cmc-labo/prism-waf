@@ -65,7 +65,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `id` | Event ID. In block mode it is also returned in the `403`/`413`/`429` response body (in a GraphQL error on GraphQL endpoints, in `grpc-message` for gRPC calls) and on the challenge page, so users can report false positives. |
 | `client_ip` | Client address (see [Client IP](#client-ip)). |
 | `action` | `block`, `challenge` (a [bot challenge](bot-protection.md) was served), or `detect` in detection mode. |
-| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit`, `failure_limit`, `enumeration`, `bot`, `geo` or `api`. |
+| `reason` | `signature`, `crs`, `body_too_large`, `rate_limit`, `failure_limit`, `enumeration`, `concurrency`, `ban`, `slow_request`, `bot`, `geo` or `api`. |
 | `country` | With `-geo-db`: the client's country, e.g. `JP`, or `XX` if unknown. Absent for private addresses. See [Geo filtering](geo-filtering.md). |
 | `rule` | The signature that matched. For the CRS, the most severe matched rule, e.g. `{"id": "942100", "category": "sqli"}`, or the rule that rejected the request on its own (e.g. 200002). |
 | `match.location`, `match.field` | Where it matched: `path`, `query`, `header` (with the header name), `body` (with the path of the value for JSON and XML bodies), `graphql` (with the argument, e.g. `user(name)`) or `grpc` (with the message and field, e.g. `[0].filter.name`). For the CRS, the ModSecurity variable and key, e.g. `ARGS` and `json.user.name`. |
@@ -73,7 +73,7 @@ file instead (created with mode `0600`, since payloads may contain secrets).
 | `match.value` | The raw value that was inspected, i.e. the payload as sent. Truncated to 4 KiB (`value_truncated`, `value_length`). |
 | `match.base64` | `true` if the match was in Base64-decoded data. |
 | `crs` | CRS details: `anomaly_score`, `deciding_rule` (usually 949110, "anomaly score exceeded") and `rules`, every matched rule with its `id`, `message`, `severity`, `variable` and matched `value`. |
-| `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events), [failure or enumeration limit](business-logic.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
+| `rate_limit` | The exceeded [rate limit](rate-limiting.md#responses-and-audit-events), [failure or enumeration limit](business-logic.md#responses-and-audit-events), [limit of requests in progress or ban](ddos.md#responses-and-audit-events): `rule`, `client` and `retry_after`. Only the first rejected request of each excess is logged. |
 | `bot` | Why the client looks like a [bot](bot-protection.md#responses-and-audit-events): `score`, `signals`, `category`, `name` and `verified` of a known bot, `challenge` (`pow` or `captcha`) and `client`. Logged for the first challenged or blocked request of a client, then at most once a minute. |
 | `geo` | Why the client was [blocked by its country](geo-filtering.md#responses-and-audit-events): `list` (`allow` or `block`) and `client`. Logged for the first blocked request of a client, then at most once a minute. |
 | `api` | Why [API protection](api-protection.md#audit-events) rejected the request: `protocol` (`openapi`, `graphql`, `grpc`), `violation`, `operation`, `limit` and `value` of a GraphQL limit, and `message`. |

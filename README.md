@@ -17,6 +17,10 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   inspected on its own
 - **Rate limiting**: limit requests per client, overall and per path, e.g.
   5 login attempts per minute ([details](docs/rate-limiting.md))
+- **Denial of service protection**: time out slow clients (Slowloris,
+  slow POST), limit connections and requests in progress per client and
+  in total, shed load with `503`, and ban clients that keep getting
+  rejected ([details](docs/ddos.md))
 - **Business flow protection**: stop password, code and coupon guessing by
   limiting failed attempts per client, and ID enumeration (scraping,
   broken object level authorization) by limiting distinct IDs per client
@@ -86,6 +90,8 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 - [OWASP Core Rule Set](docs/crs.md): engine selection, paranoia level,
   anomaly threshold, rule exclusions and use cases
 - [Rate limiting](docs/rate-limiting.md)
+- [Denial of service protection](docs/ddos.md): timeouts, connection and
+  concurrency limits, bans
 - [Business flow protection](docs/business-logic.md): failure and
   enumeration limits
 - [Geo filtering](docs/geo-filtering.md)

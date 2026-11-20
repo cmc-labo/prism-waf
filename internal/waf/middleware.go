@@ -7,14 +7,17 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/abuse"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
+	"github.com/cmc-labo/prism-waf/internal/ddos"
 	"github.com/cmc-labo/prism-waf/internal/geo"
 	"github.com/cmc-labo/prism-waf/internal/graphql"
 	"github.com/cmc-labo/prism-waf/internal/grpc"
@@ -81,6 +84,18 @@ type Config struct {
 	// GRPC checks the methods of gRPC calls. Nil blocks the server
 	// reflection service and allows every other method.
 	GRPC *grpc.Guard
+	// Bans, if set, rejects every request of clients that were rejected
+	// too often, first, and counts the rejections of each client. Requests
+	// are only rejected in ModeBlock, so clients are not banned in
+	// ModeDetect.
+	Bans *ddos.Bans
+	// Concurrency, if set, limits the requests in progress, in total and
+	// per client, before any other check but bans.
+	Concurrency *ddos.Concurrency
+	// BodyTimeout makes clients send request bodies at a minimum rate,
+	// except gRPC calls, whose streams may pause. The zero value disables
+	// it.
+	BodyTimeout ddos.BodyTimeout
 	// Geo, if set, looks up the country of each client first, passes it
 	// to the backend in geo.CountryHeader and in audit events, and blocks
 	// clients from countries that are not allowed.
@@ -121,6 +136,11 @@ type Config struct {
 // unchanged. Likewise, clients that look like bots are challenged or
 // blocked in ModeBlock and only logged in ModeDetect.
 //
+// Before all of these, banned clients get 403 Forbidden, clients over
+// their limit of requests in progress 429 Too Many Requests, and requests
+// over the total limit 503 Service Unavailable, which is not audited.
+// Requests whose body is too slow get 408 Request Timeout in both modes.
+//
 // gRPC and gRPC-Web calls are inspected message by message while they are
 // forwarded (see serveGRPC), and rejected calls get a gRPC status.
 func Middleware(next http.Handler, cfg Config) http.Handler {
@@ -132,12 +152,63 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 		cfg.GRPC = grpc.New(grpc.Config{})
 	}
 	detect := cfg.Mode == ModeDetect
+	var overload overloadLog
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		protocol, codec := grpc.ProtocolOf(r)
 		// forward passes the request on to next, through a recorder of
 		// failures if needed.
 		forward := next
-		block := func(code int, eventID string) { blockResponse(w, r, cfg, protocol, code, eventID) }
+		clientIP := cfg.TrustedProxies.ClientIP(r)
+		block := func(code int, eventID string) {
+			blockResponse(w, r, cfg, protocol, code, eventID)
+			// Errors of PrismWAF are not the client's fault.
+			if cfg.Bans != nil && code < 500 {
+				if d := cfg.Bans.Strike(r, clientIP); d.First {
+					logBanEvent(cfg, logger, r, d)
+				}
+			}
+		}
+
+		// Banned clients first: rejecting them is the cheapest. The
+		// connection is closed, so that the next one is refused when it
+		// is accepted.
+		if cfg.Bans != nil {
+			if d := cfg.Bans.Check(clientIP); d.Banned {
+				w.Header().Set("Connection", "close")
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(d.RetryAfter)))
+				blockResponse(w, r, cfg, protocol, http.StatusForbidden, d.EventID)
+				return
+			}
+		}
+
+		// Then the requests in progress, so that an overloaded PrismWAF
+		// sheds requests before it spends time on them.
+		if cfg.Concurrency != nil {
+			release, d := cfg.Concurrency.Acquire(clientIP)
+			switch {
+			case d.Allowed:
+				defer release()
+			case d.Overloaded:
+				overload.log(cfg, logger)
+				if !detect {
+					w.Header().Set("Retry-After", "1")
+					overloadResponse(w, protocol)
+					return
+				}
+			default:
+				if d.First {
+					logConcurrencyEvent(cfg, logger, r, d)
+				}
+				if !detect {
+					w.Header().Set("Retry-After", "1")
+					block(http.StatusTooManyRequests, d.EventID)
+					return
+				}
+			}
+		}
+		if protocol == grpc.None {
+			cfg.BodyTimeout.Apply(w, r)
+		}
 
 		// Countries come first: blocked clients should not count towards
 		// rate limits or get challenges.
@@ -238,6 +309,12 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 				block(http.StatusRequestEntityTooLarge, id)
 				return
 			}
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			// The body cannot be forwarded either.
+			id := logSlowRequest(cfg, logger, r)
+			w.Header().Set("Connection", "close")
+			block(http.StatusRequestTimeout, id)
+			return
 		case err != nil:
 			logger.Error("failed to inspect request", "remote_addr", r.RemoteAddr, "error", err)
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -507,6 +584,71 @@ func logAPIEvent(cfg Config, logger *slog.Logger, r *http.Request, a *audit.API)
 	e.API = a
 	writeEvent(cfg, logger, e)
 	return e.ID
+}
+
+// logBanEvent writes an audit event for a client that has been banned.
+func logBanEvent(cfg Config, logger *slog.Logger, r *http.Request, d ddos.BanDecision) {
+	e := newEvent(cfg, r, d.EventID, "ban", nil)
+	e.RateLimit = &audit.RateLimit{
+		Rule:       cfg.Bans.Rule(),
+		Client:     d.Client.String(),
+		RetryAfter: retryAfterSeconds(d.RetryAfter),
+	}
+	writeEvent(cfg, logger, e)
+}
+
+// logConcurrencyEvent writes an audit event for the first rejected request
+// of a client over its limit of requests in progress.
+func logConcurrencyEvent(cfg Config, logger *slog.Logger, r *http.Request, d ddos.ConcurrencyDecision) {
+	e := newEvent(cfg, r, d.EventID, "concurrency", nil)
+	e.RateLimit = &audit.RateLimit{
+		Rule:       strconv.Itoa(cfg.Concurrency.Config().MaxPerClient) + " in progress",
+		Client:     d.Client.String(),
+		RetryAfter: 1,
+	}
+	writeEvent(cfg, logger, e)
+}
+
+// logSlowRequest writes an audit event for a request whose body was too
+// slow, which is rejected in both modes, and returns its ID.
+func logSlowRequest(cfg Config, logger *slog.Logger, r *http.Request) string {
+	e := newEvent(cfg, r, audit.NewID(), "slow_request", nil)
+	e.Action = "block"
+	writeEvent(cfg, logger, e)
+	return e.ID
+}
+
+// overloadLog logs the requests rejected because too many are in
+// progress, at most once a minute. They are not audit events: they are not
+// the fault of the client.
+type overloadLog struct {
+	mu    sync.Mutex
+	last  time.Time
+	count int
+}
+
+func (o *overloadLog) log(cfg Config, logger *slog.Logger) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.count++
+	if now := time.Now(); now.Sub(o.last) >= time.Minute {
+		msg := "too many requests in progress; rejecting requests with 503"
+		if cfg.Mode == ModeDetect {
+			msg = "too many requests in progress; detection mode, so not rejecting them"
+		}
+		logger.Warn(msg, "max_requests", cfg.Concurrency.Config().Max, "count_last_minute", o.count)
+		o.last, o.count = now, 0
+	}
+}
+
+// overloadResponse answers a request that is rejected because PrismWAF is
+// overloaded, without an event ID: nothing is logged for it.
+func overloadResponse(w http.ResponseWriter, protocol grpc.Protocol) {
+	if protocol != grpc.None {
+		grpc.WriteError(w, protocol, grpc.StatusFromHTTP(http.StatusServiceUnavailable), http.StatusText(http.StatusServiceUnavailable))
+		return
+	}
+	http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 }
 
 // logGeoEvent writes an audit event for the first blocked request of a

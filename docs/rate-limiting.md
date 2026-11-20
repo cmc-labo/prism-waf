@@ -115,7 +115,8 @@ flood is rejected before PrismWAF spends time on its body. Requests that
 are then blocked as attacks still count: a scanner that sends attack
 payloads quickly is slowed down by the rate limit as well.
 Clients [blocked by their country](geo-filtering.md) are rejected before
-the rate limits and do not count. [Failure and enumeration
+the rate limits and do not count, and so are [banned clients and requests
+over the limits of requests in progress](ddos.md#order-of-processing). [Failure and enumeration
 limits](business-logic.md) are checked after the rate limits.
 
 ### Memory
@@ -295,11 +296,11 @@ while it is on.
 
 ## Limitations
 
-- PrismWAF limits HTTP requests. Floods of TCP connections or TLS
-  handshakes, and attacks that saturate the network, have to be stopped
-  before they reach PrismWAF, e.g. by the hosting provider or a CDN.
-  PrismWAF's [fixed limits](configuration.md#fixed-limits) and timeouts
-  protect against slow and oversized requests.
+- Rate limits count requests. Slow clients, connections and requests in
+  progress are limited by [denial of service protection](ddos.md), which
+  can also ban clients that keep exceeding the rate limits. Attacks that
+  saturate the network have to be stopped before they reach PrismWAF,
+  e.g. by the hosting provider or a CDN.
 - Counters are per process and are reset by a restart (see
   [Several instances and restarts](#several-instances-and-restarts)).
 - Limits are per client only. There is no limit on all clients together,

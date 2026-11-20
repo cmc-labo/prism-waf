@@ -17,6 +17,7 @@ PrismWAF has two kinds of tests:
 | [Geo filtering](geo-filtering.md) | [`geo_test.go`](#geo-filtering) | [2026-11-17](#results-3) |
 | [API protection](api-protection.md) | [`api_test.go`, `grpc_test.go`](#api-protection) | [2026-11-18](#results-4) |
 | [Business flow protection](business-logic.md) | [`abuse_test.go`](#business-flow-protection) | [2026-11-19](#results-5) |
+| [Denial of service protection](ddos.md) | [`ddos_test.go`](#denial-of-service-protection) | [2026-11-20](#results-6) |
 
 ```sh
 go test ./...                                      # unit tests
@@ -36,6 +37,7 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [Geo filtering](#geo-filtering)
 - [API protection](#api-protection)
 - [Business flow protection](#business-flow-protection)
+- [Denial of service protection](#denial-of-service-protection)
 
 ## Requirements
 
@@ -804,3 +806,118 @@ the code was restored:
 - Real login forms and APIs; the test backend is a stand-in.
 - Several prismwaf instances behind a load balancer, which count
   separately.
+
+## Denial of service protection
+
+```sh
+go test -tags e2e -run 'TestIdleConnections|TestSlowBody|TestConnectionLimits|TestConcurrencyLimits|TestBan|TestDoSStartup' -v ./e2e/
+```
+
+The tests connect from several loopback addresses (`127.0.0.2`,
+`127.0.0.3`, …), so that each client has an address of its own without
+`-trusted-proxies`. Linux routes all of `127.0.0.0/8` to the loopback
+interface.
+
+### What is tested (`e2e/ddos_test.go`)
+
+| Test | Checks |
+|------|--------|
+| `TestIdleConnections` | With `-read-header-timeout 1s`, connections that send nothing, `G`, the first 14 bytes of the h2c preface or incomplete headers are closed within 2 s; HTTP/1.1 keep-alive and h2c connections are reused after 1.5 s idle |
+| `TestIdleConnectionsTLS` | A TLS connection without a handshake is closed; HTTPS requests on a reused connection work after 1.5 s idle |
+| `TestSlowBody` | A body sent byte by byte gets `408` with `Connection: close` within 2.5 s and a `slow_request` event with the client; a 100 KB upload over 2 s at more than `-body-min-rate` passes |
+| `TestSlowBodyGRPC` | A bidirectional gRPC stream that pauses for 1.5 s twice, longer than `-body-timeout` and `-read-header-timeout`, keeps working |
+| `TestConnectionLimits` | `-max-conns-per-ip 2`: the third connection of an address is closed, another address is not limited; `-max-conns 4`: the fifth is closed; a closed connection makes room; the operational log names the reason; connections of a trusted proxy are not limited per address |
+| `TestConcurrencyLimits` | With two slow requests of a client and one of another in progress, the client gets `429` with a `concurrency` event, everyone else `503` without an event ID and a warning in the log; after the slow requests, requests pass again |
+| `TestBan` | `-rate-limit 2/1m -ban 3/1m -ban-duration 2s`: after three `429`, the client gets `403` with `Connection: close` and one `ban` event; its new connections are closed when accepted; another client is served; after 2 s the rate limit applies again |
+| `TestDoSStartup` | Negative limits, an invalid `-ban`, `-ban-duration` without `-ban` or of zero, and a negative `-body-min-rate` are rejected at startup |
+
+The unit tests in `internal/ddos` check the listener against a Go
+`http.Server` with h2c, as PrismWAF runs it, and with TLS; the limits of
+connections, bans and requests in progress with exempt clients; and the
+body timeout with slow, timely and pausing bodies, including a response
+that takes longer than the deadline after the body. `internal/waf` tests
+the responses, the audit events and detection mode.
+
+### Results
+
+Run on 2026-11-20 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestIdleConnections` | Pass | 7.21s |
+| `TestIdleConnectionsTLS` | Pass | 4.10s |
+| `TestSlowBody` | Pass | 3.10s |
+| `TestSlowBodyGRPC` | Pass | 3.09s |
+| `TestConnectionLimits` | Pass | 2.37s |
+| `TestConcurrencyLimits` | Pass | 0.05s |
+| `TestBan` | Pass | 2.17s |
+| `TestDoSStartup` | Pass | 0.12s |
+
+The whole E2E suite passed in 317 s, and these tests also passed three
+times with a prismwaf binary built with the race detector. The
+[measurements of attacks](ddos.md#measurements) compare the previous
+version with this one. The throughput of normal requests did not change
+measurably (about 10,500 requests per second over keep-alive in both
+versions, within the variation between runs).
+
+**Before.** Against the previous version, a plain-text connection that
+sent nothing or fewer than 14 bytes stayed open for more than 90 seconds
+(measured with a client outside the tests); without the new listener,
+`TestIdleConnections` fails.
+
+**Mutation check.** Each of these changes was caught by the tests, and
+the code was restored:
+
+| Change | Caught by |
+|--------|-----------|
+| No deadline for the first bytes | Unit, E2E |
+| Deadline not cleared after the h2c preface (h2c connections closed) | E2E |
+| Deadline kept when net/http sets its own | E2E |
+| Timed-out connection given a second timeout by net/http | E2E |
+| No total connection limit | Unit, E2E |
+| Clients without connections not forgotten | Unit |
+| Connections not released when closed | Unit, E2E |
+| Exempt addresses limited at accept | Unit |
+| Trusted proxies limited per address | E2E |
+| Banned clients' connections accepted | Unit, E2E |
+| Bans that never end | Unit, E2E |
+| Every rejection during a ban logged as a new ban | Unit |
+| No maximum number of bans | Unit |
+| No limit of requests in progress per client | Unit, E2E |
+| No total limit of requests in progress | Unit, E2E |
+| Exempt clients limited in requests in progress | Unit |
+| Releasing a request twice counted twice | Unit, E2E |
+| Excess of a client not ended by an allowed request | Unit |
+| Body deadline not extended by the data received | Unit, E2E |
+| Body deadline set again with the last bytes (requests canceled while the backend answers) | Unit |
+| No body timeout | Unit, E2E |
+| Body timeout for gRPC streams | E2E |
+| `400` instead of `408` | Unit, E2E |
+| Rejections not counted for bans | Unit, E2E |
+| Banned requests without `Connection: close` | Unit, E2E |
+| Requests in progress not released | Unit, E2E |
+| Overload rejected in detection mode | Unit |
+| No `concurrency` event | Unit, E2E |
+| No listener | Unit, E2E |
+
+Two changes were not caught and are equivalent or not tested: clearing the
+body deadline at its end is also done by net/http (the code stays, as it
+must not set the deadline again with the last bytes), and responses with
+`500` (CRS engine errors) counted for bans, which the tests cannot
+provoke.
+
+**Problems found and fixed during development:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| Since h2c was enabled for gRPC, Go's `net/http` read the beginning of plain-text connections without a deadline: connections that sent nothing were never closed | Measuring idle connections against the previous version | The listener sets a deadline until the server sets its own or the h2c preface has arrived |
+| After the first-byte timeout, net/http gave the connection a second header timeout, doubling the time | Measurement (6 s instead of 3 s) | A connection whose first-byte timeout passed fails at once |
+| A client overloading PrismWAF on its own got `503` without an event instead of `429` | Unit test | The limit of the client is checked before the total |
+| Setting the body deadline again with the last bytes of the body made net/http cancel the request while the backend was answering | Unit test, after simplifying the code | The deadline is not extended at the end of the body |
+
+**Not covered:**
+
+- Attacks from many addresses at once; the measurements use one or two
+  attacking addresses on the same machine.
+- Network-level attacks (SYN floods, bandwidth), which PrismWAF cannot
+  stop.
