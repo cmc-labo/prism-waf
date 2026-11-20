@@ -22,6 +22,10 @@ prismwaf -backend http://127.0.0.1:3000 -bot-protection
 With this, `curl https://example.com/` gets a challenge page instead of the
 site, while visitors with a browser do not notice anything.
 
+This page is the reference. For planning a rollout, configurations for
+common sites, tuning and the effect on search engines, see the
+[bot protection guide](bot-protection-guide.md).
+
 ## How it works
 
 For each request, after [rate limiting](rate-limiting.md) and
@@ -574,6 +578,11 @@ on all paths:
   are challenged, so links to the site get no preview. Allow them with
   `-bot-allow-category social`, knowing that anyone can claim to be a link
   preview, or protect only the paths that need it with `-bot-path`.
+
+What else can keep crawlers out, such as DNS failures, rate limits, bans
+and geo filtering, and how to check that search engines get through, is
+described in the guide under
+[Search engines and SEO](bot-protection-guide.md#search-engines-and-seo).
 
 ## Limitations
 

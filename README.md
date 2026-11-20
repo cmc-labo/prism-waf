@@ -97,7 +97,8 @@ go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 - [Geo filtering](docs/geo-filtering.md)
 - [API protection](docs/api-protection.md): OpenAPI validation, GraphQL
   limits, gRPC inspection
-- [Bot protection](docs/bot-protection.md)
+- [Bot protection](docs/bot-protection.md) and the
+  [guide](docs/bot-protection-guide.md): rollout, tuning, search engines
 - [Modes and audit log](docs/audit-log.md)
 - [Load balancing](docs/load-balancing.md)
 - [HTTPS](docs/https.md)
