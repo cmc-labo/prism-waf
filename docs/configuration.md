@@ -4,6 +4,11 @@ PrismWAF is configured with command-line flags. Run `prismwaf -h` for the
 built-in help. Flags that take several values can be repeated, and some
 also accept comma-separated lists, as noted below.
 
+Every flag can also be set with an environment variable, `PRISMWAF_` and
+the flag name in upper case with underscores, e.g. `PRISMWAF_RATE_LIMIT`
+for `-rate-limit`; the command line takes precedence. See
+[Configuration with environment variables](deployment.md#configuration-with-environment-variables).
+
 ## Proxy and backends
 
 | Flag | Default | Description |
@@ -176,6 +181,16 @@ backends over h2c. See [API protection](api-protection.md).
 
 See [HTTPS](https.md) and [Automatic certificates](acme.md).
 
+## Deployment
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-probe-listen` | (none; `:9090` in the container image) | Address of a separate listener for liveness and readiness probes: `GET /healthz`, `GET /readyz` |
+
+`prismwaf healthcheck [URL]` queries a probe and exits with status 0 if it
+answers `200`. See [Deployment options](deployment.md) for the container
+image, sidecars and the Go library.
+
 ## Fixed limits
 
 | Limit | Value | Response |
@@ -189,7 +204,7 @@ See [HTTPS](https.md) and [Automatic certificates](acme.md).
 | Signal | Effect |
 |--------|--------|
 | `SIGHUP` | Reload the TLS certificates from `-tls-cert`/`-tls-key` without dropping connections. Only handled with `-tls-cert`; otherwise it terminates the process |
-| `SIGINT`, `SIGTERM` | Shut down gracefully: stop accepting connections and wait up to 10 seconds for requests in progress |
+| `SIGINT`, `SIGTERM` | Shut down gracefully: report not ready on `/readyz`, stop accepting connections and wait up to 10 seconds for requests in progress |
 
 The `-geo-db` file is checked every minute and reloaded when it changes.
 Rule files (`-crs-rules-before`, `-crs-rules-after`), API descriptions

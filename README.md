@@ -47,6 +47,11 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
   backends ([details](docs/https.md)), and automatic certificates from
   Let's Encrypt or any ACME CA, with expiry notifications by webhook or
   command ([details](docs/acme.md))
+- **Flexible deployment**: a reverse proxy, a container image for running
+  as a sidecar (configuration by environment variables, liveness and
+  readiness probes, Kubernetes and Compose examples), or a Go library
+  that adds PrismWAF to an application as `net/http` middleware
+  ([details](docs/deployment.md))
 
 ## Quick start
 
@@ -83,9 +88,24 @@ To add the OWASP Core Rule Set to the built-in signatures:
 go run ./cmd/prismwaf -engine both -backend http://127.0.0.1:8081
 ```
 
+With Docker, or inside a Go program:
+
+```sh
+docker build -t prismwaf .
+docker run --rm -p 8080:8080 --add-host=host.docker.internal:host-gateway \
+  -e PRISMWAF_BACKEND=http://host.docker.internal:8081 prismwaf
+```
+
+```go
+waf, err := prismwaf.New(prismwaf.Options{RateLimit: "300/1m"}) // github.com/cmc-labo/prism-waf/prismwaf
+http.ListenAndServe(":8080", waf.Middleware(mux))
+```
+
 ## Documentation
 
 - [Configuration](docs/configuration.md): all command-line flags
+- [Deployment options](docs/deployment.md): reverse proxy, container
+  image and sidecar (Kubernetes, Compose), Go library
 - [Signature detection](docs/detection.md)
 - [OWASP Core Rule Set](docs/crs.md): engine selection, paranoia level,
   anomaly threshold, rule exclusions and use cases

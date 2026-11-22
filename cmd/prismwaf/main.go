@@ -35,6 +35,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck(os.Args[2:]))
+	}
 	var cfg config
 	flag.StringVar(&cfg.listen, "listen", ":8080", "address to listen on")
 	flag.Var(&cfg.backends, "backend", `backend server URL (http:// or https://); repeat or separate with commas for several backends (default "`+defaultBackend+`")`)
@@ -117,7 +120,19 @@ func main() {
 	flag.StringVar(&cfg.clientAuth, "tls-client-auth", "", `client certificate mode with -tls-client-ca: "require" (default) or "optional"`)
 	flag.StringVar(&cfg.backendCA, "backend-ca", "", "PEM CA file to verify an https:// backend with, instead of the system CAs")
 	flag.BoolVar(&cfg.backendInsecure, "backend-insecure-skip-verify", false, "do not verify the https:// backend certificate (testing only)")
+	flag.StringVar(&cfg.probeListen, "probe-listen", "", `address of a separate listener for liveness and readiness probes (GET /healthz, /readyz), e.g. "127.0.0.1:9090" or ":9090" in a container`)
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(out, "\nEvery option can also be set with an environment variable, e.g. %s=300/1m for -rate-limit;\n"+
+			"the command line takes precedence. Repeatable options take one value per line.\n", envName("rate-limit"))
+	}
 	flag.Parse()
+	if err := applyEnv(flag.CommandLine, os.Environ()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	flag.Visit(func(f *flag.Flag) { cfg.setFlags = append(cfg.setFlags, f.Name) })
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -207,8 +222,9 @@ type config struct {
 	clientAuth           string
 	backendCA            string
 	backendInsecure      bool
-	// setFlags are the names of the flags given on the command line, to
-	// reject options that would be ignored even when they have their
+	probeListen          string
+	// setFlags are the names of the flags given on the command line or
+	// in environment variables, to reject options that would be ignored even when they have their
 	// default value.
 	setFlags []string
 }
@@ -1015,6 +1031,9 @@ func run(cfg config, logger *slog.Logger) error {
 	if cfg.backendInsecure {
 		logger.Warn("backend certificate verification is disabled")
 	}
+	if cfg.probeListen != "" {
+		logger.Info("probes enabled", "listen", cfg.probeListen, "liveness", "/healthz", "readiness", "/readyz")
+	}
 
 	// Listen before serving, so that the ACME CA can connect as soon as
 	// certificates are requested.
@@ -1037,6 +1056,19 @@ func run(cfg config, logger *slog.Logger) error {
 			Logger: logger,
 		})
 	}
+	probe := &probes{}
+	var probeSrv *http.Server
+	if cfg.probeListen != "" {
+		ln, err := net.Listen("tcp", cfg.probeListen)
+		if err != nil {
+			for _, l := range listeners {
+				l.Close()
+			}
+			return err
+		}
+		probeSrv = &http.Server{Handler: probe, ReadHeaderTimeout: 10 * time.Second, ErrorLog: httpErrorLog}
+		go probeSrv.Serve(ln)
+	}
 	errCh := make(chan error, len(servers))
 	for i, s := range servers {
 		go func() {
@@ -1054,6 +1086,7 @@ func run(cfg config, logger *slog.Logger) error {
 	if acmeManager != nil {
 		go acmeManager.Run(ctx)
 	}
+	probe.ready.Store(true)
 
 	var runErr error
 	select {
@@ -1065,12 +1098,17 @@ func run(cfg config, logger *slog.Logger) error {
 		logger.Info("shutting down")
 	}
 
+	probe.ready.Store(false)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, s := range servers {
 		if err := s.Shutdown(shutdownCtx); err != nil && runErr == nil {
 			runErr = err
 		}
+	}
+	// Last, so that probes see the shutdown.
+	if probeSrv != nil {
+		probeSrv.Shutdown(shutdownCtx)
 	}
 	return runErr
 }

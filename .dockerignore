@@ -1,0 +1,5 @@
+.git
+bin
+e2e
+docs
+*.md

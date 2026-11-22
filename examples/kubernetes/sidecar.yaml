@@ -1,0 +1,130 @@
+# PrismWAF as a sidecar in front of an application in the same pod.
+# See docs/deployment.md#kubernetes.
+#
+#   docker build -t registry.example.com/prismwaf:1.0 . && docker push registry.example.com/prismwaf:1.0
+#   kubectl create secret generic prismwaf --from-literal=bot.key="$(openssl rand -base64 32)"
+#   kubectl apply -f examples/kubernetes/sidecar.yaml
+#
+# Traffic: Service :80 -> PrismWAF :8080 -> application 127.0.0.1:3000.
+# The application listens on the loopback address only, so it cannot be
+# reached without passing PrismWAF.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shop
+  template:
+    metadata:
+      labels:
+        app: shop
+    spec:
+      # A native sidecar (Kubernetes 1.29+): an init container that keeps
+      # running. It starts before the application and stops after it. On
+      # older clusters, move it to "containers" and drop restartPolicy.
+      initContainers:
+        - name: prismwaf
+          image: registry.example.com/prismwaf:1.0
+          restartPolicy: Always
+          env:
+            # Every flag is PRISMWAF_ and its name in upper case, with
+            # underscores; e.g. -rate-limit-path is PRISMWAF_RATE_LIMIT_PATH.
+            - name: PRISMWAF_BACKEND
+              value: http://127.0.0.1:3000
+            - name: PRISMWAF_ENGINE
+              value: both
+            # The ingress controller's pods; their X-Forwarded-For names
+            # the client. Use your cluster's pod network.
+            - name: PRISMWAF_TRUSTED_PROXIES
+              value: 10.0.0.0/8
+            - name: PRISMWAF_RATE_LIMIT
+              value: 300/1m
+            # Repeatable options: one value per line.
+            - name: PRISMWAF_RATE_LIMIT_PATH
+              value: |
+                POST /login=5/1m
+                POST /password-reset=3/10m
+            - name: PRISMWAF_BOT_PROTECTION
+              value: "true"
+            - name: PRISMWAF_BOT_EXEMPT_PATH
+              value: /api/*
+            # Shared by all replicas, so that clearance cookies are valid
+            # on each of them.
+            - name: PRISMWAF_BOT_SECRET_FILE
+              value: /etc/prismwaf/bot.key
+            # Set in the image: PRISMWAF_PROBE_LISTEN=:9090. Audit events
+            # go to standard output, i.e. the container log.
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: probes
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            periodSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: prismwaf
+              mountPath: /etc/prismwaf
+              readOnly: true
+            # The CRS engine (Coraza) requires a writable temporary
+            # directory, although nothing is stored in it.
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: app
+          image: registry.example.com/shop:1.0
+          # The application must listen on 127.0.0.1:3000 only.
+          env:
+            - name: LISTEN
+              value: 127.0.0.1:3000
+          readinessProbe:
+            httpGet:
+              # Through PrismWAF, which forwards it to the application.
+              path: /healthz
+              port: 8080
+      volumes:
+        - name: prismwaf
+          secret:
+            secretName: prismwaf
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector:
+    app: shop
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -13,7 +13,8 @@ the latest results.
 ## Project layout
 
 ```
-cmd/prismwaf/        entry point
+cmd/prismwaf/        entry point, environment variables, probes
+prismwaf/            public Go package: PrismWAF as net/http middleware
 internal/proxy/      reverse proxy, load balancing, health checks
 internal/tlsutil/    TLS configuration, certificates (files, SNI, ACME), mTLS, HSTS, HTTPS redirect
 internal/audit/      audit log (JSON Lines)
@@ -31,4 +32,8 @@ internal/notify/     notifications to administrators (webhooks, commands)
 internal/bot/        bot score, categories, DNS verification of bots, proof-of-work and CAPTCHA challenges
 e2e/                 end-to-end tests of the binary (build tag e2e)
 examples/backend/    echo server for local testing
+examples/library/    application that embeds PrismWAF with the prismwaf package
+examples/kubernetes/ PrismWAF as a sidecar in a Deployment
+examples/compose/    PrismWAF in front of an application with Docker Compose
+Dockerfile           container image (distroless, non-root)
 ```

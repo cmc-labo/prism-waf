@@ -110,6 +110,16 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Coraza refuses to start without a writable temporary directory, with
+	// an error that suggests rebuilding it, although bodies are kept in
+	// memory and nothing is written there.
+	if f, err := os.CreateTemp("", "prismwaf-check"); err != nil {
+		return nil, fmt.Errorf("crs: the temporary directory must be writable, although nothing is stored in it: %w; "+
+			"with a read-only root file system, mount a writable volume on %s or set TMPDIR", err, os.TempDir())
+	} else {
+		f.Close()
+		os.Remove(f.Name())
+	}
 	// Coraza rejects a body that reaches its limit, while a body of
 	// exactly MaxBodySize bytes is allowed: hence one byte more.
 	w, err := coraza.NewWAF(coraza.NewWAFConfig().

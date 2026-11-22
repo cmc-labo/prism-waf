@@ -18,6 +18,7 @@ PrismWAF has two kinds of tests:
 | [API protection](api-protection.md) | [`api_test.go`, `grpc_test.go`](#api-protection) | [2026-11-18](#results-4) |
 | [Business flow protection](business-logic.md) | [`abuse_test.go`](#business-flow-protection) | [2026-11-19](#results-5) |
 | [Denial of service protection](ddos.md) | [`ddos_test.go`](#denial-of-service-protection) | [2026-11-20](#results-6) |
+| [Deployment options](deployment.md) | [`deploy_test.go`](#deployment-options) | [2026-11-22](#results-7) |
 
 ```sh
 go test ./...                                      # unit tests
@@ -38,6 +39,7 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [API protection](#api-protection)
 - [Business flow protection](#business-flow-protection)
 - [Denial of service protection](#denial-of-service-protection)
+- [Deployment options](#deployment-options)
 
 ## Requirements
 
@@ -921,3 +923,77 @@ provoke.
   attacking addresses on the same machine.
 - Network-level attacks (SYN floods, bandwidth), which PrismWAF cannot
   stop.
+
+## Deployment options
+
+```sh
+go test ./prismwaf ./cmd/prismwaf                                  # library, environment variables, probes
+go test -tags e2e -run 'TestEnvironment|TestProbes' -v ./e2e/
+```
+
+### What is tested
+
+| Test | Checks |
+|------|--------|
+| `TestEnvironmentConfig` (E2E) | Options from `PRISMWAF_*` variables: the engine, two path rate limits in one variable on separate lines; `-mode block` on the command line wins over `PRISMWAF_MODE=detect` |
+| `TestEnvironmentErrors` (E2E) | A misspelled variable and an invalid value stop PrismWAF with the variable's name; an option set by a variable is validated like a flag (`-ban-duration requires -ban`) |
+| `TestProbes` (E2E) | `/readyz` and `/healthz` on `-probe-listen` answer `200`, other paths `404`; `/healthz` on `-listen` is forwarded to the backend; after `SIGTERM` with a request in progress, `/readyz` answers `503` and `/healthz` `200`, the request completes, and the probes stop when the process exits |
+| `TestApplyEnv`, `TestApplyEnvErrors` (unit) | Names, precedence of the command line, lines of repeatable flags, comma lists, booleans, durations, empty variables, unknown variables, invalid values |
+| `TestProbes`, `TestHealthcheck` (unit) | Answers of the probes before and after start; exit statuses of `prismwaf healthcheck` |
+| `prismwaf` package (unit) | Each engine blocks SQL injection and XSS in the body with `403` and passes normal requests and bodies unchanged; detection mode; the body size limit; path rate limits shared by two handlers of one WAF, per client from `X-Forwarded-For` of a trusted proxy, with exempt clients; invalid options; the package example |
+| `TestTempDirNotWritable` (unit) | Without a writable temporary directory, the CRS fails with an error that says what to do |
+
+### Results
+
+Run on 2026-11-22 on Linux (aarch64, 2 vCPUs) with Go 1.25.0 and Docker 27.4.1:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestEnvironmentConfig` | Pass | 0.07s |
+| `TestEnvironmentErrors` | Pass | 0.02s |
+| `TestProbes` | Pass | 0.27s |
+
+The whole E2E suite passed in 310 s, and the unit tests passed with the
+race detector.
+
+**Containers.** Checked by hand with Docker, as the tests do not run it:
+
+| Setup | Result |
+|-------|--------|
+| The application and PrismWAF in two containers sharing one network namespace, as in a pod; configured only with variables | Normal requests `200`, SQL injection `403`, path rate limit `429`; probes on port 9090 |
+| The same with `--read-only`, `--tmpfs /tmp`, `--cap-drop ALL`, `no-new-privileges`, bot protection and the key from a mounted file, as in `examples/kubernetes/sidecar.yaml` | `curl` on a page challenged (`403`), on an exempt API path `200`, a browser `200`; a 100 KB JSON body `200` |
+| `--read-only` without a writable `/tmp`, with the CRS | Exits with "the temporary directory must be writable" |
+| `docker stop` | Exit status 0 within 0.2 s |
+| `examples/compose/compose.yaml` | PrismWAF `healthy` after the first health check; `200` and `403` as expected |
+| The Docker command of the README | Requests forwarded to the example backend on the host |
+| Memory after startup and 300 requests | 8 MiB with the built-in signatures, 36 MiB with `-engine both` |
+
+The Kubernetes manifest was checked for valid YAML but not applied to a
+cluster.
+
+**Mutation check.** Each of these changes was caught by the tests, and
+the code was restored:
+
+| Change | Caught by |
+|--------|-----------|
+| Variables override the command line | Unit, E2E |
+| Unknown variables ignored | Unit, E2E |
+| Repeatable flags not split into lines | Unit, E2E |
+| Options from variables not validated as given | E2E |
+| `/readyz` still `200` while shutting down | E2E |
+| Probe listener stopped before requests in progress finish | E2E |
+| Library: `Mode` ignored | Unit |
+| Library: `RateLimitExempt` ignored | Unit |
+| Library: `TrustedProxies` ignored | Unit |
+| Library: no CRS with `EngineCRS` | Unit |
+| Library: `MaxBodySize` ignored | Unit |
+| No check of the temporary directory (Coraza's error) | Unit |
+| `prismwaf healthcheck` succeeds on any status | Unit |
+
+**Problems found and fixed during development:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| With a read-only root file system, the CRS did not start: Coraza requires a writable temporary directory, and its error suggests rebuilding it with a build tag | Running the image as in the Kubernetes example | A clear error at startup; the examples mount a small writable `/tmp` |
+| The image has no shell or `curl` for a Docker health check | Writing the Compose example | `prismwaf healthcheck` and a `HEALTHCHECK` in the image |
+

@@ -1,0 +1,29 @@
+# PrismWAF in front of an application with Docker Compose.
+# See docs/deployment.md#docker-compose.
+#
+#   docker compose -f examples/compose/compose.yaml up --build
+#   curl 'http://localhost:8080/search?q=shoes'
+#   curl "http://localhost:8080/search?q=1'+OR+'1'='1"    # 403
+services:
+  prismwaf:
+    build: ../..
+    ports:
+      - "8080:8080"
+    environment:
+      PRISMWAF_BACKEND: http://app:8081
+      PRISMWAF_RATE_LIMIT: 300/1m
+      PRISMWAF_RATE_LIMIT_PATH: |
+        POST /login=5/1m
+    # The image checks its health with "prismwaf healthcheck", which
+    # queries the readiness probe on port 9090.
+    depends_on:
+      - app
+
+  # The echo server of examples/backend. It publishes no port, so it can be
+  # reached only through PrismWAF.
+  app:
+    image: golang:1.25
+    working_dir: /src
+    volumes:
+      - ../..:/src:ro
+    command: ["go", "run", "./examples/backend", "-listen", ":8081"]

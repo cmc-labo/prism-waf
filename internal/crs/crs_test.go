@@ -311,6 +311,15 @@ func TestNewValidates(t *testing.T) {
 	}
 }
 
+// Coraza needs a writable temporary directory; the error says what to do.
+func TestTempDirNotWritable(t *testing.T) {
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	_, err := New(Config{})
+	if err == nil || !strings.Contains(err.Error(), "mount a writable volume") || strings.Contains(err.Error(), "no_fs_access") {
+		t.Errorf("error %v", err)
+	}
+}
+
 func BenchmarkInspect(b *testing.B) {
 	e := engine(b)
 	for _, bc := range []struct{ name, method, target, contentType, body string }{

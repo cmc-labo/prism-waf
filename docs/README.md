@@ -3,6 +3,7 @@
 | Guide | Contents |
 |-------|----------|
 | [Configuration](configuration.md) | Every command-line flag, grouped by topic, with deployment examples |
+| [Deployment options](deployment.md) | Reverse proxy, container image, environment variables, probes and shutdown, sidecar in Kubernetes and Docker Compose, the Go library |
 | [Signature detection](detection.md) | The built-in signatures, normalization of encoded payloads, JSON and XML bodies, the body size limit |
 | [OWASP Core Rule Set](crs.md) | `-engine`, paranoia level, anomaly threshold, rule exclusions, tested use cases, performance |
 | [Rate limiting](rate-limiting.md) | Limits per client and per path, bursts, IPv6, proxies, exemptions, tuning in detection mode |
