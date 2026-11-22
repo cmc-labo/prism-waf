@@ -939,7 +939,7 @@ go test -tags e2e -run 'TestEnvironment|TestProbes' -v ./e2e/
 | `TestEnvironmentErrors` (E2E) | A misspelled variable and an invalid value stop PrismWAF with the variable's name; an option set by a variable is validated like a flag (`-ban-duration requires -ban`) |
 | `TestProbes` (E2E) | `/readyz` and `/healthz` on `-probe-listen` answer `200`, other paths `404`; `/healthz` on `-listen` is forwarded to the backend; after `SIGTERM` with a request in progress, `/readyz` answers `503` and `/healthz` `200`, the request completes, and the probes stop when the process exits |
 | `TestApplyEnv`, `TestApplyEnvErrors` (unit) | Names, precedence of the command line, lines of repeatable flags, comma lists, booleans, durations, empty variables, unknown variables, invalid values |
-| `TestProbes`, `TestHealthcheck` (unit) | Answers of the probes before and after start; exit statuses of `prismwaf healthcheck` |
+| `TestProbes`, `TestHealthcheck`, `TestHealthcheckURL` (unit) | Answers of the probes before and after start; exit statuses of `prismwaf healthcheck`; its default URL from `PRISMWAF_PROBE_LISTEN` |
 | `prismwaf` package (unit) | Each engine blocks SQL injection and XSS in the body with `403` and passes normal requests and bodies unchanged; detection mode; the body size limit; path rate limits shared by two handlers of one WAF, per client from `X-Forwarded-For` of a trusted proxy, with exempt clients; invalid options; the package example |
 | `TestTempDirNotWritable` (unit) | Without a writable temporary directory, the CRS fails with an error that says what to do |
 

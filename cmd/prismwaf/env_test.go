@@ -126,3 +126,20 @@ func TestHealthcheck(t *testing.T) {
 		t.Errorf("two arguments: exit status %d, want 2", code)
 	}
 }
+
+func TestHealthcheckURL(t *testing.T) {
+	for in, want := range map[string]string{
+		":9191":          "http://127.0.0.1:9191/readyz",
+		"0.0.0.0:9191":   "http://127.0.0.1:9191/readyz",
+		"[::]:9191":      "http://127.0.0.1:9191/readyz",
+		"10.1.2.3:9191":  "http://10.1.2.3:9191/readyz",
+		"[::1]:9191":     "http://[::1]:9191/readyz",
+		"localhost:9191": "http://localhost:9191/readyz",
+		"":               defaultHealthcheckURL,
+		"9191":           defaultHealthcheckURL,
+	} {
+		if got := healthcheckURL(in); got != want {
+			t.Errorf("healthcheckURL(%q) = %s, want %s", in, got, want)
+		}
+	}
+}

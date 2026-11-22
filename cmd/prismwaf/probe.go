@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -12,6 +13,20 @@ import (
 // defaultHealthcheckURL is the readiness probe at the port that the
 // container image sets with PRISMWAF_PROBE_LISTEN.
 const defaultHealthcheckURL = "http://127.0.0.1:9090/readyz"
+
+// healthcheckURL returns the readiness probe of the address in
+// PRISMWAF_PROBE_LISTEN, so that the image's health check follows a
+// changed port, or defaultHealthcheckURL.
+func healthcheckURL(probeListen string) string {
+	host, port, err := net.SplitHostPort(probeListen)
+	if err != nil {
+		return defaultHealthcheckURL
+	}
+	if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/readyz"
+}
 
 // probes answers the liveness and readiness probes of container
 // orchestrators on -probe-listen, a port of its own, so that they neither
@@ -46,13 +61,13 @@ func (p *probes) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // checks of Docker and Compose: the image has no shell or curl to query
 // the probes with. It returns the exit status, 0 if the URL answers 200.
 func healthcheck(args []string) int {
-	target := defaultHealthcheckURL
+	target := healthcheckURL(os.Getenv(envName("probe-listen")))
 	switch len(args) {
 	case 0:
 	case 1:
 		target = args[0]
 	default:
-		fmt.Fprintln(os.Stderr, "usage: prismwaf healthcheck [URL]  (default "+defaultHealthcheckURL+")")
+		fmt.Fprintln(os.Stderr, "usage: prismwaf healthcheck [URL]  (default: /readyz at "+envName("probe-listen")+", else "+defaultHealthcheckURL+")")
 		return 2
 	}
 	c := &http.Client{Timeout: 5 * time.Second}

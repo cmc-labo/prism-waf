@@ -45,7 +45,7 @@ docker run --rm -p 8080:8080 -e PRISMWAF_BACKEND=http://app.internal:3000 prismw
 | Entry point | `/prismwaf`; arguments are flags, e.g. `docker run prismwaf -engine both` |
 | Ports | `8080` (`-listen`, the default), `9090` (probes) |
 | Environment | `PRISMWAF_PROBE_LISTEN=:9090` |
-| Health check | `prismwaf healthcheck`, which queries `/readyz` on port 9090 |
+| Health check | `prismwaf healthcheck`, which queries `/readyz` at `PRISMWAF_PROBE_LISTEN` |
 | Audit log | Standard output (`-audit-log -`, the default), next to the operational log on standard error |
 
 Files such as certificates, keys, rule exclusions, API descriptions or
@@ -111,12 +111,13 @@ the orchestrator. The image sets it to `:9090`.
 - Do not expose the probe port outside the pod or host; it has no
   protection of its own.
 - `prismwaf healthcheck [URL]` queries a probe and exits with status 0 if
-  it answers `200`, 1 otherwise; the default URL is
-  `http://127.0.0.1:9090/readyz`. The image uses it as its Docker
-  `HEALTHCHECK`, because it has no shell or `curl`. If you move the probe
-  port or turn it off (`-probe-listen ""` on the command line), override
-  the health check (`--health-cmd`) or disable it
-  (`docker run --no-healthcheck`).
+  it answers `200`, 1 otherwise. Without a URL, it queries `/readyz` at
+  the address in `PRISMWAF_PROBE_LISTEN`, so a port changed with that
+  variable is followed, or else `http://127.0.0.1:9090/readyz`. The image
+  uses it as its Docker `HEALTHCHECK`, because it has no shell or `curl`.
+  If you move the probe port on the command line or turn it off
+  (`-probe-listen ""`), override the health check (`--health-cmd`) or
+  disable it (`docker run --no-healthcheck`).
 
 On `SIGTERM` (and `SIGINT`), PrismWAF reports not ready, stops accepting
 connections, lets requests in progress finish for up to 10 seconds and
