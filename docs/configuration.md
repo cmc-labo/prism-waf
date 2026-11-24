@@ -172,6 +172,8 @@ backends over h2c. See [API protection](api-protection.md).
 | `-acme-notify-webhook-format` | `json` | `json`, `slack` (also Mattermost, Google Chat) or `discord` |
 | `-acme-notify-command` | (none) | Shell command run for each notification, with the event as JSON on stdin and in `PRISMWAF_*` variables |
 | `-acme-notify-test` | `false` | Send a test notification and exit |
+| `-acme-notify-repeat` | `24h` | How often a notification is repeated while its problem lasts; `0` notifies each problem once |
+| `-acme-notify-rate-limit` | `10/1h` | Most notifications per window as `N/WINDOW`; the others are sent together in one digest when the window ends. `off` disables |
 | `-http-redirect` | (none) | Address of an HTTP listener that redirects to HTTPS and answers ACME HTTP-01 challenges, e.g. `:80` |
 | `-hsts-max-age` | `0` (off) | Send `Strict-Transport-Security` with this max-age, e.g. `8760h` |
 | `-hsts-include-subdomains` | `false` | Add `includeSubDomains` to the HSTS header |

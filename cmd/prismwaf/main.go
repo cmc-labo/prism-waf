@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -112,6 +113,8 @@ func main() {
 	flag.StringVar(&cfg.acmeNotifyFormat, "acme-notify-webhook-format", notify.FormatJSON, `payload of -acme-notify-webhook: "json", "slack" (also Mattermost, Google Chat) or "discord"`)
 	flag.StringVar(&cfg.acmeNotifyCommand, "acme-notify-command", "", "shell command to run for each certificate notification; the event is passed as JSON on stdin and in PRISMWAF_* variables")
 	flag.BoolVar(&cfg.acmeNotifyTest, "acme-notify-test", false, "send a test notification to the -acme-notify-* targets and exit")
+	flag.DurationVar(&cfg.acmeNotifyRepeat, "acme-notify-repeat", tlsutil.DefaultNotifyRepeat, "how often a certificate notification is repeated while its problem lasts; 0 notifies each problem once")
+	flag.StringVar(&cfg.acmeNotifyRateLimit, "acme-notify-rate-limit", defaultNotifyRateLimit, `most certificate notifications sent per window as N/WINDOW; the others are sent together when the window ends. "off" disables`)
 	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80"; also answers ACME HTTP-01 challenges (requires HTTPS)`)
 	flag.DurationVar(&cfg.hsts.MaxAge, "hsts-max-age", 0, `send Strict-Transport-Security with this max-age on HTTPS responses, e.g. "8760h"; 0 disables`)
 	flag.BoolVar(&cfg.hsts.IncludeSubdomains, "hsts-include-subdomains", false, "add includeSubDomains to the HSTS header")
@@ -216,6 +219,8 @@ type config struct {
 	acmeNotifyFormat     string
 	acmeNotifyCommand    string
 	acmeNotifyTest       bool
+	acmeNotifyRepeat     time.Duration
+	acmeNotifyRateLimit  string
 	httpRedirect         string
 	hsts                 tlsutil.HSTSPolicy
 	clientCA             string
@@ -443,18 +448,42 @@ func (c config) acmeNotifyEnabled() bool {
 	return c.acmeNotifyWebhook != "" || c.acmeNotifyCommand != ""
 }
 
+// defaultNotifyRateLimit is the default of -acme-notify-rate-limit:
+// enough for the problems and recoveries of a few domains, while a CA
+// outage that affects many domains is sent as a digest.
+const defaultNotifyRateLimit = "10/1h"
+
 // notifier returns the notifier for ACME certificate events.
 func (c config) notifier(logger *slog.Logger) (*notify.Notifier, error) {
 	format := c.acmeNotifyFormat
 	if c.acmeNotifyWebhook == "" {
 		format = "" // the default of the flag; irrelevant without a webhook
 	}
+	var limit int
+	var window time.Duration
+	if c.acmeNotifyRateLimit != "" && c.acmeNotifyRateLimit != "off" {
+		var err error
+		if limit, window, err = ratelimit.ParseRate(c.acmeNotifyRateLimit); err != nil {
+			return nil, fmt.Errorf("invalid -acme-notify-rate-limit: %w", err)
+		}
+	}
 	return notify.New(notify.Config{
 		WebhookURL:    c.acmeNotifyWebhook,
 		WebhookFormat: format,
 		Command:       c.acmeNotifyCommand,
 		Logger:        logger,
+		RateLimit:     limit,
+		RateWindow:    window,
 	})
+}
+
+// acmeNotifyRepeatInterval returns ACMEConfig.NotifyRepeat for
+// -acme-notify-repeat.
+func (c config) acmeNotifyRepeatInterval() time.Duration {
+	if c.acmeNotifyRepeat == 0 {
+		return -1 // never
+	}
+	return c.acmeNotifyRepeat
 }
 
 func (c config) tlsEnabled() bool { return len(c.tlsCerts) > 0 || c.acmeEnabled() }
@@ -579,6 +608,12 @@ func (c config) validate() error {
 	}
 	if c.acmeNotifyWebhook == "" && slices.Contains(c.setFlags, "acme-notify-webhook-format") {
 		return errors.New("-acme-notify-webhook-format requires -acme-notify-webhook")
+	}
+	if !c.acmeNotifyEnabled() && (slices.Contains(c.setFlags, "acme-notify-repeat") || slices.Contains(c.setFlags, "acme-notify-rate-limit")) {
+		return errors.New("-acme-notify-repeat and -acme-notify-rate-limit require -acme-notify-webhook or -acme-notify-command")
+	}
+	if c.acmeNotifyRepeat < 0 {
+		return errors.New("-acme-notify-repeat must not be negative")
 	}
 	if c.acmeNotifyTest && !c.acmeNotifyEnabled() {
 		return errors.New("-acme-notify-test requires -acme-notify-webhook or -acme-notify-command")
@@ -863,6 +898,7 @@ func run(cfg config, logger *slog.Logger) error {
 			if notifier != nil {
 				// Not a typed nil in the interface.
 				acmeCfg.Notifier = notifier
+				acmeCfg.NotifyRepeat = cfg.acmeNotifyRepeatInterval()
 			}
 			m, err := tlsutil.NewACMEManager(acmeCfg)
 			if err != nil {
@@ -1011,7 +1047,7 @@ func run(cfg config, logger *slog.Logger) error {
 	if cfg.acmeEnabled() {
 		logger.Info("obtaining certificates via ACME", "domains", cfg.acmeDomains, "directory", acmeManager.DirectoryURL(), "cache", acmeManager.CacheDir())
 		if notifier != nil {
-			logger.Info("ACME certificate notifications enabled", "targets", notifier.Targets())
+			logger.Info("ACME certificate notifications enabled", "targets", notifier.Targets(), "repeat", cfg.acmeNotifyRepeat, "rate_limit", cmp.Or(cfg.acmeNotifyRateLimit, "off"))
 		} else {
 			logger.Info("ACME certificate notifications disabled; set -acme-notify-webhook or -acme-notify-command to be told when certificates are not renewed")
 		}

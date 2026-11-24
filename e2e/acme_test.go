@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -41,8 +40,12 @@ type notification struct {
 	Error    string     `json:"error"`
 	Failures int        `json:"failures"`
 	RetryAt  *time.Time `json:"retry_at"`
-	Text     string     `json:"text"`    // json and slack
-	Content  string     `json:"content"` // discord
+	Held     []struct {
+		Event  string `json:"event"`
+		Domain string `json:"domain"`
+	} `json:"held"`
+	Text    string `json:"text"`    // json and slack
+	Content string `json:"content"` // discord
 
 	at     time.Time         // when it was received
 	header http.Header       // of a webhook
@@ -163,7 +166,7 @@ dir=$(dirname "$0")
 n=$(cat "$dir/count" 2>/dev/null || echo 0)
 echo $((n + 1)) > "$dir/count"
 cat > "$dir/stdin.$n"
-env | grep '^PRISMWAF_' > "$dir/tmp"
+env -0 | grep -z '^PRISMWAF_' > "$dir/tmp" # NUL-separated: values may have newlines
 mv "$dir/tmp" "$dir/env.$n" # env.N appears complete, after stdin.N
 `), 0o700)
 	return &command{dir: dir, line: script}
@@ -188,9 +191,8 @@ func (c *command) received(t *testing.T) []notification {
 			t.Fatalf("command: standard input is not JSON: %v: %s", err, stdin)
 		}
 		json.Unmarshal(stdin, &n.raw)
-		sc := bufio.NewScanner(strings.NewReader(string(env)))
-		for sc.Scan() {
-			k, v, _ := strings.Cut(sc.Text(), "=")
+		for _, kv := range strings.Split(strings.TrimSuffix(string(env), "\x00"), "\x00") {
+			k, v, _ := strings.Cut(kv, "=")
 			n.env[k] = v
 		}
 		got = append(got, n)
@@ -483,6 +485,43 @@ func TestACMENotifyUnavailable(t *testing.T) {
 		t.Errorf("%d orders from client handshakes during the backoff", n-orders)
 	}
 	time.Sleep(500 * time.Millisecond)
+	if n := len(hook.received()) + len(cmd.received(t)); n != 4 {
+		t.Errorf("%d notifications, want 4", n)
+	}
+}
+
+// TestACMENotifyRateLimit fails three domains at once with a limit of one
+// notification per 3 seconds: the first is sent at once, the others
+// together in a digest when the window ends.
+func TestACMENotifyRateLimit(t *testing.T) {
+	ca := startCA(t)
+	ca.setMode("invalid")
+	hook, cmd := startWebhook(t), newCommand(t)
+	start := time.Now()
+	w := startACMEWAF(t, ca, acmeOptions{domains: "a.example,b.example,c.example",
+		args: append(notifyArgs(hook, "slack", cmd), "-acme-notify-rate-limit", "1/3s")})
+
+	w.waitLogFor(t, 10*time.Second, "level=WARN", "notification held back: rate limit reached", "domain=c.example", "limit=1", "window=3s")
+	got := cmd.wait(t, 2, 15*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("%d notifications", len(got))
+	}
+	checkEvent(t, got[0], "certificate_unavailable", "critical")
+	d := got[1]
+	checkEvent(t, d, "notification_digest", "critical")
+	if len(d.Held) != 2 || d.Held[0].Domain != "b.example" || d.Held[1].Domain != "c.example" || d.Held[1].Event != "certificate_unavailable" ||
+		!strings.HasPrefix(d.Message, "2 notifications were held back by the rate limit of 1 per 3s:\n- ") ||
+		!strings.Contains(d.Message, " CRITICAL: There is no certificate for c.example: ") || d.env["PRISMWAF_HELD"] != "2" {
+		t.Errorf("digest %+v", d)
+	}
+	if wait := d.Time.Sub(start); wait < 3*time.Second {
+		t.Errorf("digest after %v, want the end of the window", wait)
+	}
+	slack := hook.wait(t, 2, 5*time.Second)
+	if want := "[PrismWAF " + hostname(t) + "] CRITICAL: 2 notifications were held back"; !strings.HasPrefix(slack[1].Text, want) {
+		t.Errorf("slack text %q", slack[1].Text)
+	}
+	time.Sleep(4 * time.Second) // nothing more in the next window
 	if n := len(hook.received()) + len(cmd.received(t)); n != 4 {
 		t.Errorf("%d notifications, want 4", n)
 	}

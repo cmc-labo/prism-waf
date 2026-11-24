@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -799,6 +800,50 @@ func TestACMENotifiesMissingCertificates(t *testing.T) {
 	a.check()
 	if got := strings.Join(rec.take(), ","); got != "certificate_recovered www.example.com" {
 		t.Errorf("after recovery: %v", got)
+	}
+}
+
+func TestACMENotifyRepeat(t *testing.T) {
+	day := 24 * time.Hour
+	for _, tc := range []struct {
+		repeat time.Duration
+		// The number of notifications after 0, 5, 6 and 30 hours of an
+		// ongoing problem.
+		want []int
+	}{
+		{0, []int{1, 0, 0, 1}}, // DefaultNotifyRepeat
+		{6 * time.Hour, []int{1, 0, 1, 1}},
+		{-1, []int{1, 0, 0, 0}}, // never
+	} {
+		var cert atomic.Pointer[tls.Certificate]
+		a, now, _ := fakeACME(t, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert.Load(), nil })
+		a.domains = a.domains[:1]
+		if tc.repeat != 0 {
+			a.notifyRepeat = tc.repeat
+		}
+		rec := &recorder{}
+		a.notifier = rec
+		issued := now.Add(-61 * day) // a day of failed renewals
+		cert.Store(leafCert(t, "example.com", issued, issued.Add(90*day)))
+		a.check() // the first check waits for renewal
+		start := *now
+		var got []int
+		for _, h := range []time.Duration{0, 5, 6, 30} {
+			*now = start.Add(h*time.Hour + time.Minute)
+			a.check()
+			got = append(got, len(rec.take()))
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("repeat %v: notifications %v, want %v", tc.repeat, got, tc.want)
+		}
+		// A worse problem and the recovery are notified regardless.
+		*now = issued.Add(90*day + time.Minute)
+		a.check()
+		cert.Store(leafCert(t, "example.com", *now, now.Add(90*day)))
+		a.check()
+		if got := strings.Join(rec.take(), ","); got != "certificate_expired example.com,certificate_recovered example.com" {
+			t.Errorf("repeat %v: %v", tc.repeat, got)
+		}
 	}
 }
 

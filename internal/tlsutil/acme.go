@@ -44,9 +44,8 @@ const (
 // acmeCheckInterval is how often Run checks the certificates.
 const acmeCheckInterval = time.Minute
 
-// acmeNotifyInterval is how often a notification is repeated while its
-// problem lasts.
-const acmeNotifyInterval = 24 * time.Hour
+// DefaultNotifyRepeat is the default of ACMEConfig.NotifyRepeat.
+const DefaultNotifyRepeat = 24 * time.Hour
 
 // Events notified to administrators.
 const (
@@ -85,6 +84,10 @@ type ACMEConfig struct {
 	// without having been renewed, has expired or cannot be obtained, and
 	// when it is fine again.
 	Notifier Notifier
+	// NotifyRepeat is how often a notification is repeated while its
+	// problem lasts. Zero means DefaultNotifyRepeat; a negative value
+	// notifies each problem only once, until it is fine again.
+	NotifyRepeat time.Duration
 }
 
 // ACMEManager obtains and renews certificates for the configured domains
@@ -94,6 +97,7 @@ type ACMEManager struct {
 	m            *autocert.Manager
 	logger       *slog.Logger
 	notifier     Notifier
+	notifyRepeat time.Duration // negative: never
 	directoryURL string
 	cacheDir     string
 	domains      []string // normalized
@@ -151,11 +155,15 @@ func NewACMEManager(c ACMEConfig) (*ACMEManager, error) {
 	a := &ACMEManager{
 		logger:       c.Logger,
 		notifier:     c.Notifier,
+		notifyRepeat: c.NotifyRepeat,
 		directoryURL: c.DirectoryURL,
 		domainSet:    map[string]bool{},
 		now:          time.Now,
 		certs:        map[string]*certStatus{},
 		validations:  map[string][]validationError{},
+	}
+	if a.notifyRepeat == 0 {
+		a.notifyRepeat = DefaultNotifyRepeat
 	}
 	if a.logger == nil {
 		a.logger = slog.Default()
@@ -528,7 +536,8 @@ func (a *ACMEManager) recovered(domain string, leaf *x509.Certificate) {
 }
 
 // raise notifies a problem with the certificate of a domain: at once if it
-// is new or worse than the one notified before, otherwise once a day.
+// is new or worse than the one notified before, otherwise every
+// notifyRepeat (by default once a day).
 func (a *ACMEManager) raise(domain string, e notify.Event) {
 	if a.notifier == nil {
 		return
@@ -536,7 +545,7 @@ func (a *ACMEManager) raise(domain string, e notify.Event) {
 	now := a.now()
 	a.mu.Lock()
 	s := a.status(domain)
-	if s.alert == e.Event && now.Sub(s.notifiedAt) < acmeNotifyInterval {
+	if s.alert == e.Event && (a.notifyRepeat < 0 || now.Sub(s.notifiedAt) < a.notifyRepeat) {
 		a.mu.Unlock()
 		return
 	}

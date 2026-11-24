@@ -388,6 +388,7 @@ command (a shell script):
 |------|--------|
 | `TestACMECertificate` | A certificate is obtained with TLS-ALPN-01, and with HTTP-01 when the CA offers only that; it is served with its chain and verifies against the CA, HTTPS requests reach the backend, other requests to `-http-redirect` get `308` to HTTPS. No notification and no warning is logged for a valid certificate. After a restart, the cached certificate is served without a new order |
 | `TestACMENotifyUnavailable` | The CA cannot validate two domains: each gets `certificate_unavailable` (`critical`) at the webhook (`json`) and from the command, with `failures` 1, `retry_at` 10 minutes later, the error with the CA's reason (`Timeout during connect`), the message and `text`; the command gets the event on standard input (without `text`) and in `PRISMWAF_*` variables. The CA's reason is logged as `ACME validation failed` with a hint. Client handshakes fail and do not make prismwaf contact the CA again during the backoff; nothing is notified twice |
+| `TestACMENotifyRateLimit` | Three domains fail at once with `-acme-notify-rate-limit 1/3s`: the first `certificate_unavailable` is sent at once, the other two are logged as `notification held back: rate limit reached` and arrive 3 seconds later as one `notification_digest` (`critical`) with both events in `held`, a message that lists them one per line, `PRISMWAF_HELD=2` for the command and the same text for the `slack` webhook. Nothing more is sent in the next window |
 | `TestACMENotifyCommandIsNotInjected` | The CA rejects the order with a detail containing `$(touch …)`, backticks and `;`. A command that uses `$PRISMWAF_ERROR` and `$PRISMWAF_MESSAGE` (also unquoted) gets the detail as text, and nothing in it is run. The `slack` webhook gets only `{"text": …}` |
 | `TestACMENotifyExpiring` | A cached certificate with 10 days left of 90 and a CA that cannot validate: renewal is attempted at once and fails, without a notification; at the next check, a minute later, `certificate_expiring` (`warning`) with the issuer, serial and `not_after` of the certificate, as `{"content": …}` to the `discord` webhook and to the command (`PRISMWAF_NOT_AFTER`). The old certificate keeps being served |
 | `TestACMERenewalAtStartup` | The same certificate and a CA that works: it is renewed at once, and nothing is notified or warned, also at the next check |
@@ -397,7 +398,7 @@ command (a shell script):
 | `TestNotifyTargetsAreIndependent` | The webhook does not answer: the command is still run at once, prismwaf keeps serving HTTPS for another domain, and stops at once on `SIGTERM` |
 | `TestNotifyTestFlag` | `-acme-notify-test` with each webhook format and a command, over HTTP and HTTPS (a webhook with a certificate from an unknown CA fails, and works once the CA is trusted with `SSL_CERT_FILE`). A `403`, a refused connection and a failing command each make prismwaf exit with an error that names the target and the reason |
 | `TestNotifySecretsAreNotLogged` | A webhook URL with a token in the path, a password and a key in the query: neither the test output, the startup log nor the failure logs contain them |
-| `TestNotifyInvalidFlags` | prismwaf refuses to start with notification flags without `-acme-domains`, `-acme-notify-test` without a target, a webhook URL that is not `http(s)://`, an unknown format, or `-acme-notify-webhook-format` without `-acme-notify-webhook`; the URL is not repeated in the error |
+| `TestNotifyInvalidFlags` | prismwaf refuses to start with notification flags without `-acme-domains`, `-acme-notify-test` without a target, a webhook URL that is not `http(s)://`, an unknown format, or `-acme-notify-webhook-format` without `-acme-notify-webhook`; the URL is not repeated in the error. `-acme-notify-repeat` and `-acme-notify-rate-limit` are checked by the unit tests of `cmd/prismwaf` (`TestConfigValidate`): an invalid rate, a negative interval, and either without a target are refused |
 | `TestLiveWebhook` | With `PRISMWAF_E2E_WEBHOOK`, sends a test notification to a real service, e.g. a Slack or Discord channel |
 
 `TestLiveWebhook` is not run by default, because it needs a webhook URL:
@@ -415,6 +416,7 @@ Run on 2026-11-15 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
 |------|--------|-----:|
 | `TestACMECertificate` | Pass | 2.2s |
 | `TestACMENotifyUnavailable` | Pass | 0.7s |
+| `TestACMENotifyRateLimit` | Pass (2026-11-24, with the full E2E suite) | 7.1s |
 | `TestACMENotifyCommandIsNotInjected` | Pass | 0.1s |
 | `TestACMENotifyExpiring` | Pass | 60s |
 | `TestACMERenewalAtStartup` | Pass | 65s |
@@ -450,6 +452,8 @@ tests, and the code was restored:
 | A worse problem not notified at once | 1 |
 | The `slack` format sending the full event | 3 |
 | The CA's reason left out of the notification's `error` | 1 |
+| No rate limit; events overtaking held ones; the digest not counted in the next window; a digest with severity `info`; a single held notification sent as a digest; held notifications not logged at shutdown; no `PRISMWAF_HELD` (unit tests, 2026-11-24) | 1–2 each |
+| `-acme-notify-repeat` ignored; `0` meaning the default instead of never; a negative interval accepted (unit tests, 2026-11-24) | 1 each |
 
 The unit tests added with the fixes fail without them as well.
 
@@ -477,7 +481,10 @@ The unit tests added with the fixes fail without them as well.
 
 - The daily repetition of a notification and `certificate_recovered`,
   which need a day, or 10 to 60 minutes until the next attempt; the unit
-  tests cover them with a fixed clock.
+  tests cover them with a fixed clock, including other
+  `-acme-notify-repeat` intervals and `0` (`TestACMENotifyRepeat`), and
+  the rate limit's windows, digests and shutdown (`TestRateLimit`,
+  `TestDigestIsShortened`, `TestRunSendsDigests`).
 - The 30-second timeout of commands, and the limit of 100 waiting
   notifications.
 - Rate limit responses of the CA, RSA certificates, and a real CA such as

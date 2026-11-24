@@ -46,7 +46,17 @@ type Event struct {
 	Error    string     `json:"error,omitempty"`
 	Failures int        `json:"failures,omitempty"`
 	RetryAt  *time.Time `json:"retry_at,omitempty"`
+
+	// Held are the notifications of a digest (EventDigest).
+	Held []Event `json:"held,omitempty"`
 }
+
+// EventDigest is the event of the notification that sends the
+// notifications held back by Config.RateLimit.
+const EventDigest = "notification_digest"
+
+// digestLines is how many held notifications a digest's message lists.
+const digestLines = 20
 
 // Text returns the message with the host and severity, for chat services.
 func (e Event) Text() string {
@@ -94,6 +104,13 @@ type Config struct {
 	// HTTPClient sends webhooks. Nil uses a client with a 10 second
 	// timeout.
 	HTTPClient *http.Client
+	// RateLimit is the most notifications queued by Notify per RateWindow.
+	// The others are held back and sent together in one notification when
+	// the window ends, so that many notifications at once, e.g. when the
+	// certificates of all domains fail, do not flood the administrators.
+	// Zero means no limit.
+	RateLimit  int
+	RateWindow time.Duration
 }
 
 // Notifier sends events. Notify queues them for Run, which sends them in
@@ -107,6 +124,13 @@ type Notifier struct {
 	targets []target
 	queues  []chan Event                               // one per target
 	sleep   func(context.Context, time.Duration) error // for tests
+	now     func() time.Time                           // for tests
+
+	mu          sync.Mutex
+	windowStart time.Time // of the rate limit
+	sent        int       // notifications queued in the window
+	held        []Event   // held back by the rate limit
+	wake        chan struct{}
 }
 
 // New returns a Notifier.
@@ -128,11 +152,16 @@ func New(cfg Config) (*Notifier, error) {
 	default:
 		return nil, fmt.Errorf("notify: invalid webhook format %q: must be %q, %q or %q", cfg.WebhookFormat, FormatJSON, FormatSlack, FormatDiscord)
 	}
+	if cfg.RateLimit < 0 || cfg.RateLimit > 0 && cfg.RateWindow <= 0 {
+		return nil, errors.New("notify: the rate limit requires a positive number of notifications and window")
+	}
 	n := &Notifier{
 		cfg:    cfg,
 		logger: cfg.Logger,
 		client: cfg.HTTPClient,
 		sleep:  sleep,
+		now:    time.Now,
+		wake:   make(chan struct{}, 1),
 	}
 	if n.logger == nil {
 		n.logger = slog.Default()
@@ -177,9 +206,133 @@ func redact(raw string) string {
 
 // Notify queues an event to be sent by Run. Time and Host are filled in if
 // empty. It never blocks: if too many events are waiting for a target, the
-// event is dropped for that target and logged.
+// event is dropped for that target and logged. Beyond Config.RateLimit,
+// the event is held back for a digest.
 func (n *Notifier) Notify(e Event) {
 	n.fill(&e)
+	if n.admit(e) {
+		n.enqueue(e)
+	}
+}
+
+// admit reports whether an event may be queued under the rate limit, and
+// otherwise holds it back.
+func (n *Notifier) admit(e Event) bool {
+	if n.cfg.RateLimit == 0 {
+		return true
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	now := n.now()
+	// Events wait behind held ones, which the digest sends first.
+	if len(n.held) == 0 {
+		if now.Sub(n.windowStart) >= n.cfg.RateWindow {
+			n.windowStart, n.sent = now, 0
+		}
+		if n.sent < n.cfg.RateLimit {
+			n.sent++
+			return true
+		}
+	}
+	n.held = append(n.held, e)
+	if len(n.held) == 1 {
+		select {
+		case n.wake <- struct{}{}:
+		default: // already pending
+		}
+	}
+	n.logger.Warn("notification held back: rate limit reached", "event", e.Event, "domain", e.Domain,
+		"limit", n.cfg.RateLimit, "window", n.cfg.RateWindow, "send_at", n.windowStart.Add(n.cfg.RateWindow).UTC().Format(time.RFC3339))
+	return false
+}
+
+// flush returns the held events as one event, starting a new window of the
+// rate limit in which it counts.
+func (n *Notifier) flush() (Event, bool) {
+	n.mu.Lock()
+	held := n.held
+	n.held = nil
+	if len(held) > 0 {
+		n.windowStart, n.sent = n.now(), 1
+	}
+	n.mu.Unlock()
+	switch len(held) {
+	case 0:
+		return Event{}, false
+	case 1:
+		return held[0], true
+	}
+	return n.digest(held), true
+}
+
+// digest returns an event that lists held events, with the highest
+// severity among them.
+func (n *Notifier) digest(held []Event) Event {
+	e := Event{Event: EventDigest, Severity: SeverityInfo, Held: held}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d notifications were held back by the rate limit of %d per %s:", len(held), n.cfg.RateLimit, n.cfg.RateWindow)
+	for i, h := range held {
+		if severityRank(h.Severity) > severityRank(e.Severity) {
+			e.Severity = h.Severity
+		}
+		if i < digestLines {
+			fmt.Fprintf(&b, "\n- %s %s: %s", h.Time.UTC().Format(time.RFC3339), strings.ToUpper(h.Severity), h.Message)
+		}
+	}
+	if len(held) > digestLines {
+		fmt.Fprintf(&b, "\n- … and %d more; see the PrismWAF log", len(held)-digestLines)
+	}
+	e.Message = b.String()
+	n.fill(&e)
+	return e
+}
+
+func severityRank(s string) int {
+	switch s {
+	case SeverityCritical:
+		return 2
+	case SeverityWarning:
+		return 1
+	}
+	return 0
+}
+
+// sendDigests queues the held events as a digest when each window of the
+// rate limit ends, until ctx is canceled.
+func (n *Notifier) sendDigests(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			n.dropHeld()
+			return
+		case <-n.wake:
+		}
+		n.mu.Lock()
+		wait := n.windowStart.Add(n.cfg.RateWindow).Sub(n.now())
+		n.mu.Unlock()
+		if wait > 0 && n.sleep(ctx, wait) != nil {
+			n.dropHeld()
+			return
+		}
+		if e, ok := n.flush(); ok {
+			n.enqueue(e)
+		}
+	}
+}
+
+// dropHeld logs the held events at shutdown, so that they are not lost.
+func (n *Notifier) dropHeld() {
+	n.mu.Lock()
+	held := n.held
+	n.held = nil
+	n.mu.Unlock()
+	for _, e := range held {
+		n.logger.Error("notification not sent: shutting down", "event", e.Event, "domain", e.Domain, "message", e.Message)
+	}
+}
+
+// enqueue queues an event for each target.
+func (n *Notifier) enqueue(e Event) {
 	for i, q := range n.queues {
 		select {
 		case q <- e:
@@ -191,7 +344,7 @@ func (n *Notifier) Notify(e Event) {
 
 func (n *Notifier) fill(e *Event) {
 	if e.Time.IsZero() {
-		e.Time = time.Now().UTC()
+		e.Time = n.now().UTC()
 	}
 	if e.Host == "" {
 		e.Host = n.host
@@ -200,9 +353,13 @@ func (n *Notifier) fill(e *Event) {
 
 // Run sends queued events until ctx is canceled, to each target in the
 // order they were queued. Each event is tried up to three times per
-// target.
+// target. Events held back by the rate limit are sent as a digest when
+// the window ends.
 func (n *Notifier) Run(ctx context.Context) {
 	var wg sync.WaitGroup
+	if n.cfg.RateLimit > 0 {
+		wg.Go(func() { n.sendDigests(ctx) })
+	}
 	for i, t := range n.targets {
 		wg.Go(func() {
 			for {
@@ -339,6 +496,9 @@ func commandEnv(e Event) []string {
 	}
 	if e.Failures > 0 {
 		env = append(env, "PRISMWAF_FAILURES="+strconv.Itoa(e.Failures))
+	}
+	if len(e.Held) > 0 {
+		env = append(env, "PRISMWAF_HELD="+strconv.Itoa(len(e.Held)))
 	}
 	return env
 }

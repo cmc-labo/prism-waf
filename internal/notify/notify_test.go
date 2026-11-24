@@ -254,9 +254,172 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		{WebhookURL: "hooks.slack.com/services/x"},
 		{WebhookURL: "ftp://example.com/hook"},
 		{WebhookURL: "https://example.com/hook", WebhookFormat: "teams"},
+		{Command: "true", RateLimit: 10},
+		{Command: "true", RateLimit: -1, RateWindow: time.Hour},
 	} {
 		if _, err := New(cfg); err == nil {
 			t.Errorf("New(%+v) succeeded", cfg)
 		}
+	}
+}
+
+// eventFor returns a test event for a domain with a severity.
+func eventFor(domain, severity string) Event {
+	e := testEvent()
+	e.Domain, e.Severity = domain, severity
+	e.Message = "The certificate for " + domain + " has a problem."
+	return e
+}
+
+// queued returns the domains of the events queued for the first target.
+func queued(n *Notifier) []string {
+	var out []string
+	for {
+		select {
+		case e := <-n.queues[0]:
+			if e.Event == EventDigest {
+				out = append(out, "digest")
+			} else {
+				out = append(out, e.Domain)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	n, logs := newTestNotifier(t, Config{Command: "true", RateLimit: 2, RateWindow: time.Hour})
+	now := time.Date(2026, 11, 9, 3, 0, 0, 0, time.UTC)
+	n.now = func() time.Time { return now }
+
+	n.Notify(eventFor("a.example", SeverityWarning))
+	n.Notify(eventFor("b.example", SeverityWarning))
+	n.Notify(eventFor("c.example", SeverityInfo))
+	n.Notify(eventFor("d.example", SeverityCritical))
+	n.Notify(eventFor("e.example", SeverityWarning))
+	if got := strings.Join(queued(n), ","); got != "a.example,b.example" {
+		t.Errorf("queued %s, want the first two", got)
+	}
+	if c := strings.Count(logs.String(), "notification held back: rate limit reached"); c != 3 ||
+		!strings.Contains(logs.String(), "send_at=2026-11-09T04:00:00Z") {
+		t.Errorf("log:\n%s", logs)
+	}
+
+	// The window has not ended yet: later events wait behind the held ones,
+	// even when the window ends before the digest is sent.
+	now = now.Add(time.Hour)
+	n.Notify(eventFor("f.example", SeverityInfo))
+	if got := queued(n); got != nil {
+		t.Errorf("queued %v before the digest", got)
+	}
+	e, ok := n.flush()
+	if !ok || e.Event != EventDigest || e.Severity != SeverityCritical || len(e.Held) != 4 || !e.Time.Equal(now) || e.Host == "" {
+		t.Fatalf("digest %+v", e)
+	}
+	want := "4 notifications were held back by the rate limit of 2 per 1h0m0s:\n" +
+		"- 2026-11-09T03:00:00Z INFO: The certificate for c.example has a problem.\n" +
+		"- 2026-11-09T03:00:00Z CRITICAL: The certificate for d.example has a problem.\n" +
+		"- 2026-11-09T03:00:00Z WARNING: The certificate for e.example has a problem.\n" +
+		"- 2026-11-09T03:00:00Z INFO: The certificate for f.example has a problem."
+	if e.Message != want {
+		t.Errorf("message:\n%s\nwant:\n%s", e.Message, want)
+	}
+	if env := strings.Join(commandEnv(e), "\n"); !strings.Contains(env, "PRISMWAF_HELD=4") {
+		t.Errorf("environment:\n%s", env)
+	}
+	if _, ok := n.flush(); ok {
+		t.Error("second flush returned events")
+	}
+
+	// The digest counts in the new window.
+	n.Notify(eventFor("g.example", SeverityInfo))
+	n.Notify(eventFor("h.example", SeverityInfo))
+	if got := strings.Join(queued(n), ","); got != "g.example" {
+		t.Errorf("queued %s in the new window", got)
+	}
+	// A single held event is sent as it is.
+	now = now.Add(time.Hour)
+	if e, ok := n.flush(); !ok || e.Domain != "h.example" || e.Held != nil {
+		t.Errorf("flush = %+v", e)
+	}
+}
+
+func TestDigestIsShortened(t *testing.T) {
+	n, _ := newTestNotifier(t, Config{Command: "true", RateLimit: 1, RateWindow: time.Minute})
+	var held []Event
+	for range digestLines + 5 {
+		held = append(held, testEvent())
+	}
+	e := n.digest(held)
+	if lines := strings.Split(e.Message, "\n"); len(lines) != digestLines+2 || lines[len(lines)-1] != "- … and 5 more; see the PrismWAF log" {
+		t.Errorf("message:\n%s", e.Message)
+	}
+	if len(e.Held) != digestLines+5 {
+		t.Errorf("%d held events, want all", len(e.Held))
+	}
+}
+
+func TestRunSendsDigests(t *testing.T) {
+	h := &webhook{}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	n, logs := newTestNotifier(t, Config{WebhookURL: srv.URL, RateLimit: 1, RateWindow: time.Hour})
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 9, 3, 0, 0, 0, time.UTC)
+	n.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	slept := make(chan time.Duration, 1)
+	release := make(chan struct{}) // ends the window
+	digests := 0
+	n.sleep = func(ctx context.Context, d time.Duration) error {
+		if d < time.Hour-time.Minute { // a retry
+			return nil
+		}
+		if digests++; digests > 1 { // the second digest waits for the shutdown
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		slept <- d
+		<-release
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { n.Run(ctx); close(done) }()
+	for _, d := range []string{"a.example", "b.example", "c.example"} {
+		n.Notify(eventFor(d, SeverityWarning))
+	}
+	select {
+	case d := <-slept:
+		if d != time.Hour {
+			t.Errorf("waited %v for the digest, want the rest of the window", d)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("no digest is waiting for the end of the window")
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(h.received()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	var first, digest Event
+	if b := h.received(); len(b) != 2 || json.Unmarshal(b[0], &first) != nil || json.Unmarshal(b[1], &digest) != nil ||
+		first.Domain != "a.example" || digest.Event != EventDigest || len(digest.Held) != 2 || digest.Held[1].Domain != "c.example" {
+		t.Errorf("received %s", b)
+	}
+
+	// The digest counts in the new window, so these are held. Events held
+	// at shutdown are logged.
+	n.Notify(eventFor("d.example", SeverityWarning))
+	n.Notify(eventFor("e.example", SeverityWarning))
+	cancel()
+	<-done
+	if !strings.Contains(logs.String(), `msg="notification not sent: shutting down" event=certificate_expiring domain=d.example`) ||
+		!strings.Contains(logs.String(), `msg="notification not sent: shutting down" event=certificate_expiring domain=e.example`) {
+		t.Errorf("log:\n%s", logs)
 	}
 }

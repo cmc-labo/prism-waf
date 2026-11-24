@@ -46,6 +46,12 @@ func TestConfigValidate(t *testing.T) {
 		{"ACME invalid webhook format", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyWebhook: "https://hooks.example.com/x", acmeNotifyFormat: "teams"}, true},
 		{"notifications without ACME", config{acmeNotifyWebhook: "https://hooks.example.com/x"}, true},
 		{"ACME webhook format without webhook", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyFormat: "slack", setFlags: []string{"acme-notify-webhook-format"}}, true},
+		{"ACME notification limits", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyRepeat: 6 * time.Hour, acmeNotifyRateLimit: "5/30m"}, false},
+		{"ACME notifications without limits", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyRateLimit: "off"}, false},
+		{"ACME invalid notification rate limit", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyRateLimit: "10"}, true},
+		{"ACME negative notification repeat", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyCommand: "true", acmeNotifyRepeat: -time.Hour}, true},
+		{"ACME notification repeat without target", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyRepeat: time.Hour, setFlags: []string{"acme-notify-repeat"}}, true},
+		{"ACME notification rate limit without target", config{acmeDomains: "example.com", acmeCache: "c", acmeNotifyRateLimit: "off", setFlags: []string{"acme-notify-rate-limit"}}, true},
 
 		{"HSTS", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year}}), false},
 		{"HSTS preload", https(config{hsts: tlsutil.HSTSPolicy{MaxAge: year, IncludeSubdomains: true, Preload: true}}), false},
@@ -194,4 +200,16 @@ func gql(c config) config {
 	c.graphqlMaxFields = graphql.DefaultMaxFields
 	c.graphqlMaxBatch = graphql.DefaultMaxBatch
 	return c
+}
+
+func TestACMENotifyRepeatInterval(t *testing.T) {
+	for in, want := range map[time.Duration]time.Duration{
+		tlsutil.DefaultNotifyRepeat: tlsutil.DefaultNotifyRepeat,
+		6 * time.Hour:               6 * time.Hour,
+		0:                           -1, // never, not the default
+	} {
+		if got := (config{acmeNotifyRepeat: in}).acmeNotifyRepeatInterval(); got != want {
+			t.Errorf("-acme-notify-repeat %v: %v, want %v", in, got, want)
+		}
+	}
 }

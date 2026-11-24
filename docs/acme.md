@@ -98,6 +98,8 @@ first time such a client connects.
 | `-acme-notify-webhook-format` | `json` | Payload of the webhook: `json`, `slack` or `discord` |
 | `-acme-notify-command` | (none) | Shell command to run for each notification |
 | `-acme-notify-test` | `false` | Send a test notification and exit |
+| `-acme-notify-repeat` | `24h` | How often a notification is [repeated](#limiting-notifications) while its problem lasts; `0` notifies each problem once |
+| `-acme-notify-rate-limit` | `10/1h` | Most notifications sent per window as `N/WINDOW`; the others are [sent together](#limiting-notifications) when the window ends. `off` disables |
 
 Related options that work with ACME: `-hsts-max-age` (see
 [HSTS](https.md#hsts)) and `-tls-client-ca` (see
@@ -374,9 +376,11 @@ Without notification options, PrismWAF logs a reminder at startup.
 | `certificate_unavailable` | `critical` | A domain has no certificate at all, because requesting one failed (at startup with an empty or expired cache, or for a new domain); HTTPS connections to it fail |
 | `certificate_recovered` | `info` | The certificate is fine again after one of the events above |
 | `test` | `info` | Sent by `-acme-notify-test` |
+| `notification_digest` | Highest of its notifications | Notifications held back by `-acme-notify-rate-limit`, sent together (see [Limiting notifications](#limiting-notifications)) |
 
 A problem is notified as soon as it is detected (PrismWAF checks every
-minute) and then once a day while it lasts. A worse problem, e.g.
+minute) and then once a day while it lasts (see
+[Limiting notifications](#limiting-notifications)). A worse problem, e.g.
 `certificate_expired` after `certificate_expiring`, is notified at once.
 `certificate_recovered` closes the problem, so an alert can be resolved
 automatically.
@@ -407,6 +411,51 @@ Notifications concern the ECDSA certificates of the configured domains.
 They are only sent while PrismWAF runs; see
 [Monitor certificate expiry](#monitor-certificate-expiry) for a check from
 outside.
+
+### Limiting notifications
+
+Two options keep notifications few, so that they are not ignored:
+
+- `-acme-notify-repeat` (default `24h`) is how often the same problem of
+  a domain is notified again while it lasts. Longer intervals, e.g.
+  `72h`, suit teams that track problems in a ticket system; `0` notifies
+  each problem only once. A worse problem (`certificate_expired` after
+  `certificate_expiring`) and `certificate_recovered` are always sent at
+  once, and a problem that comes back after `certificate_recovered` is
+  new.
+- `-acme-notify-rate-limit` (default `10/1h`) caps the notifications of
+  all domains together. When a single cause, e.g. a firewall change or an
+  outage of the CA, makes the certificates of many domains fail at once,
+  the first 10 are sent and the others are held back: when the hour ends,
+  they are sent together as one `notification_digest`. Nothing is lost.
+  `off` sends every notification at once.
+
+```sh
+prismwaf … -acme-notify-webhook https://hooks.slack.com/services/T000/B000/XXXX \
+  -acme-notify-webhook-format slack \
+  -acme-notify-repeat 72h -acme-notify-rate-limit 5/1h
+```
+
+A digest lists the notifications it holds, oldest first; the message
+shows the first 20:
+
+```
+[PrismWAF waf1] CRITICAL: 7 notifications were held back by the rate limit of 5 per 1h0m0s:
+- 2026-11-09T01:03:46Z CRITICAL: There is no certificate for shop.example.com: requesting one failed; HTTPS connections to it fail. …
+- 2026-11-09T01:03:47Z CRITICAL: There is no certificate for api.example.com: requesting one failed; HTTPS connections to it fail. …
+…
+```
+
+With the `json` format and for commands, the digest's `held` field has
+the full events, and `PRISMWAF_HELD` their number. A notification that
+is the only one held back is sent unchanged when the window ends. The
+digest counts towards the next window, and notifications that arrive
+after it are sent in order. Notifications held back when PrismWAF stops
+are logged as `notification not sent: shutting down`, with their message.
+
+The limit applies to the notifications PrismWAF queues; retries of a
+failed delivery do not count. The test notification of
+`-acme-notify-test` is not limited.
 
 ### Webhooks
 
@@ -445,6 +494,7 @@ The `json` format:
 | `domain` | The domain of the certificate |
 | `issuer`, `serial`, `not_after` | The certificate, for `certificate_expiring`, `certificate_expired` and `certificate_recovered` |
 | `error`, `failures`, `retry_at` | For `certificate_unavailable`: the last error, the number of failed requests in a row and the next attempt. When the CA could not validate the domain, `error` ends with `; validation:` and the CA's reasons, as in the `validation` field of the log |
+| `held` | For `notification_digest`: the notifications it holds, each with the fields above (without `text`) |
 
 A response other than `2xx` counts as a failure. Each notification is
 tried three times (immediately, after 10 seconds and after another
@@ -469,6 +519,7 @@ format without `text`) on standard input and in environment variables:
 | `PRISMWAF_DOMAIN`, `PRISMWAF_HOST`, `PRISMWAF_TIME` | Domain, host name and time (RFC 3339) |
 | `PRISMWAF_NOT_AFTER` | Expiry of the certificate (RFC 3339), if known |
 | `PRISMWAF_ERROR`, `PRISMWAF_FAILURES` | For `certificate_unavailable` |
+| `PRISMWAF_HELD` | For `notification_digest`: the number of notifications it holds; `PRISMWAF_MESSAGE` lists them, one per line |
 
 A non-zero exit status counts as a failure and is retried like a webhook;
 the first 512 bytes of the command's output are logged. Commands are
@@ -519,6 +570,8 @@ PrismWAF writes ACME events to its operational log (standard error):
 | WARN | `notification failed; retrying` | Delivery failed and is retried. With the `error` |
 | ERROR | `notification failed` | Delivery failed three times. With the `error` and the `message` that could not be delivered |
 | ERROR | `notification dropped: …` | More than 100 notifications were waiting to be sent to the `target` |
+| WARN | `notification held back: rate limit reached` | `-acme-notify-rate-limit` was reached; the notification is sent in a digest at `send_at`. With `event`, `domain`, `limit` and `window` |
+| ERROR | `notification not sent: shutting down` | A notification held back by the rate limit when PrismWAF stopped. With the `message` |
 
 The library that implements ACME only reports that no challenge
 succeeded; the CA's reason is taken from its responses and logged as
@@ -777,4 +830,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - Renewal failures of existing certificates are retried every 30 to 60
   minutes by the ACME library, without the longer delays above.
 - Notifications are only sent while PrismWAF runs, and their state is
-  kept in memory: after a restart, an ongoing problem is notified again.
+  kept in memory: after a restart, an ongoing problem is notified again,
+  and the rate limit starts over.
+- Several instances, e.g. replicas with the same domains, notify
+  independently; each problem is then notified once per instance.
