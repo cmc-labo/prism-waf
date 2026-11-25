@@ -423,3 +423,16 @@ func TestRunSendsDigests(t *testing.T) {
 		t.Errorf("log:\n%s", logs)
 	}
 }
+
+func TestCommandEnvOfAlerts(t *testing.T) {
+	env := strings.Join(commandEnv(Event{Event: "rate_limited_client", Metric: "client", Client: "203.0.113.7", Count: 300, Threshold: 300, Window: "5m0s"}), "\n")
+	for _, want := range []string{"PRISMWAF_METRIC=client", "PRISMWAF_CLIENT=203.0.113.7", "PRISMWAF_COUNT=300", "PRISMWAF_THRESHOLD=300", "PRISMWAF_WINDOW=5m0s"} {
+		if !strings.Contains(env, want+"\n") && !strings.HasSuffix(env, want) {
+			t.Errorf("no %s in\n%s", want, env)
+		}
+	}
+	// Certificate events have none of them.
+	if env := strings.Join(commandEnv(testEvent()), "\n"); strings.Contains(env, "PRISMWAF_COUNT") || strings.Contains(env, "PRISMWAF_METRIC") {
+		t.Errorf("certificate event:\n%s", env)
+	}
+}

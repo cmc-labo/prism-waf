@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/abuse"
+	"github.com/cmc-labo/prism-waf/internal/alert"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
@@ -115,6 +116,14 @@ func main() {
 	flag.BoolVar(&cfg.acmeNotifyTest, "acme-notify-test", false, "send a test notification to the -acme-notify-* targets and exit")
 	flag.DurationVar(&cfg.acmeNotifyRepeat, "acme-notify-repeat", tlsutil.DefaultNotifyRepeat, "how often a certificate notification is repeated while its problem lasts; 0 notifies each problem once")
 	flag.StringVar(&cfg.acmeNotifyRateLimit, "acme-notify-rate-limit", defaultNotifyRateLimit, `most certificate notifications sent per window as N/WINDOW; the others are sent together when the window ends. "off" disables`)
+	flag.StringVar(&cfg.alertRequests, "alert-rate-limited-requests", "", `alert when the rate limits reject this many requests of all clients together, as N/WINDOW, e.g. "1000/5m"`)
+	flag.StringVar(&cfg.alertClients, "alert-rate-limited-clients", "", `alert when this many distinct clients exceed a rate limit, as N/WINDOW, e.g. "50/5m"`)
+	flag.StringVar(&cfg.alertClient, "alert-rate-limited-client", "", `alert when the requests of one client are rejected by the rate limits this many times, as N/WINDOW, e.g. "300/5m"`)
+	flag.StringVar(&cfg.alertWebhook, "alert-webhook", "", "URL to POST rate limit alerts to; alerts are always logged")
+	flag.StringVar(&cfg.alertFormat, "alert-webhook-format", notify.FormatJSON, `payload of -alert-webhook: "json", "slack" (also Mattermost, Google Chat) or "discord"`)
+	flag.StringVar(&cfg.alertCommand, "alert-command", "", "shell command to run for each rate limit alert; the alert is passed as JSON on stdin and in PRISMWAF_* variables")
+	flag.StringVar(&cfg.alertNotifyRateLimit, "alert-notify-rate-limit", defaultNotifyRateLimit, `most alerts sent per window as N/WINDOW; the others are sent together when the window ends. "off" disables`)
+	flag.BoolVar(&cfg.alertTest, "alert-test", false, "send a test alert to -alert-webhook and -alert-command and exit")
 	flag.StringVar(&cfg.httpRedirect, "http-redirect", "", `address of a plain HTTP listener that redirects to HTTPS, e.g. ":80"; also answers ACME HTTP-01 challenges (requires HTTPS)`)
 	flag.DurationVar(&cfg.hsts.MaxAge, "hsts-max-age", 0, `send Strict-Transport-Security with this max-age on HTTPS responses, e.g. "8760h"; 0 disables`)
 	flag.BoolVar(&cfg.hsts.IncludeSubdomains, "hsts-include-subdomains", false, "add includeSubDomains to the HSTS header")
@@ -221,6 +230,14 @@ type config struct {
 	acmeNotifyTest       bool
 	acmeNotifyRepeat     time.Duration
 	acmeNotifyRateLimit  string
+	alertRequests        string
+	alertClients         string
+	alertClient          string
+	alertWebhook         string
+	alertFormat          string
+	alertCommand         string
+	alertNotifyRateLimit string
+	alertTest            bool
 	httpRedirect         string
 	hsts                 tlsutil.HSTSPolicy
 	clientCA             string
@@ -455,26 +472,69 @@ const defaultNotifyRateLimit = "10/1h"
 
 // notifier returns the notifier for ACME certificate events.
 func (c config) notifier(logger *slog.Logger) (*notify.Notifier, error) {
-	format := c.acmeNotifyFormat
-	if c.acmeNotifyWebhook == "" {
+	return newNotifier(c.acmeNotifyWebhook, c.acmeNotifyFormat, c.acmeNotifyCommand, c.acmeNotifyRateLimit, "-acme-notify-rate-limit", logger)
+}
+
+// newNotifier returns a notifier for a set of -*-webhook, -*-webhook-format,
+// -*-command and -*-rate-limit options; rateFlag names the latter in
+// errors.
+func newNotifier(webhook, format, command, rate, rateFlag string, logger *slog.Logger) (*notify.Notifier, error) {
+	if webhook == "" {
 		format = "" // the default of the flag; irrelevant without a webhook
 	}
 	var limit int
 	var window time.Duration
-	if c.acmeNotifyRateLimit != "" && c.acmeNotifyRateLimit != "off" {
+	if rate != "" && rate != "off" {
 		var err error
-		if limit, window, err = ratelimit.ParseRate(c.acmeNotifyRateLimit); err != nil {
-			return nil, fmt.Errorf("invalid -acme-notify-rate-limit: %w", err)
+		if limit, window, err = ratelimit.ParseRate(rate); err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", rateFlag, err)
 		}
 	}
 	return notify.New(notify.Config{
-		WebhookURL:    c.acmeNotifyWebhook,
+		WebhookURL:    webhook,
 		WebhookFormat: format,
-		Command:       c.acmeNotifyCommand,
+		Command:       command,
 		Logger:        logger,
 		RateLimit:     limit,
 		RateWindow:    window,
 	})
+}
+
+func (c config) alertEnabled() bool {
+	return c.alertRequests != "" || c.alertClients != "" || c.alertClient != ""
+}
+
+func (c config) alertNotifyEnabled() bool { return c.alertWebhook != "" || c.alertCommand != "" }
+
+// alertNotifier returns the notifier for rate limit alerts.
+func (c config) alertNotifier(logger *slog.Logger) (*notify.Notifier, error) {
+	return newNotifier(c.alertWebhook, c.alertFormat, c.alertCommand, c.alertNotifyRateLimit, "-alert-notify-rate-limit", logger)
+}
+
+// alertConfig parses the -alert-rate-limited-* thresholds.
+func (c config) alertConfig() (alert.Config, error) {
+	var ac alert.Config
+	for _, t := range []struct {
+		flag, value string
+		threshold   *alert.Threshold
+	}{
+		{"-alert-rate-limited-requests", c.alertRequests, &ac.Requests},
+		{"-alert-rate-limited-clients", c.alertClients, &ac.Clients},
+		{"-alert-rate-limited-client", c.alertClient, &ac.Client},
+	} {
+		if t.value == "" {
+			continue
+		}
+		n, window, err := ratelimit.ParseRate(t.value)
+		if err != nil {
+			return ac, fmt.Errorf("invalid %s: %w", t.flag, err)
+		}
+		*t.threshold = alert.Threshold{Count: n, Window: window}
+	}
+	if ac.Clients.Count > alert.MaxClients {
+		return ac, fmt.Errorf("invalid -alert-rate-limited-clients: at most %d clients", alert.MaxClients)
+	}
+	return ac, nil
 }
 
 // acmeNotifyRepeatInterval returns ACMEConfig.NotifyRepeat for
@@ -623,6 +683,31 @@ func (c config) validate() error {
 			return err
 		}
 	}
+	if c.alertEnabled() {
+		if !c.rateLimitEnabled() {
+			return errors.New("-alert-rate-limited-* options require -rate-limit or -rate-limit-path")
+		}
+		if _, err := c.alertConfig(); err != nil {
+			return err
+		}
+	}
+	if c.alertNotifyEnabled() && !c.alertEnabled() && !c.alertTest {
+		return errors.New("-alert-webhook and -alert-command require an -alert-rate-limited-* threshold")
+	}
+	if c.alertWebhook == "" && slices.Contains(c.setFlags, "alert-webhook-format") {
+		return errors.New("-alert-webhook-format requires -alert-webhook")
+	}
+	if !c.alertNotifyEnabled() && slices.Contains(c.setFlags, "alert-notify-rate-limit") {
+		return errors.New("-alert-notify-rate-limit requires -alert-webhook or -alert-command")
+	}
+	if c.alertTest && !c.alertNotifyEnabled() {
+		return errors.New("-alert-test requires -alert-webhook or -alert-command")
+	}
+	if c.alertNotifyEnabled() {
+		if _, err := c.alertNotifier(nil); err != nil {
+			return err
+		}
+	}
 	if !c.tlsEnabled() {
 		switch {
 		case c.httpRedirect != "":
@@ -659,8 +744,26 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
-	if cfg.acmeNotifyTest {
-		return sendTestNotification(notifier, cfg, logger)
+	var alertNotifier *notify.Notifier
+	if cfg.alertNotifyEnabled() {
+		var err error
+		if alertNotifier, err = cfg.alertNotifier(logger); err != nil {
+			return err
+		}
+	}
+	if cfg.acmeNotifyTest || cfg.alertTest {
+		if cfg.acmeNotifyTest {
+			domains := splitList(cfg.acmeDomains)
+			if err := sendTestNotification(notifier, domains[0], "Test notification: PrismWAF will notify here when a certificate for "+strings.Join(domains, ", ")+" is about to expire, has expired or cannot be obtained.", logger); err != nil {
+				return err
+			}
+		}
+		if cfg.alertTest {
+			if err := sendTestNotification(alertNotifier, "", "Test alert: PrismWAF will alert here when the rate limits are triggered more often than the -alert-rate-limited-* thresholds.", logger); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	var backends []*url.URL
 	for _, raw := range cfg.backendURLs() {
@@ -774,6 +877,21 @@ func run(cfg config, logger *slog.Logger) error {
 			return err
 		}
 	}
+	var alerts *alert.Monitor
+	if cfg.alertEnabled() {
+		ac, err := cfg.alertConfig()
+		if err != nil {
+			return err
+		}
+		ac.Logger = logger
+		if alertNotifier != nil {
+			// Not a typed nil in the interface.
+			ac.Notifier = alertNotifier
+		}
+		if alerts, err = alert.New(ac); err != nil {
+			return err
+		}
+	}
 	var abuseGuard *abuse.Guard
 	if cfg.abuseEnabled() {
 		ac, err := cfg.abuseConfig()
@@ -841,22 +959,23 @@ func run(cfg config, logger *slog.Logger) error {
 	// without a valid certificate, to the operational log.
 	httpErrorLog := slog.NewLogLogger(logger.Handler(), slog.LevelWarn)
 	var handler http.Handler = waf.Middleware(rp, waf.Config{
-		Inspector:      inspector,
-		CRS:            crsEngine,
-		Geo:            geoFilter,
-		OpenAPI:        apiSpec,
-		GraphQL:        graphqlGuard,
-		GRPC:           grpc.New(grpcConfig),
-		RateLimiter:    limiter,
-		Abuse:          abuseGuard,
-		Bans:           bans,
-		Concurrency:    concurrency,
-		BodyTimeout:    ddos.BodyTimeout{Timeout: cfg.bodyTimeout, MinRate: cfg.bodyMinRate},
-		Bot:            guard,
-		Mode:           mode,
-		Audit:          auditLogger,
-		TrustedProxies: tp,
-		Logger:         logger,
+		Inspector:       inspector,
+		CRS:             crsEngine,
+		Geo:             geoFilter,
+		OpenAPI:         apiSpec,
+		GraphQL:         graphqlGuard,
+		GRPC:            grpc.New(grpcConfig),
+		RateLimiter:     limiter,
+		RateLimitAlerts: alerts,
+		Abuse:           abuseGuard,
+		Bans:            bans,
+		Concurrency:     concurrency,
+		BodyTimeout:     ddos.BodyTimeout{Timeout: cfg.bodyTimeout, MinRate: cfg.bodyMinRate},
+		Bot:             guard,
+		Mode:            mode,
+		Audit:           auditLogger,
+		TrustedProxies:  tp,
+		Logger:          logger,
 	})
 	if cfg.hsts.MaxAge > 0 {
 		// Outermost, so that blocked responses carry the header too.
@@ -1055,6 +1174,13 @@ func run(cfg config, logger *slog.Logger) error {
 			logger.Info("ACME HTTP-01 challenge disabled; TLS-ALPN-01 requires -listen to be reachable on port 443")
 		}
 	}
+	if alerts != nil {
+		args := []any{"requests", cmp.Or(cfg.alertRequests, "off"), "clients", cmp.Or(cfg.alertClients, "off"), "client", cmp.Or(cfg.alertClient, "off")}
+		if alertNotifier != nil {
+			args = append(args, "targets", alertNotifier.Targets(), "rate_limit", cmp.Or(cfg.alertNotifyRateLimit, "off"))
+		}
+		logger.Info("rate limit alerts enabled", args...)
+	}
 	if cfg.hsts.MaxAge > 0 {
 		logger.Info("HSTS enabled", "header", cfg.hsts.Header())
 	}
@@ -1119,6 +1245,12 @@ func run(cfg config, logger *slog.Logger) error {
 	if notifier != nil {
 		go notifier.Run(ctx)
 	}
+	if alertNotifier != nil {
+		go alertNotifier.Run(ctx)
+	}
+	if alerts != nil {
+		go alerts.Run(ctx)
+	}
 	if acmeManager != nil {
 		go acmeManager.Run(ctx)
 	}
@@ -1168,16 +1300,15 @@ func serverProtocols() *http.Protocols {
 }
 
 // sendTestNotification sends a test notification to check the
-// -acme-notify-* settings.
-func sendTestNotification(n *notify.Notifier, cfg config, logger *slog.Logger) error {
+// -acme-notify-* or -alert-* settings.
+func sendTestNotification(n *notify.Notifier, domain, message string, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	domains := splitList(cfg.acmeDomains)
 	err := n.Send(ctx, notify.Event{
 		Event:    "test",
 		Severity: notify.SeverityInfo,
-		Domain:   domains[0],
-		Message:  "Test notification: PrismWAF will notify here when a certificate for " + strings.Join(domains, ", ") + " is about to expire, has expired or cannot be obtained.",
+		Domain:   domain,
+		Message:  message,
 	})
 	if err != nil {
 		return fmt.Errorf("test notification failed: %w", err)

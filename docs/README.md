@@ -6,7 +6,7 @@
 | [Deployment options](deployment.md) | Reverse proxy, container image, environment variables, probes and shutdown, sidecar in Kubernetes and Docker Compose, the Go library |
 | [Signature detection](detection.md) | The built-in signatures, normalization of encoded payloads, JSON and XML bodies, the body size limit |
 | [OWASP Core Rule Set](crs.md) | `-engine`, paranoia level, anomaly threshold, rule exclusions, tested use cases, performance |
-| [Rate limiting](rate-limiting.md) | Limits per client and per path, bursts, IPv6, proxies, exemptions, tuning in detection mode |
+| [Rate limiting](rate-limiting.md) | Limits per client and per path, bursts, IPv6, proxies, exemptions, tuning in detection mode, alerts |
 | [Denial of service protection](ddos.md) | Slow clients, connection limits, requests in progress and load shedding, bans, network-level attacks, measurements |
 | [Business flow protection](business-logic.md) | Failure limits against password, code and coupon guessing, enumeration limits against ID harvesting, rollout in detection mode |
 | [Geo filtering](geo-filtering.md) | Allowing or blocking countries, GeoIP databases and their updates, the country header for the backend, rollout in detection mode |

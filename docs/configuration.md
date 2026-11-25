@@ -69,9 +69,17 @@ See [Audit log](audit-log.md#audit-log) and
 | `-rate-limit-path` | (none) | Limit per client for one path, as `[METHOD ]PATH=N/WINDOW`, e.g. `POST /login=5/1m` or `/api/*=100/1m`; repeatable |
 | `-rate-limit-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never limited |
 | `-rate-limit-max-clients` | `100000` | Maximum number of clients tracked at once |
+| `-alert-rate-limited-requests` | (none) | Alert when the rate limits reject this many requests of all clients together, as `N/WINDOW`, e.g. `1000/5m` |
+| `-alert-rate-limited-clients` | (none) | Alert when this many distinct clients exceed a rate limit, as `N/WINDOW`, e.g. `50/5m` (at most 10,000) |
+| `-alert-rate-limited-client` | (none) | Alert when the requests of one client are rejected this many times, as `N/WINDOW`, e.g. `300/5m` |
+| `-alert-webhook` | (none) | URL to `POST` rate limit alerts to; alerts are always logged |
+| `-alert-webhook-format` | `json` | `json`, `slack` (also Mattermost, Google Chat) or `discord` |
+| `-alert-command` | (none) | Shell command run for each alert, with the alert as JSON on stdin and in `PRISMWAF_*` variables |
+| `-alert-notify-rate-limit` | `10/1h` | Most alerts per window as `N/WINDOW`; the others are sent together in one digest when the window ends. `off` disables |
+| `-alert-test` | `false` | Send a test alert and exit |
 
 A client is an IP address, or a `/64` network for IPv6. See
-[Rate limiting](rate-limiting.md).
+[Rate limiting](rate-limiting.md) and its [alerts](rate-limiting.md#alerts).
 
 ## Denial of service protection
 

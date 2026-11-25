@@ -29,6 +29,7 @@ internal/graphql/    GraphQL query limits, introspection, schema validation
 internal/grpc/       gRPC message streams, protobuf decoding, gRPC status responses
 internal/geo/        country lookup in MaxMind DB files, allow and block lists (geotest/: test databases)
 internal/notify/     notifications to administrators (webhooks, commands)
+internal/alert/      alerts when the rate limits are triggered too often
 internal/bot/        bot score, categories, DNS verification of bots, proof-of-work and CAPTCHA challenges
 e2e/                 end-to-end tests of the binary (build tag e2e)
 examples/backend/    echo server for local testing

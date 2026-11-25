@@ -22,6 +22,14 @@ Every client may send 300 requests per minute, of which 5 may be `POST
 | `-rate-limit-path` | (none) | Limit on the requests of each client to one path, as `[METHOD ]PATH=N/WINDOW`; repeatable |
 | `-rate-limit-exempt` | (none) | Comma-separated IPs/CIDRs of clients that are never limited |
 | `-rate-limit-max-clients` | `100000` | Maximum number of clients tracked at once |
+| `-alert-rate-limited-requests` | (none) | [Alert](#alerts) when the rate limits reject this many requests of all clients together, as `N/WINDOW` |
+| `-alert-rate-limited-clients` | (none) | [Alert](#alerts) when this many distinct clients exceed a limit, as `N/WINDOW` |
+| `-alert-rate-limited-client` | (none) | [Alert](#alerts) when the requests of one client are rejected this many times, as `N/WINDOW` |
+| `-alert-webhook` | (none) | URL to `POST` alerts to |
+| `-alert-webhook-format` | `json` | Payload of the webhook: `json`, `slack` (also Mattermost, Google Chat) or `discord` |
+| `-alert-command` | (none) | Shell command to run for each alert |
+| `-alert-notify-rate-limit` | `10/1h` | Most alerts sent per window; the others are sent together when the window ends. `off` disables |
+| `-alert-test` | `false` | Send a test alert to `-alert-webhook` and `-alert-command` and exit |
 
 Rate limiting is off unless `-rate-limit` or `-rate-limit-path` is given.
 
@@ -202,6 +210,137 @@ jq -r 'select(.reason == "rate_limit") | .rate_limit.client' audit.log | sort | 
 jq -r 'select(.reason == "rate_limit") | .rate_limit.rule' audit.log | sort | uniq -c
 ```
 
+## Alerts
+
+The audit log records every client that exceeds a limit, but nobody reads
+it while an attack is going on. PrismWAF can count how often the rate
+limits are triggered and alert administrators when that exceeds a
+threshold:
+
+```sh
+prismwaf -backend http://127.0.0.1:3000 \
+  -rate-limit 300/1m -rate-limit-path "POST /login=5/1m" \
+  -alert-rate-limited-requests 1000/5m \
+  -alert-rate-limited-clients 50/5m \
+  -alert-rate-limited-client 300/5m \
+  -alert-webhook https://hooks.slack.com/services/T000/B000/XXXX \
+  -alert-webhook-format slack
+```
+
+```
+[PrismWAF waf1] WARNING: Client 203.0.113.7 was rate limited 300 times within 1m42s (alert threshold: 300 per 5m0s). Rules: POST /login=5/1m (300).
+[PrismWAF waf1] WARNING: 50 clients were rate limited within 3m10s (alert threshold: 50 per 5m0s). Top clients: 198.51.100.23 (41), 203.0.113.7 (38), 192.0.2.80 (12), 2001:db8:4:2::/64 (9), 192.0.2.81 (7). Rules: POST /login=5/1m (130), 300/1m (22).
+[PrismWAF waf1] INFO: Rate-limited clients are below the alert threshold (50 per 5m0s) again after 25m0s: at most 104 clients per window.
+```
+
+### Thresholds
+
+Each threshold is `N/WINDOW`, like a rate. All three are optional; use
+the ones that match what you want to know:
+
+| Option | Counts | Typical cause |
+|--------|--------|---------------|
+| `-alert-rate-limited-requests` | Rejected requests of all clients together | A flood, or a limit that is too low for normal traffic (e.g. after a release) |
+| `-alert-rate-limited-clients` | Distinct clients (IPv6: `/64` networks) that were rejected | A distributed attack, such as credential stuffing from a botnet, where each address stays near the limit |
+| `-alert-rate-limited-client` | Rejected requests of a single client | One aggressive client, e.g. a scraper or a password-guessing script; the alert names its IP |
+
+Counting starts with the first request a limit rejects. In detection mode
+(`-mode detect`), the requests that would have been rejected count, so
+thresholds can be tuned before limits are enforced. Only `-rate-limit` and
+`-rate-limit-path` count; failure and enumeration limits of
+[business flow protection](business-logic.md), and the
+[denial of service protection](ddos.md), do not.
+
+To pick thresholds, look at how often the limits are exceeded on a normal
+day (see the `jq` commands [above](#responses-and-audit-events)), and set
+the threshold well above it. An alert should mean that something unusual
+is going on.
+
+### When PrismWAF alerts
+
+The count starts over in each window (fixed windows from the start of
+PrismWAF):
+
+- A threshold is alerted **as soon as** it is reached, not at the end of
+  the window. The alert lists the top 5 clients and rules of the window.
+- While it lasts, it is not alerted again, however many windows exceed
+  the threshold.
+- A whole window below the threshold resolves it: for the requests and
+  clients thresholds, PrismWAF sends `rate_limit_alert_resolved` with how
+  long it lasted, the total of rejected requests, and the highest count of
+  a window. A single
+  client is only logged as resolved, so that many clients do not mean
+  twice as many notifications. After that, the next excess is a new
+  alert.
+
+| Event | Severity | When |
+|-------|----------|------|
+| `rate_limited_requests` | `warning` | `-alert-rate-limited-requests` was reached |
+| `rate_limited_clients` | `warning` | `-alert-rate-limited-clients` was reached |
+| `rate_limited_client` | `warning` | A client reached `-alert-rate-limited-client` |
+| `rate_limit_alert_resolved` | `info` | A window below the requests or clients threshold after its alert |
+| `notification_digest` | Highest of its alerts | Alerts held back by `-alert-notify-rate-limit` |
+| `test` | `info` | Sent by `-alert-test` |
+
+When many clients exceed `-alert-rate-limited-client` at once, the first
+10 alerts in an hour are sent and the others are held back and sent
+together in one `notification_digest` when the hour ends (see
+`-alert-notify-rate-limit`, which works like
+[`-acme-notify-rate-limit`](acme.md#limiting-notifications)). Use
+`-alert-rate-limited-clients` to learn about such attacks in one alert.
+
+To limit memory during a distributed attack, each window counts at most
+10,000 clients individually. Further clients still count as rejected
+requests, but not as distinct clients or towards
+`-alert-rate-limited-client`; the alert then says so.
+`-alert-rate-limited-clients` must be at most 10,000.
+
+### Where alerts go
+
+Alerts are always written to the operational log, so that a log-based
+monitoring system can pick them up:
+
+```
+level=WARN msg="rate limit alert" event=rate_limited_client metric=client client=203.0.113.7 count=300 threshold=300 window=5m0s message="Client 203.0.113.7 was rate limited 300 times within 1m42s (alert threshold: 300 per 5m0s). Rules: POST /login=5/1m (300)."
+level=INFO msg="rate limit alert resolved" event=rate_limit_alert_resolved metric=requests count=15320 threshold=1000 window=5m0s message="…"
+level=INFO msg="rate limit alert resolved" metric=client client=203.0.113.7 threshold="300 per 5m0s"
+```
+
+With `-alert-webhook` or `-alert-command`, they are also sent there. The
+webhook formats, the command's input, retries and the handling of
+secrets are the same as for
+[certificate notifications](acme.md#webhooks); check the setup with
+`-alert-test`. They may use the same URL or command as the
+`-acme-notify-*` options. The `json` format and a command's standard
+input have these fields in addition to `time`, `event`, `severity`,
+`host` and `message`:
+
+```json
+{
+  "event": "rate_limited_requests",
+  "severity": "warning",
+  "message": "Rate limits rejected 1000 requests within 2m13s (alert threshold: 1000 per 5m0s). Top clients: …",
+  "metric": "requests",
+  "count": 1000,
+  "threshold": 1000,
+  "window": "5m0s",
+  "top_clients": [{ "name": "203.0.113.7", "count": 812 }, { "name": "198.51.100.4", "count": 120 }],
+  "top_rules": [{ "name": "POST /login=5/1m", "count": 900 }, { "name": "300/1m", "count": 100 }]
+}
+```
+
+| Field | Variable | Description |
+|-------|----------|-------------|
+| `metric` | `PRISMWAF_METRIC` | `requests`, `clients` or `client`: the threshold |
+| `client` | `PRISMWAF_CLIENT` | For `rate_limited_client`: the client's IP, or its `/64` network for IPv6 |
+| `count` | `PRISMWAF_COUNT` | Rejected requests or clients when the threshold was reached. For `rate_limit_alert_resolved`: the rejected requests while the alert lasted, or the most clients of a window |
+| `threshold`, `window` | `PRISMWAF_THRESHOLD`, `PRISMWAF_WINDOW` | The threshold, e.g. `1000` and `5m0s` |
+| `top_clients` | | Up to 5 clients with the most rejected requests in the window (not for `rate_limited_client`) |
+| `top_rules` | | Up to 5 rules that rejected the most requests: of the window, or of the client |
+
+A client in an alert can be [banned](ddos.md) automatically with `-ban`,
+or blocked by hand, e.g. in the firewall.
+
 ## Use cases
 
 ### Protect a login form against password guessing
@@ -306,3 +445,6 @@ while it is on.
 - Limits are per client only. There is no limit on all clients together,
   per user account, per header value or per host name.
 - Rules apply to every host name served by PrismWAF.
+- [Alerts](#alerts) are counted per process, like the limits: with
+  several instances, each one alerts on its own share of the traffic.
+  Their state is reset by a restart.

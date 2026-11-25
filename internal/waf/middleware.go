@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cmc-labo/prism-waf/internal/abuse"
+	"github.com/cmc-labo/prism-waf/internal/alert"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/crs"
@@ -103,6 +104,9 @@ type Config struct {
 	// RateLimiter, if set, limits the request rate of each client before
 	// requests are inspected.
 	RateLimiter *ratelimit.Limiter
+	// RateLimitAlerts, if set, is told of every request over a rate limit,
+	// also in ModeDetect, to alert when that happens too often.
+	RateLimitAlerts *alert.Monitor
 	// Abuse, if set, limits the failed attempts of each client at business
 	// flows such as logins and the distinct IDs it requests, after rate
 	// limiting. It does not apply to gRPC calls.
@@ -237,6 +241,9 @@ func Middleware(next http.Handler, cfg Config) http.Handler {
 			if !d.Allowed {
 				if d.First {
 					logRateLimitEvent(cfg, logger, r, d)
+				}
+				if cfg.RateLimitAlerts != nil {
+					cfg.RateLimitAlerts.RateLimited(d.Client, d.Rule.String())
 				}
 				if !detect {
 					w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(d.RetryAfter)))

@@ -19,6 +19,7 @@ PrismWAF has two kinds of tests:
 | [Business flow protection](business-logic.md) | [`abuse_test.go`](#business-flow-protection) | [2026-11-19](#results-5) |
 | [Denial of service protection](ddos.md) | [`ddos_test.go`](#denial-of-service-protection) | [2026-11-20](#results-6) |
 | [Deployment options](deployment.md) | [`deploy_test.go`](#deployment-options) | [2026-11-22](#results-7) |
+| [Rate limit alerts](rate-limiting.md#alerts) | [`alert_test.go`](#rate-limit-alerts) | [2026-11-25](#results-8) |
 
 ```sh
 go test ./...                                      # unit tests
@@ -40,6 +41,7 @@ The E2E tests have the `e2e` build tag, so `go test ./...` skips them.
 - [Business flow protection](#business-flow-protection)
 - [Denial of service protection](#denial-of-service-protection)
 - [Deployment options](#deployment-options)
+- [Rate limit alerts](#rate-limit-alerts)
 
 ## Requirements
 
@@ -1004,3 +1006,69 @@ the code was restored:
 | With a read-only root file system, the CRS did not start: Coraza requires a writable temporary directory, and its error suggests rebuilding it with a build tag | Running the image as in the Kubernetes example | A clear error at startup; the examples mount a small writable `/tmp` |
 | The image has no shell or `curl` for a Docker health check | Writing the Compose example | `prismwaf healthcheck` and a `HEALTHCHECK` in the image |
 
+## Rate limit alerts
+
+```sh
+go test ./internal/alert ./internal/notify ./internal/waf ./cmd/prismwaf
+go test -tags e2e -run 'TestRateLimitAlert' -v ./e2e/
+```
+
+### What is tested
+
+| Test | Checks |
+|------|--------|
+| `TestRateLimitAlerts` (E2E) | `-rate-limit 2/1m` with all three thresholds over 4-second windows, a webhook and a command; two clients behind a trusted proxy send 5 requests each and get `429` from the third. Alerts arrive in order at both targets: the first client at its third rejection, the number of clients at the second client's first, the requests at the sixth rejection, then the second client; with `metric`, `client`, `count`, `threshold`, `window`, `top_clients`, `top_rules`, the message and the `PRISMWAF_*` variables. A quiet window resolves the requests and clients alerts, single clients only in the log. No other notification follows. The startup log names the thresholds |
+| `TestRateLimitAlertFlags` (E2E) | `-alert-test` with a command and no threshold sends a `test` event and exits; alerts without rate limits, an invalid threshold, a target without a threshold and `-alert-notify-rate-limit` without a target are refused |
+| `internal/alert` (unit, fixed clock) | Each threshold: the alert as soon as it is reached, its message with the time since the first rejection, top 5 clients and rules (ties by name), no repetition while over the threshold in later windows, resolution by a whole window below it with its duration, total and peak, a new alert after that; a client alert per client, ended silently; at most 10,000 clients per window; invalid thresholds; alerts without a notifier |
+| `TestRateLimit` in `internal/waf` (unit) | Every request over a rate limit is recorded, not only the first of an excess, in block and detect mode |
+| `TestConfigValidate` in `cmd/prismwaf` (unit) | The option combinations above, invalid webhooks and formats |
+| `TestCommandEnvOfAlerts` in `internal/notify` (unit) | The `PRISMWAF_*` variables of alerts, and none of them for certificate events |
+
+`BenchmarkRateLimited` measures the cost of recording a rejected request
+with all thresholds enabled and many clients: about 200 ns and no
+allocation per request on 2 vCPUs, so alerts do not slow down rejecting a
+flood.
+
+### Results
+
+Run on 2026-11-25 on Linux (aarch64, 2 vCPUs) with Go 1.25.0:
+
+| Test | Result | Time |
+|------|--------|-----:|
+| `TestRateLimitAlerts` | Pass | 15s |
+| `TestRateLimitAlertFlags` | Pass | 0.1s |
+
+The whole E2E suite passed in 339 s, and the unit tests passed with the
+race detector, except `TestUnreachableBackendIsRetriedAfterFailTimeout` in
+`internal/proxy` once; it waits 100 ms for a 50 ms timeout and passed 30
+times in a row on its own. It is not affected by this feature.
+
+**Mutation check.** These changes to the code were each caught by the
+tests, and the code was restored:
+
+| Change | Failing tests |
+|--------|--------------:|
+| An alert repeated in each window while over the threshold | 1 |
+| Alerts never resolved | 2 |
+| Windows twice as long | 2 |
+| Clients counted as requests | 1 |
+| A client alerted at every rejection over its threshold | 1 |
+| A client never alerted again after its alert | 1 |
+| More than 5 top clients and rules | 1 |
+| Top clients and rules in the wrong order | 4 |
+| IPv4 clients shown with `/32` | 4 |
+| No limit on the clients of a window | 1 |
+| Time measured from the start of the window instead of the first rejection | 1 |
+| Rejected requests of later windows not added to the total | 1 |
+| The middleware not recording rejections | 1 |
+| Only the first rejection of an excess recorded | 1 |
+| Alerts accepted without rate limits | 1 |
+| A target accepted without a threshold | 1 |
+| No `PRISMWAF_COUNT` for commands | 1 |
+
+**Problems found and fixed during development:**
+
+| Problem | Found by | Fix |
+|---------|----------|-----|
+| The time in alerts was measured from the start of the window, which has nothing to do with the attack, and a burst read "within 0s" | `TestRateLimitAlerts` | Measured from the first rejected request; "less than a second" for shorter times |
+| The resolution of a clients alert reported "N clients in total", the sum of the windows, in which the same clients count several times | Review of the documentation | It reports the most clients of a window |

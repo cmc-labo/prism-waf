@@ -16,7 +16,8 @@ PrismWAF is a reverse-proxy Web Application Firewall written in Go.
 - **Structured bodies**: JSON and XML bodies are parsed and every value is
   inspected on its own
 - **Rate limiting**: limit requests per client, overall and per path, e.g.
-  5 login attempts per minute ([details](docs/rate-limiting.md))
+  5 login attempts per minute, and alert through a webhook or a command
+  when the limits are triggered too often ([details](docs/rate-limiting.md))
 - **Denial of service protection**: time out slow clients (Slowloris,
   slow POST), limit connections and requests in progress per client and
   in total, shed load with `503`, and ban clients that keep getting

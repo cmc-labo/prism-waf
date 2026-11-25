@@ -40,7 +40,21 @@ type notification struct {
 	Error    string     `json:"error"`
 	Failures int        `json:"failures"`
 	RetryAt  *time.Time `json:"retry_at"`
-	Held     []struct {
+	// Rate limit alerts.
+	Metric     string `json:"metric"`
+	Client     string `json:"client"`
+	Count      int    `json:"count"`
+	Threshold  int    `json:"threshold"`
+	Window     string `json:"window"`
+	TopClients []struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	} `json:"top_clients"`
+	TopRules []struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	} `json:"top_rules"`
+	Held []struct {
 		Event  string `json:"event"`
 		Domain string `json:"domain"`
 	} `json:"held"`

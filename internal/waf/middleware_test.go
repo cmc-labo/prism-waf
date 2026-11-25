@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"math/bits"
 	"net/http"
 	"net/http/httptest"
@@ -16,10 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cmc-labo/prism-waf/internal/alert"
 	"github.com/cmc-labo/prism-waf/internal/audit"
 	"github.com/cmc-labo/prism-waf/internal/bot"
 	"github.com/cmc-labo/prism-waf/internal/geo"
 	"github.com/cmc-labo/prism-waf/internal/geo/geotest"
+	"github.com/cmc-labo/prism-waf/internal/notify"
 	"github.com/cmc-labo/prism-waf/internal/ratelimit"
 )
 
@@ -274,14 +277,20 @@ func TestRateLimit(t *testing.T) {
 				t.Fatal(err)
 			}
 			tp, _ := ParseTrustedProxies("10.0.0.0/8")
+			alerts := &alertRecorder{}
+			monitor, err := alert.New(alert.Config{Client: alert.Threshold{Count: 3, Window: time.Minute}, Notifier: alerts, Logger: slog.New(slog.DiscardHandler)})
+			if err != nil {
+				t.Fatal(err)
+			}
 			var buf bytes.Buffer
 			forwarded := 0
 			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded++ }), Config{
-				Inspector:      mustInspector(t, 0),
-				RateLimiter:    limiter,
-				Mode:           mode,
-				Audit:          audit.New(&buf),
-				TrustedProxies: tp,
+				Inspector:       mustInspector(t, 0),
+				RateLimiter:     limiter,
+				RateLimitAlerts: monitor,
+				Mode:            mode,
+				Audit:           audit.New(&buf),
+				TrustedProxies:  tp,
 			})
 			login := func(client string) *httptest.ResponseRecorder {
 				r := httptest.NewRequest("POST", "/login", strings.NewReader("user=a&password=b"))
@@ -322,6 +331,12 @@ func TestRateLimit(t *testing.T) {
 			if e.RateLimit == nil || e.RateLimit.Rule != "POST /login=2/1m" || e.RateLimit.Client != "203.0.113.7/32" ||
 				e.RateLimit.RetryAfter != 30 {
 				t.Errorf("rate_limit = %+v", e.RateLimit)
+			}
+			// All three requests over the limit count towards alerts, also
+			// in detect mode.
+			if len(alerts.events) != 1 || alerts.events[0].Client != "203.0.113.7" || alerts.events[0].Count != 3 ||
+				alerts.events[0].TopRules[0].Name != "POST /login=2/1m" {
+				t.Errorf("alerts %+v", alerts.events)
 			}
 
 			if mode == ModeDetect {
@@ -645,3 +660,8 @@ func TestGeoBeforeRateLimit(t *testing.T) {
 		t.Errorf("events %+v", events)
 	}
 }
+
+// alertRecorder records rate limit alerts.
+type alertRecorder struct{ events []notify.Event }
+
+func (r *alertRecorder) Notify(e notify.Event) { r.events = append(r.events, e) }

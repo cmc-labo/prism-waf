@@ -47,8 +47,23 @@ type Event struct {
 	Failures int        `json:"failures,omitempty"`
 	RetryAt  *time.Time `json:"retry_at,omitempty"`
 
+	// Details of rate limit alerts.
+	Metric     string  `json:"metric,omitempty"`
+	Client     string  `json:"client,omitempty"`
+	Count      int     `json:"count,omitempty"`
+	Threshold  int     `json:"threshold,omitempty"`
+	Window     string  `json:"window,omitempty"`
+	TopClients []Count `json:"top_clients,omitempty"`
+	TopRules   []Count `json:"top_rules,omitempty"`
+
 	// Held are the notifications of a digest (EventDigest).
 	Held []Event `json:"held,omitempty"`
+}
+
+// Count is a number of events of a client or a rule.
+type Count struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 // EventDigest is the event of the notification that sends the
@@ -496,6 +511,14 @@ func commandEnv(e Event) []string {
 	}
 	if e.Failures > 0 {
 		env = append(env, "PRISMWAF_FAILURES="+strconv.Itoa(e.Failures))
+	}
+	for name, v := range map[string]string{"METRIC": e.Metric, "CLIENT": e.Client, "WINDOW": e.Window} {
+		if v != "" {
+			env = append(env, "PRISMWAF_"+name+"="+v)
+		}
+	}
+	if e.Threshold > 0 {
+		env = append(env, "PRISMWAF_COUNT="+strconv.Itoa(e.Count), "PRISMWAF_THRESHOLD="+strconv.Itoa(e.Threshold))
 	}
 	if len(e.Held) > 0 {
 		env = append(env, "PRISMWAF_HELD="+strconv.Itoa(len(e.Held)))
