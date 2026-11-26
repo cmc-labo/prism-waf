@@ -164,11 +164,32 @@ func TestRetryOnUnreachableBackend(t *testing.T) {
 func TestUnreachableBackendIsRetriedAfterFailTimeout(t *testing.T) {
 	dead := deadBackend(t)
 	tr := &countingTransport{}
-	p := mustProxy(t, Config{Backends: []*url.URL{dead, namedBackend(t, "live")}, Transport: tr, FailTimeout: 50 * time.Millisecond})
-	send(p, httptest.NewRequest("GET", "/", nil))
-	time.Sleep(100 * time.Millisecond)
-	send(p, httptest.NewRequest("GET", "/", nil)) // live (round-robin)
-	send(p, httptest.NewRequest("GET", "/", nil)) // dead again
+	p := mustProxy(t, Config{Backends: []*url.URL{dead, namedBackend(t, "live")}, Transport: tr, FailTimeout: time.Minute})
+	// A fixed clock: with the real one, a slow run could let FailTimeout
+	// pass between requests.
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	sendAll := func() {
+		t.Helper()
+		for range 4 {
+			if code, _ := send(p, httptest.NewRequest("GET", "/", nil)); code != http.StatusOK {
+				t.Fatalf("status %d", code)
+			}
+		}
+	}
+	sendAll()
+	if n := tr.get(dead.Host); n != 1 {
+		t.Fatalf("dead backend tried %d times, want 1", n)
+	}
+	// Once FailTimeout has passed, it is tried once more, then skipped
+	// again.
+	now = now.Add(time.Minute - time.Nanosecond)
+	sendAll()
+	if n := tr.get(dead.Host); n != 1 {
+		t.Errorf("dead backend tried %d times before FailTimeout, want 1", n)
+	}
+	now = now.Add(time.Nanosecond)
+	sendAll()
 	if n := tr.get(dead.Host); n != 2 {
 		t.Errorf("dead backend tried %d times, want 2", n)
 	}

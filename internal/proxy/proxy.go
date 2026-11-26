@@ -73,7 +73,8 @@ type Proxy struct {
 	policy      Policy
 	failTimeout time.Duration
 	logger      *slog.Logger
-	next        atomic.Uint64 // round-robin position
+	next        atomic.Uint64    // round-robin position
+	now         func() time.Time // for tests
 }
 
 type backend struct {
@@ -124,6 +125,7 @@ func New(cfg Config) (*Proxy, error) {
 		policy:      cfg.Policy,
 		failTimeout: cfg.FailTimeout,
 		logger:      cfg.Logger,
+		now:         time.Now,
 	}
 	for _, u := range cfg.Backends {
 		if u == nil || u.Scheme == "" || u.Host == "" {
@@ -175,7 +177,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.fail(w, r, b, a.err)
 			return
 		}
-		b.downUntil.Store(time.Now().Add(p.failTimeout).UnixNano())
+		b.downUntil.Store(p.now().Add(p.failTimeout).UnixNano())
 		p.logger.Warn("backend unreachable; skipping it", "backend", b.url.String(), "for", p.failTimeout, "error", a.err)
 		if !rewindBody(r) {
 			p.fail(w, r, b, a.err)
@@ -209,7 +211,7 @@ func (p *Proxy) fail(w http.ResponseWriter, r *http.Request, b *backend, err err
 func (p *Proxy) pick(tried []bool) int {
 	n := len(p.backends)
 	start := int(p.next.Add(1)-1) % n
-	now := time.Now()
+	now := p.now()
 	best, fallback := -1, -1
 	for k := range n {
 		i := (start + k) % n
@@ -352,7 +354,7 @@ func (p *Proxy) check(ctx context.Context, client *http.Client, b *backend, path
 	}
 	// A successful check also ends the skip after a connection failure, so
 	// a restarted backend is used again without waiting for FailTimeout.
-	wasDown := b.downUntil.Swap(0) > time.Now().UnixNano()
+	wasDown := b.downUntil.Swap(0) > p.now().UnixNano()
 	if b.unhealthy.Swap(false) || wasDown {
 		p.logger.Info("backend healthy again", "backend", b.url.String())
 	}
