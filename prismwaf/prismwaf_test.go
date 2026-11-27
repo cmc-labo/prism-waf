@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cmc-labo/prism-waf/internal/waf"
 	"github.com/cmc-labo/prism-waf/prismwaf"
 )
 
@@ -175,5 +176,12 @@ func TestNewErrors(t *testing.T) {
 				t.Errorf("error %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// The documented default must stay that of the command.
+func TestDefaultMaxBodySizeMatchesCommand(t *testing.T) {
+	if prismwaf.DefaultMaxBodySize != waf.DefaultMaxBodySize {
+		t.Errorf("DefaultMaxBodySize = %d, want %d", prismwaf.DefaultMaxBodySize, waf.DefaultMaxBodySize)
 	}
 }
