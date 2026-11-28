@@ -10,6 +10,33 @@ go build -o bin/prismwaf ./cmd/prismwaf
 See [Testing](testing.md) for the end-to-end tests, their requirements and
 the latest results.
 
+## CI/CD
+
+GitHub Actions runs two workflows in [`.github/workflows/`](../.github/workflows):
+
+| Workflow | Runs on | Does |
+|----------|---------|------|
+| `ci.yml` | Every push to `master` and every pull request | `gofmt`, `go vet`, `go test -race ./...`, `go test -tags e2e -short ./e2e/`, and builds the image for `linux/amd64` and `linux/arm64` without pushing it |
+| `release.yml` | Pushes to `master`, `v*` tags, manual runs | Runs the tests again, then pushes the image to `ghcr.io/cmc-labo/prism-waf` |
+
+Image tags:
+
+| Trigger | Tags |
+|---------|------|
+| Push to `master` | `edge`, `sha-<commit>` |
+| Tag `v1.2.3` | `1.2.3`, `1.2`, `1`, `latest`, `sha-<commit>` (no major tag for `v0.x`) |
+
+To release a version:
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The workflows use the built-in `GITHUB_TOKEN`; no secrets are needed. The
+first published package is private: make it public under the repository's
+**Packages → Package settings** if anyone should be able to pull it.
+
 ## Project layout
 
 ```
@@ -37,4 +64,5 @@ examples/library/    application that embeds PrismWAF with the prismwaf package
 examples/kubernetes/ PrismWAF as a sidecar in a Deployment
 examples/compose/    PrismWAF in front of an application with Docker Compose
 Dockerfile           container image (distroless, non-root)
+.github/workflows/   CI (tests, image build) and release (image push to GHCR)
 ```

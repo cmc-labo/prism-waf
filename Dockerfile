@@ -4,12 +4,16 @@
 #   docker build -t prismwaf .
 #   docker run --rm -p 8080:8080 -e PRISMWAF_BACKEND=http://app:3000 prismwaf
 
-FROM golang:1.25 AS build
+# The build stage runs on the build machine and cross-compiles, so that
+# multi-platform images (docker buildx --platform linux/amd64,linux/arm64)
+# need no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /prismwaf ./cmd/prismwaf
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w" -o /prismwaf ./cmd/prismwaf
 
 # No shell or package manager; runs as an unprivileged user (UID 65532).
 FROM gcr.io/distroless/static-debian12:nonroot

@@ -37,6 +37,14 @@ docker build -t prismwaf .
 docker run --rm -p 8080:8080 -e PRISMWAF_BACKEND=http://app.internal:3000 prismwaf
 ```
 
+Built images for `linux/amd64` and `linux/arm64` are published to the
+GitHub Container Registry (see [CI/CD](development.md#cicd)):
+
+```sh
+docker pull ghcr.io/cmc-labo/prism-waf:latest   # latest release; :1.2.3 for a version
+docker pull ghcr.io/cmc-labo/prism-waf:edge     # latest commit on master
+```
+
 | Property | Value |
 |----------|-------|
 | Base | `gcr.io/distroless/static-debian12:nonroot`: no shell, no package manager |
